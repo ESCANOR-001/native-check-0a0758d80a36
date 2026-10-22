@@ -1187,5 +1187,12 @@ async fn truncated_shared_image_recovers_from_verified_native_turn_without_raw_h
     assert!(!public.contains(&data));
     f.restart().await;
     let after = f.detail().await;
-    assert!(after.to_string().contains(paths[0].as_str().unwrap()));
+    let recovered = after["activities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "truncated-screenshot")
+        .unwrap();
+    assert_eq!(recovered["payload"]["data"]["toolImages"], json!(paths));
+    assert_eq!(std::fs::read(paths[0].as_str().unwrap()).unwrap(), bytes);
 }

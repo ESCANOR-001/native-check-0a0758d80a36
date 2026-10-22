@@ -37,9 +37,18 @@ jobs:
       - name: Lint all targets
         run: cargo +1.98.0 clippy --locked --all-targets -- -D warnings
       - name: Execute protocol and lifecycle tests
+        timeout-minutes: 15
         run: cargo +1.98.0 test --locked --all-targets --no-fail-fast -- --test-threads=1 --show-output
       - name: Build native release binary
         run: cargo +1.98.0 build --locked --release --bin remodex-connect-native
+      - name: Keep isolated test binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: native-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: target/release/remodex-connect-native${{ runner.os == 'Windows' && '.exe' || '' }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
       - name: Save disposable compiler cache
         if: always() && steps.compiler-cache.outputs.cache-hit != 'true'
         continue-on-error: true

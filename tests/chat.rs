@@ -6,6 +6,9 @@ use remodex_connect_native::{
 };
 use serde_json::{json, Value};
 use std::{path::PathBuf, time::Duration};
+// The `many` fixture writes 160 completed 4-KiB messages with FULL-sync
+// transactions. Give only that disk-stress preparation a separate budget.
+const BULK_HISTORY_TIMEOUT: Duration = Duration::from_secs(30);
 struct Test {
     dir: tempfile::TempDir,
     db: AuthService,
@@ -79,6 +82,15 @@ impl Test {
     }
     async fn wait(&self, a: AgentKind, id: &str, status: &str) -> Value {
         self.wait_for(a, id, status, Duration::from_secs(8)).await
+    }
+    async fn wait_bulk_history(&self, a: AgentKind, id: &str) -> Value {
+        let started = std::time::Instant::now();
+        let result = self.wait_for(a, id, "ready", BULK_HISTORY_TIMEOUT).await;
+        eprintln!(
+            "Durable long-turn fixture {a:?}/{id}: {:?}",
+            started.elapsed()
+        );
+        result
     }
     async fn wait_for(&self, a: AgentKind, id: &str, status: &str, limit: Duration) -> Value {
         let started = std::time::Instant::now();
@@ -1137,7 +1149,7 @@ async fn reused_native_request_ids_do_not_overwrite_old_controls_or_hide_new_que
                 t.call(agent, prompt("request-pages", "many", "normal"))
                     .await
                     .unwrap();
-                t.wait(agent, "request-pages", "ready").await;
+                t.wait_bulk_history(agent, "request-pages").await;
             }
         }
         let db = rusqlite::Connection::open(t.dir.path().join("native-connect.sqlite")).unwrap();
@@ -1157,7 +1169,8 @@ async fn unanswered_controls_remain_visible_after_parallel_output_spills_their_p
         )
         .await
         .unwrap();
-        let d = tokio::time::timeout(Duration::from_secs(8), async {
+        let started = std::time::Instant::now();
+        let d = tokio::time::timeout(BULK_HISTORY_TIMEOUT, async {
             loop {
                 let d = t.detail(agent, "spilled-question").await;
                 if d["messages"]
@@ -1173,6 +1186,10 @@ async fn unanswered_controls_remain_visible_after_parallel_output_spills_their_p
         })
         .await
         .unwrap();
+        eprintln!(
+            "Durable question history {agent:?}: {:?}",
+            started.elapsed()
+        );
         assert_eq!(d["hasPendingUserInput"], true);
         assert!(d["messages"].as_array().unwrap().len() <= 24);
         let row = d["activities"]
@@ -1381,7 +1398,7 @@ async fn branching_pins_native_history_and_copies_all_pages_with_durable_receipt
     t.call(a, prompt("branch-source", "many", "normal"))
         .await
         .unwrap();
-    t.wait(a, "branch-source", "ready").await;
+    t.wait_bulk_history(a, "branch-source").await;
     let source =
         t.db.call(|a| a.store.load_chat("branch-source"))
             .await
@@ -2647,14 +2664,7 @@ async fn both_protocols_spill_long_turns_and_update_old_tools_without_losing_row
         let t = Test::new().await;
         t.create(a, "many").await;
         t.call(a, prompt("many", "many", "normal")).await.unwrap();
-        // This fixture emits 160 completed 4-KiB messages in one burst, with
-        // FULL-sync durable commits. Measure the stress case separately from
-        // the eight-second single-message/control checks on slow CI disks.
-        let started = std::time::Instant::now();
-        let done = t
-            .wait_for(a, "many", "ready", Duration::from_secs(30))
-            .await;
-        eprintln!("Durable long-turn fixture {a:?}: {:?}", started.elapsed());
+        let done = t.wait_bulk_history(a, "many").await;
         assert!(done.to_string().len() < 180 * 1024);
         assert!(done["historyPage"]["hasOlder"].as_bool().unwrap());
         let tool =
@@ -3106,7 +3116,7 @@ async fn prompt_edit_preserves_a_revision_and_retries_without_reediting() {
         let second = t.wait(a, "edit", "ready").await;
         let target = second["latestTurn"]["turnId"].clone();
         t.call(a, prompt("edit", "many", "normal")).await.unwrap();
-        t.wait(a, "edit", "ready").await;
+        t.wait_bulk_history(a, "edit").await;
         let db = rusqlite::Connection::open(t.dir.path().join("native-connect.sqlite")).unwrap();
         let raw: String = db
             .query_row("SELECT data FROM chats WHERE id='edit'", [], |r| r.get(0))
