@@ -6,6 +6,35 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 use tokio::{io::AsyncReadExt, process::Command};
 const LIMIT: usize = 1024 * 1024;
 
+/// Git for Windows rejects `//?/C:/...` when creating a worktree's .git file.
+/// Keep canonical paths for authorization/storage, but pass Git a normal path.
+pub(crate) fn path_argument(path: &Path) -> Result<String, String> {
+    let text = path.to_str().ok_or("Git path is not UTF-8")?;
+    #[cfg(windows)]
+    {
+        windows_path_argument(text)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(text.to_owned())
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_path_argument(text: &str) -> Result<String, String> {
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return Ok(format!("//{}", rest.replace('\\', "/")));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        let drive = rest.as_bytes();
+        if drive.len() < 3 || !drive[0].is_ascii_alphabetic() || &drive[1..3] != b":\\" {
+            return Err("Git does not support this Windows device path".into());
+        }
+        return Ok(rest.replace('\\', "/"));
+    }
+    Ok(text.replace('\\', "/"))
+}
+
 pub(crate) async fn git(root: &Path, args: &[&str]) -> Result<(i32, Vec<u8>), String> {
     git_with_timeout(root, args, Duration::from_secs(8), false).await
 }
@@ -16,6 +45,8 @@ async fn git_with_timeout(
     network: bool,
 ) -> Result<(i32, Vec<u8>), String> {
     let mut cmd = Command::new("git");
+    #[cfg(windows)]
+    cmd.args(["-c", "core.longpaths=true"]);
     cmd.args([
         "--no-pager",
         "-c",
@@ -439,6 +470,75 @@ async fn diff(root: &Path, ignore: bool) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn windows_git_arguments_preserve_drive_unc_spaces_and_unicode() {
+        for (input, expected) in [
+            (
+                r"\\?\C:\Users\Example\project with spaces",
+                "C:/Users/Example/project with spaces",
+            ),
+            (r"\\?\UNC\server\share\日本語", "//server/share/日本語"),
+            (r"C:\normal\path", "C:/normal/path"),
+            (r"\\server\share\path", "//server/share/path"),
+        ] {
+            assert_eq!(windows_path_argument(input).unwrap(), expected);
+        }
+        assert!(windows_path_argument(r"\\?\GLOBALROOT\Device\HarddiskVolume1").is_err());
+        #[cfg(not(windows))]
+        assert_eq!(
+            path_argument(Path::new(r"/a/back\slash")).unwrap(),
+            r"/a/back\slash"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_creates_worktree_from_canonical_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project with spaces");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        output(&root, &["init", "-b", "main"]).await.unwrap();
+        output(
+            &root,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        )
+        .await
+        .unwrap();
+        let target = dir.path().canonicalize().unwrap().join("isolated checkout");
+        output(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "fixture-checkout",
+                "--",
+                &path_argument(&target).unwrap(),
+                "HEAD",
+            ],
+        )
+        .await
+        .unwrap();
+        let actual = output(&target, &["rev-parse", "--show-toplevel"])
+            .await
+            .unwrap();
+        assert_eq!(
+            Path::new(std::str::from_utf8(&actual).unwrap().trim())
+                .canonicalize()
+                .unwrap(),
+            target.canonicalize().unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn status_diff_and_refs_use_only_the_disposable_repository() {
         let d = tempfile::tempdir().unwrap();

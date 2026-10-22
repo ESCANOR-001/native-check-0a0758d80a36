@@ -853,7 +853,8 @@ impl Hub {
         let mut bootstrap_jobs = tokio::task::JoinSet::new();
         let mut shared_jobs = tokio::task::JoinSet::new();
         let mut shared_reads = HashSet::new();
-        let mut shared_sends: HashMap<String, (Instant, Request)> = HashMap::new();
+        let mut shared_sends: HashMap<String, (Instant, u64, Request)> = HashMap::new();
+        let mut shared_send_epoch = 0u64;
         let mut previews: HashMap<String, crate::checkpoints::Preview> = HashMap::new();
         let mut capability_waiters: HashMap<String, Vec<oneshot::Sender<Result<Value, String>>>> =
             HashMap::new();
@@ -903,7 +904,7 @@ impl Hub {
                 let native = chat.native_id.clone();
                 let config = self.config.codex.clone();
                 let db = self.db.clone();
-                let explicit_send = shared_sends.contains_key(&id);
+                let send_epoch = shared_sends.get(&id).map(|(_, epoch, _)| *epoch);
                 shared_reads.insert(id.clone());
                 shared_jobs.spawn(async move {
                     let result = crate::shared_history::read(
@@ -911,10 +912,10 @@ impl Hub {
                         db,
                         id.clone(),
                         native.clone(),
-                        explicit_send,
+                        send_epoch.is_some(),
                     )
                     .await;
-                    (id, native, result)
+                    (id, native, send_epoch, result)
                 });
             }
             if discovery.is_empty() && self.active.is_empty() {
@@ -946,7 +947,8 @@ impl Hub {
                             if self.tool_controls.contains(&id) || shared_sends.contains_key(&id) || shared_sends.len()>=4 {let _=r.reply.send(Err("Wait for this chat's current history check".into()));continue;}
                             self.tool_controls.insert(id.clone());
                             self.shared_watches.insert(id.clone(),(Instant::now()+Duration::from_secs(35),Instant::now()));
-                            shared_sends.insert(id,(Instant::now(),r));continue;
+                            shared_send_epoch=shared_send_epoch.wrapping_add(1);
+                            shared_sends.insert(id,(Instant::now(),shared_send_epoch,r));continue;
                         }
                     }
                     if r.method=="orchestration.dispatchCommand" {
@@ -1091,17 +1093,20 @@ impl Hub {
                     let _=r.reply.send(result);
                 }
                 Some(result)=shared_jobs.join_next(), if !shared_jobs.is_empty()=>{
-                    if let Ok((id,native,result))=result {
+                    if let Ok((id,native,send_epoch,result))=result {
+                        // A background read started before a send cannot authorize it.
+                        // Match the exact queued request, including after timeout/retry.
+                        let current_send=send_epoch.is_some_and(|epoch|shared_sends.get(&id).is_some_and(|(_,current,_)|epoch==*current));
                         shared_reads.remove(&id);
                         let valid=self.chats.get(&id).is_some_and(|c|c.native_id==native && c.thread["deletedAt"].is_null() && c.thread["archivedAt"].is_null()) && !self.active.contains_key(&id) && (!self.tool_controls.contains(&id) || shared_sends.contains_key(&id));
                         if !valid {continue;}
                         let result=match result {Ok(batch)=>{let tail=batch.caught_up;let busy=batch.busy;let external=batch.turn.as_ref().filter(|t|t["status"]=="inProgress").map(|t|s(&t["id"]).to_owned());
-                            if batch.missing_empty_session && !shared_sends.contains_key(&id) {continue;}
-                            match self.apply_shared(&id,batch).await {Ok(())=>{if tail && busy {if let Some(turn)=external {let _=self.attach_shared(&id,turn).await;}}Ok((tail,busy))},Err(e)=>Err(e)}},Err(e)=>Err(e)};
-                        if let Some((_,due))=self.shared_watches.get_mut(&id){*due=Instant::now()+Duration::from_millis(if matches!(result,Ok((false,_))) {10} else if result.is_ok(){750}else{5000});}
+                            if batch.missing_empty_session && !current_send {continue;}
+                            match self.apply_shared(&id,batch).await {Ok(())=>{if tail && busy && (current_send || !shared_sends.contains_key(&id)) {if let Some(turn)=external {let _=self.attach_shared(&id,turn).await;}}Ok((tail,busy))},Err(e)=>Err(e)}},Err(e)=>Err(e)};
+                        if let Some((_,due))=self.shared_watches.get_mut(&id){*due=Instant::now()+Duration::from_millis(if (shared_sends.contains_key(&id) && !current_send) || matches!(result,Ok((false,_))) {10} else if result.is_ok(){750}else{5000});}
                         let finish=match &result {Ok((tail,_))=>*tail,Err(_)=>true};
-                        if finish {
-                            if let Some((_,r))=shared_sends.remove(&id) {
+                        if finish && current_send {
+                            if let Some((_,_,r))=shared_sends.remove(&id) {
                                 self.tool_controls.remove(&id);
                                 let result=match result {Ok((_,false))=>self.dispatch(r.agent,&r.client,r.params).await,Ok((_,true)) if self.active.contains_key(&id) && r.params["deliveryMode"]=="queue"=>self.dispatch(r.agent,&r.client,r.params).await,Ok((_,true))=>Err("This shared chat is running in Desktop. Wait for it to finish before sending another prompt.".into()),Err(e)=>Err(e)};
                                 let _=r.reply.send(result);
@@ -1209,8 +1214,8 @@ impl Hub {
                     self.expire_native_controls();
                     self.reconnect_claude().await;
                     previews.retain(|_,p|p.created.elapsed()<Duration::from_secs(60));
-                    let expired:Vec<_>=shared_sends.iter().filter(|(_, (at,r))|at.elapsed()>Duration::from_secs(30) || r.reply.is_closed()).map(|(id,_)|id.clone()).collect();
-                    for id in expired {if let Some((_,r))=shared_sends.remove(&id){self.tool_controls.remove(&id);let _=r.reply.send(Err("Shared history is still catching up. Your prompt was not sent; try again shortly.".into()));}}
+                    let expired:Vec<_>=shared_sends.iter().filter(|(_, (at,_,r))|at.elapsed()>Duration::from_secs(30) || r.reply.is_closed()).map(|(id,_)|id.clone()).collect();
+                    for id in expired {if let Some((_,_,r))=shared_sends.remove(&id){self.tool_controls.remove(&id);let _=r.reply.send(Err("Shared history is still catching up. Your prompt was not sent; try again shortly.".into()));}}
                     if !self.active.is_empty() && storage_checked.elapsed() >= Duration::from_secs(2) {
                         storage_checked=Instant::now();
                         if let Err(e)=self.db.call(|a|a.store.check_history(0)).await.map_err(str::to_owned).and_then(|r|r) {
@@ -1251,7 +1256,7 @@ impl Hub {
         }
         shared_jobs.abort_all();
         while shared_jobs.join_next().await.is_some() {}
-        for (_, (_, r)) in shared_sends {
+        for (_, (_, _, r)) in shared_sends {
             let _ = r.reply.send(Err(
                 "Native chat service stopped; prompt was not sent".into()
             ));

@@ -370,16 +370,16 @@ async fn materialize(base: &Path, p: &Intent) -> Result<(), String> {
         }
         let reference = format!("refs/heads/{}", p.branch);
         let (code, bytes) = git(&p.repo, &["rev-parse", "--verify", &reference]).await?;
-        let path = p.path.to_str().ok_or("Invalid checkout path")?;
+        let path = crate::vcs::path_argument(&p.path)?;
         if code == 0 {
             if String::from_utf8_lossy(&bytes).trim() != p.head {
                 return Err("The reserved branch changed; its files were preserved".into());
             }
-            text(&p.repo, &["worktree", "add", "--", path, &p.branch]).await?;
+            text(&p.repo, &["worktree", "add", "--", &path, &p.branch]).await?;
         } else {
             text(
                 &p.repo,
-                &["worktree", "add", "-b", &p.branch, "--", path, &p.head],
+                &["worktree", "add", "-b", &p.branch, "--", &path, &p.head],
             )
             .await?;
         }

@@ -20,11 +20,17 @@ jobs:
       CARGO_TERM_COLOR: never
       RUST_BACKTRACE: 1
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal --component clippy --component rustfmt
+      - name: Restore disposable compiler cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: target
+          key: native-${{ runner.os }}-1.98.0-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: native-${{ runner.os }}-1.98.0-${{ hashFiles('Cargo.lock') }}-
       - name: Formatting
         run: cargo +1.98.0 fmt --all -- --check
       - name: Lint all targets

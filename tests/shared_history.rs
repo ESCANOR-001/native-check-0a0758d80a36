@@ -17,6 +17,13 @@ use std::{
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
+#[derive(Default)]
+struct HistoryGate {
+    armed: AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     hub: Chats,
@@ -27,6 +34,7 @@ struct Fixture {
     corrupt: Arc<Mutex<bool>>,
     offline: Arc<AtomicBool>,
     notices: Arc<Mutex<Vec<Value>>>,
+    history_gate: Arc<HistoryGate>,
     server: tokio::task::JoinHandle<()>,
 }
 impl Fixture {
@@ -52,6 +60,8 @@ impl Fixture {
         let notices: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
         let outbound = notices.clone();
         let missing = dir.path().join("missing-native");
+        let history_gate = Arc::new(HistoryGate::default());
+        let gate = history_gate.clone();
         let server = tokio::spawn(async move {
             let mut clients = tokio::task::JoinSet::new();
             loop {
@@ -66,8 +76,10 @@ impl Fixture {
                 let corrupt = bad.clone();
                 let notices = outbound.clone();
                 let missing = missing.clone();
+                let gate = gate.clone();
                 clients.spawn(async move {
-   let mut ws=tokio_tungstenite::accept_async(stream).await.unwrap();
+   // A canceled history read may close before the handshake completes.
+   let Ok(mut ws)=tokio_tungstenite::accept_async(stream).await else {return;};
    let mut subscribed:Option<String>=None;let mut sent=Value::Null;let mut notice_index=0;let mut pulse=tokio::time::interval(Duration::from_millis(30));
    loop {
     if offline.load(Ordering::SeqCst) {let _=ws.close(None).await;break;}
@@ -132,6 +144,9 @@ impl Fixture {
      },
      _=>panic!("Unexpected shared RPC {method}"),
     };
+    if method=="thread/turns/list" && gate.armed.swap(false, Ordering::SeqCst) {
+     gate.entered.notify_one();gate.release.notified().await;
+    }
     if ws.send(Message::Text(json!({"id":v["id"],"result":result}).to_string().into())).await.is_err(){break;}
     if method=="turn/start" && v["params"]["input"][0]["text"]!="hold_owned" {
      let id=result["turn"]["id"].clone();
@@ -177,6 +192,7 @@ impl Fixture {
             log,
             corrupt,
             notices,
+            history_gate,
             server,
         };
         f.call("orchestration.dispatchCommand",json!({"type":"thread.create","commandId":"create","threadId":"shared","projectId":"native-test-project"})).await.unwrap();
@@ -650,6 +666,45 @@ async fn conflicting_native_client_receipt_cannot_move_an_existing_prompt_to_ano
     assert!(error.contains("conflicting delivery receipt"));
     let after = f.detail().await;
     assert_eq!(before["messages"], after["messages"]);
+    assert_eq!(
+        f.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "turn/start")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn background_history_read_started_before_send_cannot_authorize_that_send() {
+    let f = Fixture::new().await;
+    let before = f.detail().await;
+    f.history_gate.armed.store(true, Ordering::SeqCst);
+    f.watch().await;
+    tokio::time::timeout(Duration::from_secs(5), f.history_gate.entered.notified())
+        .await
+        .unwrap();
+    // The background read has already sampled the old native turns. Introduce
+    // a conflicting receipt before the phone asks to send a new prompt.
+    let mut turn = external("foreign-receipt", "completed", 2);
+    turn["items"][0]["item"]["clientId"] = json!("initial");
+    f.turns.lock().unwrap().push(turn);
+    let send = f.send("not-sent-after-stale-check");
+    tokio::pin!(send);
+    tokio::select! {
+        biased;
+        result = &mut send => panic!("Send finished before history was released: {result:?}"),
+        _ = f.detail() => {}, // FIFO request after the pending send was polled.
+    }
+    f.history_gate.release.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(8), send)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error.contains("conflicting delivery receipt"), "{error}");
+    assert_eq!(before["messages"], f.detail().await["messages"]);
     assert_eq!(
         f.log
             .lock()

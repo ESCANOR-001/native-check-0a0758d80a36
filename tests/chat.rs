@@ -699,6 +699,7 @@ fn prompt(id: &str, text: &str, mode: &str) -> Value {
 fn fixture_git(root: &std::path::Path, args: &[&str]) -> String {
     let mut c = std::process::Command::new("git");
     c.current_dir(root)
+        .args(["-c", "core.autocrlf=false"])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0");
     #[cfg(windows)]
@@ -713,50 +714,6 @@ fn fixture_git(root: &std::path::Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8(out.stdout).unwrap()
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_git_canonical_worktree_path_diagnostic() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("project with spaces");
-    std::fs::create_dir(&root).unwrap();
-    fixture_git(&root, &["init", "-b", "main"]);
-    fixture_git(
-        &root,
-        &[
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "initial",
-        ],
-    );
-    let canonical = root.canonicalize().unwrap();
-    fixture_git(&canonical, &["rev-parse", "--show-toplevel"]);
-    fixture_git(
-        &canonical,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    );
-    fixture_git(&canonical, &["worktree", "list", "--porcelain", "-z"]);
-    let target = dir.path().canonicalize().unwrap().join("isolated checkout");
-    fixture_git(
-        &canonical,
-        &[
-            "-c",
-            "core.hooksPath=",
-            "worktree",
-            "add",
-            "-b",
-            "fixture-checkout",
-            "--",
-            target.to_str().unwrap(),
-            "HEAD",
-        ],
-    );
 }
 
 #[tokio::test]
