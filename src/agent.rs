@@ -160,10 +160,15 @@ fn validate_socket(profile: &std::path::Path, socket: &std::path::Path) -> Resul
         let link =
             std::fs::symlink_metadata(socket).map_err(|_| "Shared Codex socket unavailable")?;
         if link.file_type().is_symlink() {
-            // Codex shortens Unix paths using a private temporary directory
-            // and a SHA256 name bound to the requested absolute socket path.
+            // Codex shortens Unix paths using its fixed /tmp rendezvous root,
+            // canonicalized for /tmp -> /private/tmp on macOS. The CLI does not
+            // use TMPDIR here, which can be both different and too long. The
+            // SHA256 name is bound to the requested absolute socket path.
             // Accept that exact owned alias, never an arbitrary redirect.
-            let directory = std::env::temp_dir().join(format!("codex-daemon-{owner}"));
+            let directory = std::path::Path::new("/tmp")
+                .canonicalize()
+                .map_err(|_| "Private Codex socket directory unavailable")?
+                .join(format!("codex-daemon-{owner}"));
             let meta = std::fs::symlink_metadata(&directory)
                 .map_err(|_| "Private Codex socket directory unavailable")?;
             let digest = format!(

@@ -713,6 +713,12 @@ fn fixture_git(root: &std::path::Path, args: &[&str]) -> String {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    if args.first() == Some(&"init") {
+        // Worktree creation runs through the production helper, which rightly
+        // respects repository settings. Pin fixture bytes in the repository,
+        // not only in this helper's individual Git invocations.
+        fixture_git(root, &["config", "core.autocrlf", "false"]);
+    }
     String::from_utf8(out.stdout).unwrap()
 }
 

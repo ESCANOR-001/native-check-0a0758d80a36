@@ -26,7 +26,8 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal --component clippy --component rustfmt
       - name: Restore disposable compiler cache
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        id: compiler-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
         with:
           path: target
           key: native-${{ runner.os }}-1.98.0-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
@@ -36,6 +37,13 @@ jobs:
       - name: Lint all targets
         run: cargo +1.98.0 clippy --locked --all-targets -- -D warnings
       - name: Execute protocol and lifecycle tests
-        run: cargo +1.98.0 test --locked --all-targets -- --test-threads=1 --show-output
+        run: cargo +1.98.0 test --locked --all-targets --no-fail-fast -- --test-threads=1 --show-output
       - name: Build native release binary
         run: cargo +1.98.0 build --locked --release --bin remodex-connect-native
+      - name: Save disposable compiler cache
+        if: always() && steps.compiler-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: target
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}

@@ -344,8 +344,11 @@ async fn codex_short_socket_alias_is_bound_to_the_requested_isolated_path() {
     use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
     let profile = tempfile::tempdir().unwrap();
     let path = profile.path().join("rpc.sock");
-    let directory =
-        std::env::temp_dir().join(format!("codex-daemon-{}", unsafe { libc::geteuid() }));
+    // Match Codex's actual fixed rendezvous root, not macOS's long TMPDIR.
+    let directory = std::path::Path::new("/tmp")
+        .canonicalize()
+        .unwrap()
+        .join(format!("codex-daemon-{}", unsafe { libc::geteuid() }));
     let mut builder = std::fs::DirBuilder::new();
     builder.mode(0o700);
     if let Err(e) = builder.create(&directory) {
