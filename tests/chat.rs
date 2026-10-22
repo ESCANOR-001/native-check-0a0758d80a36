@@ -1869,6 +1869,137 @@ async fn hosted_controls_use_one_worker_and_restore_policy_before_reconnecting()
         .any(|v| v["text"] == "TOOLS_DISABLED"));
     t.stop().await;
 }
+fn access_controls(t: &Test) -> Vec<Value> {
+    std::fs::read_to_string(t.dir.path().join("host-controls.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+#[tokio::test]
+async fn shared_access_waits_for_worker_ack_and_deduplicates_across_restart() {
+    let mut t = Test::hosted().await;
+    let a = AgentKind::Claude;
+    t.create(a, "access").await;
+    t.call(a, prompt("access", "first", "normal"))
+        .await
+        .unwrap();
+    let before = t.wait(a, "access", "ready").await;
+    std::fs::write(t.dir.path().join("control-delay"), "").unwrap();
+    let request = json!({"type":"thread.runtime-mode.set","threadId":"access","commandId":"access-change","runtimeMode":"auto-accept-edits"});
+    let request_copy = request.clone();
+    let hub = t.hub.clone();
+    let send = tokio::spawn(async move {
+        hub.call(a, "phone", "orchestration.dispatchCommand", request_copy)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while access_controls(&t).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pending = t.detail(a, "access").await;
+    assert_eq!(
+        pending["runtimeMode"], before["runtimeMode"],
+        "a sent control is not confirmation"
+    );
+    assert!(t
+        .call(a, prompt("access", "pending-prompt", "normal"))
+        .await
+        .unwrap_err()
+        .contains("finish"));
+    assert!(send.await.unwrap().unwrap()["sequence"].is_number());
+    assert_eq!(
+        access_controls(&t)[0]["request"],
+        json!({"subtype":"set_permission_mode","mode":"acceptEdits"})
+    );
+    assert_eq!(
+        t.detail(a, "access").await["runtimeMode"],
+        "auto-accept-edits"
+    );
+    for (i, mode, native) in [(1, "plan", "plan"), (2, "default", "acceptEdits")] {
+        t.call(a,json!({"type":"thread.interaction-mode.set","threadId":"access","commandId":format!("plan-{i}"),"interactionMode":mode})).await.unwrap();
+        assert_eq!(access_controls(&t)[i]["request"]["mode"], native);
+        assert_eq!(t.detail(a, "access").await["interactionMode"], mode);
+    }
+    let mut conflicting = prompt("access", "access-change", "normal");
+    conflicting["commandId"] = request["commandId"].clone();
+    assert!(t
+        .call(a, conflicting.clone())
+        .await
+        .unwrap_err()
+        .contains("different content"));
+    conflicting["bootstrap"] = json!({"prepareWorktree":true});
+    assert!(t
+        .call(a, conflicting)
+        .await
+        .unwrap_err()
+        .contains("different content"));
+    let mut reused_ordinary = request.clone();
+    reused_ordinary["commandId"] = json!("create-access");
+    assert!(t
+        .call(a, reused_ordinary)
+        .await
+        .unwrap_err()
+        .contains("different content"));
+    t.call(a, request.clone()).await.unwrap();
+    assert_eq!(access_controls(&t).len(), 3);
+    let after = t.detail(a, "access").await;
+    assert_eq!(after["messages"], before["messages"]);
+    assert_eq!(after["latestTurn"], before["latestTurn"]);
+    t.stop().await;
+    t.hub = Chats::start(t.db.clone(), t.config.clone()).await.unwrap();
+    wait_links(&t, 2).await;
+    t.call(a, request).await.unwrap();
+    assert_eq!(
+        access_controls(&t).len(),
+        3,
+        "a recovered receipt cannot resend settings"
+    );
+    assert_eq!(
+        t.detail(a, "access").await["runtimeMode"],
+        "auto-accept-edits"
+    );
+    t.stop().await;
+}
+#[tokio::test]
+async fn shared_access_rejection_and_lost_ack_never_claim_success_or_replay() {
+    for (fixture, expected) in [
+        ("control-reject", "previous settings are retained"),
+        ("control-crash", "not confirmed"),
+    ] {
+        let mut t = Test::hosted().await;
+        let a = AgentKind::Claude;
+        t.create(a, "access-failure").await;
+        t.call(a, prompt("access-failure", "first", "normal"))
+            .await
+            .unwrap();
+        let before = t.wait(a, "access-failure", "ready").await;
+        std::fs::write(t.dir.path().join(fixture), "").unwrap();
+        let request = json!({"type":"thread.runtime-mode.set","threadId":"access-failure","commandId":"access-failure","runtimeMode":"full-access"});
+        let error = t.call(a, request.clone()).await.unwrap_err();
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("PRIVATE_METADATA"));
+        if fixture == "control-crash" {
+            wait_links(&t, 2).await;
+        }
+        assert!(t
+            .call(a, request.clone())
+            .await
+            .unwrap_err()
+            .contains(expected));
+        let after = t.detail(a, "access-failure").await;
+        assert_eq!(after["runtimeMode"], before["runtimeMode"]);
+        assert_eq!(after["messages"], before["messages"]);
+        t.stop().await;
+        t.hub = Chats::start(t.db.clone(), t.config.clone()).await.unwrap();
+        assert!(t.call(a, request).await.unwrap_err().contains(expected));
+        assert_eq!(access_controls(&t).len(), 1);
+        t.stop().await;
+    }
+}
 #[tokio::test]
 async fn lost_native_control_ack_is_not_replayed_after_worker_or_bridge_restart() {
     let mut t = Test::hosted().await;

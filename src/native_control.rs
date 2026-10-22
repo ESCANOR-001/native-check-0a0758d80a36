@@ -53,6 +53,15 @@ pub(crate) fn apply(chat: &mut Chat, value: &Value) -> bool {
     } else {
         let result = &value["response"]["response"];
         match &intent.action {
+            Control::Access {
+                runtime_mode,
+                interaction_mode,
+            } => {
+                chat.thread["runtimeMode"] = json!(runtime_mode);
+                chat.thread["session"]["runtimeMode"] = json!(runtime_mode);
+                chat.thread["interactionMode"] = json!(interaction_mode);
+                json!({"updated":true})
+            }
             Control::Toggle { name, enabled } => {
                 chat.disabled_mcp.retain(|s| s != name);
                 if !enabled {
@@ -129,6 +138,36 @@ mod tests {
             );
             assert!(!result.to_string().contains("PRIVATE_METADATA"));
             assert!(chat.disabled_mcp.is_empty());
+        }
+    }
+    #[test]
+    fn access_only_changes_on_the_matching_successful_acknowledgement() {
+        let state = json!({"agent":"claude","native_id":"native","resumed":true,"external_claude":true,"thread":{"runtimeMode":"approval-required","interactionMode":"default","session":{"runtimeMode":"approval-required"}},"native_control":{"key":"key","digest":"digest","request":"request","action":{"Access":{"runtime_mode":"auto-accept-edits","interaction_mode":"plan"}},"deadline":0,"result":null}});
+        for subtype in ["success", "error"] {
+            let mut chat: Chat = serde_json::from_value(state.clone()).unwrap();
+            assert!(!apply(
+                &mut chat,
+                &json!({"type":"control_response","response":{"request_id":"another","subtype":subtype}})
+            ));
+            assert_eq!(chat.thread, state["thread"]);
+            assert!(apply(
+                &mut chat,
+                &json!({"type":"control_response","response":{"request_id":"request","subtype":subtype,"error":"PRIVATE_METADATA"}})
+            ));
+            if subtype == "success" {
+                assert_eq!(chat.thread["runtimeMode"], "auto-accept-edits");
+                assert_eq!(chat.thread["session"]["runtimeMode"], "auto-accept-edits");
+                assert_eq!(chat.thread["interactionMode"], "plan");
+            } else {
+                assert_eq!(chat.thread, state["thread"]);
+            }
+            assert!(!chat
+                .native_control
+                .unwrap()
+                .result
+                .unwrap()
+                .to_string()
+                .contains("PRIVATE_METADATA"));
         }
     }
     #[test]

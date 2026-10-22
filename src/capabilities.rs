@@ -155,10 +155,17 @@ pub fn project_context(seed: &Value, context: &Value) -> Value {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum Control {
-    Toggle { name: String, enabled: bool },
+    Toggle {
+        name: String,
+        enabled: bool,
+    },
     Reconnect(String),
     ReloadSkills,
     ReloadPlugins,
+    Access {
+        runtime_mode: String,
+        interaction_mode: String,
+    },
 }
 impl Control {
     pub fn parse(v: &Value) -> Result<Self, String> {
@@ -187,6 +194,18 @@ impl Control {
             Self::Reconnect(name) => json!({"subtype":"mcp_reconnect","serverName":name}),
             Self::ReloadSkills => json!({"subtype":"reload_skills"}),
             Self::ReloadPlugins => json!({"subtype":"reload_plugins","hold_on_cache_impact":true}),
+            Self::Access {
+                runtime_mode,
+                interaction_mode,
+            } => {
+                let mode = match (interaction_mode.as_str(), runtime_mode.as_str()) {
+                    ("plan", _) => "plan",
+                    (_, "full-access") => "bypassPermissions",
+                    (_, "auto-accept-edits") => "acceptEdits",
+                    _ => "default",
+                };
+                json!({"subtype":"set_permission_mode","mode":mode})
+            }
         }
     }
 }

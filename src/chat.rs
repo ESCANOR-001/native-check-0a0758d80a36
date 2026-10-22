@@ -938,6 +938,15 @@ impl Hub {
                         }
                         let _=r.reply.send(Ok(json!({})));continue;
                     }
+                    // Check native receipts before any bootstrap/edit/job can
+                    // create side effects under a reused dispatch command ID.
+                    if r.method=="orchestration.dispatchCommand" && r.agent==AgentKind::Claude {
+                        match self.cached_native_dispatch(&r).await {
+                            Ok(Some(value))=>{let _=r.reply.send(Ok(value));continue;},
+                            Err(error)=>{let _=r.reply.send(Err(error));continue;},
+                            Ok(None)=>{},
+                        }
+                    }
                     if self.chats.get(s(&r.params["threadId"])).is_some_and(|c|c.external_claude) && ((r.method=="claude.sessionAction" && r.params["action"]!="connect" && !native_control::supported(&r.params["action"])) || r.params.get("promptEdit").is_some()) {
                         let _=r.reply.send(Err("This control for an externally owned session is not migrated yet".into())); continue;
                     }
@@ -953,6 +962,17 @@ impl Hub {
                     }
                     if r.method=="orchestration.dispatchCommand" {
                         previews.retain(|_,p|p.chat!=s(&r.params["threadId"]));
+                    }
+                    if r.method=="orchestration.dispatchCommand" && r.agent==AgentKind::Claude
+                        && ["thread.runtime-mode.set","thread.interaction-mode.set"].contains(&s(&r.params["type"]))
+                        && (self.chats.get(s(&r.params["threadId"])).is_some_and(|c|c.external_claude)
+                            || self.active.get(s(&r.params["threadId"])).is_some_and(|w|w.claude_router.is_some())) {
+                        match self.prepare_access_control(&r).await {
+                            Ok(PreparedTool::Run(key,digest,action))=>self.start_native_control(r,key,digest,action).await,
+                            Ok(PreparedTool::Cached(value))=>{let result=crate::native_control::response(value).map(|_|json!({"sequence":self.seq}));let _=r.reply.send(result);},
+                            Err(error)=>{let _=r.reply.send(Err(error));},
+                        }
+                        continue;
                     }
                     if r.method=="orchestration.dispatchCommand" && r.params["type"]=="thread.turn.start" && (r.params["bootstrap"].get("prepareWorktree").is_some() || r.params["bootstrap"]["createThread"]["worktreePath"].is_string() || r.params["bootstrap"]["createThread"]["branch"].is_string()) {
                         let id=s(&r.params["threadId"]).to_owned();

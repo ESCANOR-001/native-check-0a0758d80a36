@@ -3,12 +3,116 @@ use super::*;
 pub(super) struct Waiter {
     reply: oneshot::Sender<Result<Value, String>>,
     deadline: Instant,
+    dispatch: bool,
 }
 
 pub(super) fn supported(action: &Value) -> bool {
     ["mcpToggle", "mcpReconnect", "reloadSkills", "reloadPlugins"].contains(&s(action))
 }
 impl Hub {
+    pub(super) async fn cached_native_dispatch(
+        &self,
+        r: &Request,
+    ) -> Result<Option<Value>, String> {
+        let key = format!(
+            "{}:{}:{}",
+            r.agent.instance(),
+            r.client,
+            s(&r.params["commandId"])
+        );
+        let digest = format!("{:x}", Sha256::digest(r.params.to_string().as_bytes()));
+        let receipt = self
+            .db
+            .call(move |a| a.store.tool_action(&key))
+            .await?
+            .map_err(|_| "Control store unavailable")?;
+        match receipt {
+            None => Ok(None),
+            Some((previous, value)) if previous == digest => {
+                crate::native_control::response(value).map(|_| Some(json!({"sequence":self.seq})))
+            }
+            Some(_) => Err("Command ID was already used for different content".into()),
+        }
+    }
+
+    /// Shared settings go through the existing worker, never a new CLI or an
+    /// optimistic local-only update. Use the dispatch namespace for receipts so
+    /// a command ID cannot be reused as a prompt after a lost acknowledgement.
+    pub(super) async fn prepare_access_control(&self, r: &Request) -> Result<PreparedTool, String> {
+        let id = s(&r.params["threadId"]);
+        let chat = self.checked(r.agent, id)?;
+        let command = s(&r.params["commandId"]);
+        if r.agent != AgentKind::Claude
+            || command.is_empty()
+            || command.len() > 128
+            || id.len() > 128
+        {
+            return Err("Command and Claude thread IDs required".into());
+        }
+        let key = format!("{}:{}:{command}", r.agent.instance(), r.client);
+        let digest = format!("{:x}", Sha256::digest(r.params.to_string().as_bytes()));
+        let lookup = key.clone();
+        let (command_receipt, control_receipt) = self
+            .db
+            .call(move |a| {
+                Ok::<_, rusqlite::Error>((
+                    a.store.command_digest(&lookup)?,
+                    a.store.tool_action(&lookup)?,
+                ))
+            })
+            .await?
+            .map_err(|_| "Control store unavailable")?;
+        if let Some(previous) = command_receipt {
+            return if previous == digest {
+                Ok(PreparedTool::Cached(json!({"updated":true})))
+            } else {
+                Err("Command ID was already used for different content".into())
+            };
+        }
+        if let Some((previous, value)) = control_receipt {
+            return if previous == digest {
+                Ok(PreparedTool::Cached(value))
+            } else {
+                Err("Command ID was already used for different content".into())
+            };
+        }
+        if self.tool_controls.contains(id)
+            || !chat.queue.is_empty()
+            || self
+                .active
+                .get(id)
+                .is_none_or(|w| w.stage != "idle" || !w.metadata_ready())
+        {
+            return Err("Wait for the original Claude session to reconnect and finish its task; clear queued messages before changing settings".into());
+        }
+        if !chat.thread["deletedAt"].is_null() || !chat.thread["archivedAt"].is_null() {
+            return Err("Select an active chat".into());
+        }
+        let mut runtime_mode = s(&chat.thread["runtimeMode"]).to_owned();
+        let mut interaction_mode = s(&chat.thread["interactionMode"]).to_owned();
+        match s(&r.params["type"]) {
+            "thread.runtime-mode.set" => runtime_mode = s(&r.params["runtimeMode"]).to_owned(),
+            "thread.interaction-mode.set" => {
+                interaction_mode = s(&r.params["interactionMode"]).to_owned()
+            }
+            _ => return Err("Unsupported setting".into()),
+        }
+        if !["approval-required", "full-access", "auto-accept-edits"]
+            .contains(&runtime_mode.as_str())
+            || !["default", "plan"].contains(&interaction_mode.as_str())
+        {
+            return Err("Unsupported access or interaction mode".into());
+        }
+        Ok(PreparedTool::Run(
+            key,
+            digest,
+            crate::capabilities::Control::Access {
+                runtime_mode,
+                interaction_mode,
+            },
+        ))
+    }
+
     pub(super) async fn start_native_control(
         &mut self,
         r: Request,
@@ -27,6 +131,7 @@ impl Hub {
                     w.control_reply = Some(Waiter {
                         reply: r.reply,
                         deadline: Instant::now() + Duration::from_secs(15),
+                        dispatch: r.method == "orchestration.dispatchCommand",
                     });
                 } else {
                     self.tool_controls.remove(&id);
@@ -127,7 +232,14 @@ impl Hub {
         if let Some(w) = self.active.get_mut(id) {
             w.metadata.capability_cache = None;
             if let Some(reply) = w.control_reply.take() {
-                let _ = reply.reply.send(crate::native_control::response(result));
+                let result = crate::native_control::response(result).map(|v| {
+                    if reply.dispatch {
+                        json!({"sequence":self.seq})
+                    } else {
+                        v
+                    }
+                });
+                let _ = reply.reply.send(result);
             }
         }
     }
