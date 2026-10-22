@@ -20,18 +20,21 @@ impl Hub {
             r.client,
             s(&r.params["commandId"])
         );
-        let digest = format!("{:x}", Sha256::digest(r.params.to_string().as_bytes()));
         let receipt = self
             .db
             .call(move |a| a.store.tool_action(&key))
             .await?
             .map_err(|_| "Control store unavailable")?;
-        match receipt {
-            None => Ok(None),
-            Some((previous, value)) if previous == digest => {
-                crate::native_control::response(value).map(|_| Some(json!({"sequence":self.seq})))
-            }
-            Some(_) => Err("Command ID was already used for different content".into()),
+        let Some((previous, value)) = receipt else {
+            // Ordinary prompts may contain attachments. Do not serialize or
+            // duplicate their buffers just to check an absent control receipt.
+            return Ok(None);
+        };
+        let digest = format!("{:x}", Sha256::digest(r.params.to_string().as_bytes()));
+        if previous == digest {
+            crate::native_control::response(value).map(|_| Some(json!({"sequence":self.seq})))
+        } else {
+            Err("Command ID was already used for different content".into())
         }
     }
 

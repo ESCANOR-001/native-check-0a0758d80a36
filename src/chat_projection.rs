@@ -666,6 +666,7 @@ mod tests {
             thread: json!({"id":"projection","latestTurn":{"turnId":"turn"},"messages":[],"activities":[],"proposedPlans":[]}),
             native_id: String::new(),
             resumed: false,
+            claude_plan_access: None,
             remote_identity: None,
             external_claude: false,
             external_stop: None,

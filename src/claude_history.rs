@@ -494,21 +494,7 @@ pub async fn project(
         {
             chat.thread["modelSelection"]["model"] = json!(model);
         }
-        let mode = match s(&value["permissionMode"]) {
-            "bypassPermissions" => Some("full-access"),
-            "acceptEdits" => Some("auto-accept-edits"),
-            "default" | "plan" => Some("approval-required"),
-            _ => None,
-        };
-        if let Some(mode) = mode {
-            chat.thread["runtimeMode"] = json!(mode);
-            chat.thread["session"]["runtimeMode"] = json!(mode);
-        }
-        chat.thread["interactionMode"] = json!(if value["permissionMode"] == "plan" {
-            "plan"
-        } else {
-            "default"
-        });
+        crate::native_control::observe_permission(&mut chat, s(&value["permissionMode"]));
     }
     if event.source == "worker"
         && value["type"] == "control_request"

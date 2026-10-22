@@ -57,6 +57,8 @@ pub(crate) fn apply(chat: &mut Chat, value: &Value) -> bool {
                 runtime_mode,
                 interaction_mode,
             } => {
+                chat.claude_plan_access =
+                    (interaction_mode == "plan").then(|| runtime_mode.clone());
                 chat.thread["runtimeMode"] = json!(runtime_mode);
                 chat.thread["session"]["runtimeMode"] = json!(runtime_mode);
                 chat.thread["interactionMode"] = json!(interaction_mode);
@@ -81,6 +83,30 @@ pub(crate) fn apply(chat: &mut Chat, value: &Value) -> bool {
     };
     intent.result = Some(result);
     true
+}
+
+/// Native Plan mode is a temporary execution restriction, not a replacement
+/// for an explicitly confirmed access preference. An imported Plan session
+/// with no such confirmation defaults to approval; never infer full access.
+pub(crate) fn observe_permission(chat: &mut Chat, mode: &str) {
+    let runtime = match mode {
+        "plan" => chat
+            .claude_plan_access
+            .as_deref()
+            .filter(|s| ["approval-required", "auto-accept-edits", "full-access"].contains(s))
+            .unwrap_or("approval-required")
+            .to_owned(),
+        "default" => "approval-required".into(),
+        "acceptEdits" => "auto-accept-edits".into(),
+        "bypassPermissions" => "full-access".into(),
+        _ => return,
+    };
+    if mode != "plan" {
+        chat.claude_plan_access = None;
+    }
+    chat.thread["runtimeMode"] = json!(runtime);
+    chat.thread["session"]["runtimeMode"] = json!(runtime);
+    chat.thread["interactionMode"] = json!(if mode == "plan" { "plan" } else { "default" });
 }
 /// Called inside the chat/cursor transaction, so a committed event can never
 /// leave a pending command behind or acknowledge changes whose save failed.
@@ -169,6 +195,31 @@ mod tests {
                 .to_string()
                 .contains("PRIVATE_METADATA"));
         }
+    }
+    #[test]
+    fn plan_status_keeps_only_confirmed_access_and_forgets_it_after_owner_changes() {
+        let state = json!({"agent":"claude","native_id":"native","resumed":true,"external_claude":true,"thread":{"runtimeMode":"full-access","interactionMode":"default","session":{"runtimeMode":"full-access"}}});
+        let mut chat: Chat = serde_json::from_value(state.clone()).unwrap();
+        observe_permission(&mut chat, "plan");
+        assert_eq!(
+            chat.thread["runtimeMode"], "approval-required",
+            "an imported plan cannot inherit an unconfirmed access preference"
+        );
+        chat.claude_plan_access = Some("auto-accept-edits".into());
+        observe_permission(&mut chat, "plan");
+        assert_eq!(chat.thread["runtimeMode"], "auto-accept-edits");
+        assert_eq!(chat.thread["interactionMode"], "plan");
+        let mut resumed: Chat =
+            serde_json::from_value(serde_json::to_value(chat).unwrap()).unwrap();
+        observe_permission(&mut resumed, "plan");
+        assert_eq!(resumed.thread["runtimeMode"], "auto-accept-edits");
+        let previous = resumed.thread.clone();
+        observe_permission(&mut resumed, "");
+        assert_eq!(resumed.thread, previous);
+        observe_permission(&mut resumed, "default");
+        assert!(resumed.claude_plan_access.is_none());
+        observe_permission(&mut resumed, "plan");
+        assert_eq!(resumed.thread["runtimeMode"], "approval-required");
     }
     #[test]
     fn acknowledgement_settings_cursor_and_receipt_commit_together() {

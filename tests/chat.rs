@@ -3744,7 +3744,16 @@ async fn worktree_setup_shutdown_marks_uncertain_execution_and_stops_descendants
     let path=tokio::time::timeout(Duration::from_secs(5),async{
         loop {
             let result=db.query_row("SELECT data FROM native_worktrees WHERE id='claude-worktree:phone:setup-interrupt'",[],|r|r.get::<_,String>(0));
-            if let Ok(data)=result {let i:Value=serde_json::from_str(&data).unwrap();let path=PathBuf::from(i["path"].as_str().unwrap());if path.join("owned-pid").exists(){break path;}}
+            if let Ok(data)=result {
+                let i:Value=serde_json::from_str(&data).unwrap();
+                let path=PathBuf::from(i["path"].as_str().unwrap());
+                // Redirection creates the PID file before echo writes either
+                // marker. Stop only after the fixture has reached its wait;
+                // otherwise a fast shutdown legitimately interrupts the echo.
+                let pid_written=std::fs::read_to_string(path.join("owned-pid")).is_ok_and(|s|s.trim().parse::<i32>().is_ok_and(|pid|pid>0));
+                let marker_written=std::fs::read_to_string(path.join("attempted.txt")).is_ok_and(|s|s=="once\n");
+                if pid_written && marker_written {break path;}
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }).await.unwrap();

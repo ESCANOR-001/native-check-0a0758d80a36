@@ -146,6 +146,8 @@ pub(crate) struct Chat {
     pub native_id: String,
     pub resumed: bool,
     #[serde(default)]
+    pub claude_plan_access: Option<String>,
+    #[serde(default)]
     pub remote_identity: Option<crate::claude_host::Identity>,
     #[serde(default)]
     pub external_claude: bool,
@@ -2233,6 +2235,7 @@ impl Hub {
                 String::new()
             },
             resumed: false,
+            claude_plan_access: None,
             remote_identity: None,
             external_claude: false,
             external_stop: None,
