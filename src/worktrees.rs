@@ -91,7 +91,10 @@ impl Store {
 async fn text(root: &Path, args: &[&str]) -> Result<String, String> {
     let (code, bytes) = git(root, args).await?;
     if code != 0 {
-        return Err("Git could not prepare the isolated checkout".into());
+        return Err(format!(
+            "Git could not prepare the isolated checkout ({} exited {code})",
+            args.first().copied().unwrap_or("inspection")
+        ));
     }
     String::from_utf8(bytes)
         .map(|s| s.trim().to_owned())

@@ -78,17 +78,30 @@ impl Test {
             .clone()
     }
     async fn wait(&self, a: AgentKind, id: &str, status: &str) -> Value {
-        tokio::time::timeout(Duration::from_secs(8), async {
+        self.wait_for(a, id, status, Duration::from_secs(8)).await
+    }
+    async fn wait_for(&self, a: AgentKind, id: &str, status: &str, limit: Duration) -> Value {
+        let started = std::time::Instant::now();
+        let mut last = Value::Null;
+        let result = tokio::time::timeout(limit, async {
             loop {
                 let t = self.detail(a, id).await;
                 if t["session"]["status"] == status {
                     return t;
                 }
+                last = t;
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
-        .await
-        .unwrap()
+        .await;
+        result.unwrap_or_else(|_| {
+            panic!(
+                "{a:?}/{id} did not reach {status} after {:?}; session={}, history={}",
+                started.elapsed(),
+                last["session"],
+                last["historyPage"]
+            )
+        })
     }
     async fn stop(&self) {
         self.hub
@@ -700,6 +713,50 @@ fn fixture_git(root: &std::path::Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8(out.stdout).unwrap()
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_git_canonical_worktree_path_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project with spaces");
+    std::fs::create_dir(&root).unwrap();
+    fixture_git(&root, &["init", "-b", "main"]);
+    fixture_git(
+        &root,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    let canonical = root.canonicalize().unwrap();
+    fixture_git(&canonical, &["rev-parse", "--show-toplevel"]);
+    fixture_git(
+        &canonical,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
+    fixture_git(&canonical, &["worktree", "list", "--porcelain", "-z"]);
+    let target = dir.path().canonicalize().unwrap().join("isolated checkout");
+    fixture_git(
+        &canonical,
+        &[
+            "-c",
+            "core.hooksPath=",
+            "worktree",
+            "add",
+            "-b",
+            "fixture-checkout",
+            "--",
+            target.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
 }
 
 #[tokio::test]
@@ -2627,7 +2684,14 @@ async fn both_protocols_spill_long_turns_and_update_old_tools_without_losing_row
         let t = Test::new().await;
         t.create(a, "many").await;
         t.call(a, prompt("many", "many", "normal")).await.unwrap();
-        let done = t.wait(a, "many", "ready").await;
+        // This fixture emits 160 completed 4-KiB messages in one burst, with
+        // FULL-sync durable commits. Measure the stress case separately from
+        // the eight-second single-message/control checks on slow CI disks.
+        let started = std::time::Instant::now();
+        let done = t
+            .wait_for(a, "many", "ready", Duration::from_secs(30))
+            .await;
+        eprintln!("Durable long-turn fixture {a:?}: {:?}", started.elapsed());
         assert!(done.to_string().len() < 180 * 1024);
         assert!(done["historyPage"]["hasOlder"].as_bool().unwrap());
         let tool =
@@ -2687,7 +2751,10 @@ async fn projects_and_projectless_chats_persist_for_both_agents() {
         )
         .await
         .unwrap();
-        assert_eq!(t.detail(agent, id).await["worktreePath"], json!(root));
+        assert_eq!(
+            t.detail(agent, id).await["worktreePath"],
+            json!(root.canonicalize().unwrap())
+        );
         let scratch = format!("{id}-scratch");
         t.call(agent,json!({"type":"thread.create","commandId":scratch,"threadId":scratch,"projectId":"no-project","workspaceKind":"projectless"})).await.unwrap();
         let d = t.detail(agent, &scratch).await;
@@ -2731,7 +2798,7 @@ async fn projects_and_projectless_chats_persist_for_both_agents() {
     );
     assert_eq!(
         t.detail(AgentKind::Claude, "claude-folder").await["worktreePath"],
-        json!(root)
+        json!(root.canonicalize().unwrap())
     );
     t.stop().await;
 }
@@ -3437,7 +3504,11 @@ async fn worktree_setup_uses_configured_default_and_never_repeats_after_receipt_
     assert!(!checkout.join("must-not-run").exists());
     assert_eq!(
         std::fs::read_to_string(checkout.join("setup-env.txt")).unwrap(),
-        format!("{}\n{}\n", root.display(), checkout.display())
+        format!(
+            "{}\n{}\n",
+            root.canonicalize().unwrap().display(),
+            checkout.display()
+        )
     );
     assert_eq!(
         std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
@@ -3824,7 +3895,7 @@ async fn worktree_bootstrap_recovers_saved_setup_when_first_prompt_commit_fails(
         t.call(agent, cmd).await.unwrap();
         let d = t.wait(agent, "commit-failure", "ready").await;
         assert_eq!(d["messages"].as_array().unwrap().len(), 2);
-        assert_eq!(d["worktreePath"], json!(checkout));
+        assert_eq!(d["worktreePath"], json!(checkout.canonicalize().unwrap()));
         assert_eq!(
             std::fs::read_to_string(checkout.join("setup-ready.txt")).unwrap(),
             "once\n"
@@ -3990,7 +4061,7 @@ async fn existing_worktree_bootstrap_preserves_files_and_receipts_for_both_agent
         let cmd = existing_worktree_bootstrap(agent, &checkout, "existing-chat");
         t.call(agent, cmd.clone()).await.unwrap();
         let d = t.wait(agent, "existing-chat", "ready").await;
-        assert_eq!(d["worktreePath"], json!(checkout));
+        assert_eq!(d["worktreePath"], json!(checkout.canonicalize().unwrap()));
         assert_eq!(d["branch"], "existing-work");
         assert_eq!(d["messages"].as_array().unwrap().len(), 2);
         assert!(!checkout.join("must-not-run").exists());
