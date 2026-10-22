@@ -45,6 +45,14 @@ pub fn catalog(rows: &Value, codex: bool, default: &str) -> Value {
             }
         };
         let mut model = json!({"slug":slug,"name":if name.is_empty(){slug.to_owned()}else{bounded(name,256)},"isCustom":false,"isDefault":slug==default,"capabilities":{"optionDescriptors":descriptors}});
+        // A shared session reports its wire model ID, while the picker lists
+        // aliases. Keep the CLI's public mapping to validate unchanged models.
+        if let Some(resolved) = row["resolvedModel"]
+            .as_str()
+            .filter(|v| !codex && !v.is_empty() && v.len() <= 256)
+        {
+            model["resolvedModel"] = json!(resolved);
+        }
         if !codex && slug == "default" {
             let resolved = s(&row["resolvedModel"]);
             let matched = rows.as_array().into_iter().flatten().find(|r| {
@@ -135,6 +143,14 @@ pub fn selection(
         }
     }
     Ok(json!({"instanceId":instance,"model":model,"options":options}))
+}
+/// The catalog row that reports `model`, by alias or by the wire model it
+/// resolves to. Used only to validate options of an unchanged native model.
+pub fn row<'a>(catalog: &'a Value, model: &str) -> Option<&'a Value> {
+    let rows = catalog.as_array()?;
+    rows.iter()
+        .find(|v| v["slug"] == model)
+        .or_else(|| rows.iter().find(|v| v["resolvedModel"] == model))
 }
 pub fn effort(selection: &Value) -> Option<&str> {
     selection["options"]

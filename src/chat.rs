@@ -328,6 +328,7 @@ impl Chats {
                 claude_recovery,
                 shared_watches,
                 tool_controls: HashSet::new(),
+                confirmed_settings: None,
                 prepared_edits: HashMap::new(),
                 prepared_bootstraps: HashMap::new(),
                 seq: 0,
@@ -410,6 +411,8 @@ struct PreparedBootstrap {
 }
 struct Hub {
     tool_controls: HashSet<String>,
+    /// (chat, command) whose model/effort the shared worker just confirmed.
+    confirmed_settings: Option<(String, String)>,
     prepared_edits: HashMap<String, crate::editing::Prepared>,
     prepared_bootstraps: HashMap<String, (Chat, PathBuf)>,
     db: AuthService,
@@ -920,7 +923,9 @@ impl Hub {
                     (id, native, send_epoch, result)
                 });
             }
-            if discovery.is_empty() && self.active.is_empty() {
+            // Metadata-only and isolated: idle shared connections must not keep
+            // a stale catalog (or its alias-to-wire mapping) forever.
+            if discovery.is_empty() && self.busy_count() == 0 {
                 if let Some(agent) = to_discover.pop() {
                     let config = self.config.provider(agent).clone();
                     let cwd = self.config.workspace.clone();
@@ -975,6 +980,16 @@ impl Hub {
                             Err(error)=>{let _=r.reply.send(Err(error));},
                         }
                         continue;
+                    }
+                    // A shared session's model/effort is confirmed by its own
+                    // worker before the unchanged prompt path may deliver.
+                    if r.method=="orchestration.dispatchCommand" && r.agent==AgentKind::Claude && r.params["type"]=="thread.turn.start"
+                        && self.chats.get(s(&r.params["threadId"])).is_some_and(|c|c.external_claude) {
+                        match self.prepare_shared_settings(&r).await {
+                            Ok(Some(steps))=>{self.start_shared_settings(r,steps).await;continue;},
+                            Ok(None)=>{},
+                            Err(error)=>{let _=r.reply.send(Err(error));continue;},
+                        }
                     }
                     if r.method=="orchestration.dispatchCommand" && r.params["type"]=="thread.turn.start" && (r.params["bootstrap"].get("prepareWorktree").is_some() || r.params["bootstrap"]["createThread"]["worktreePath"].is_string() || r.params["bootstrap"]["createThread"]["branch"].is_string()) {
                         let id=s(&r.params["threadId"]).to_owned();
@@ -1233,7 +1248,7 @@ impl Hub {
                     if let Err(error)=result {self.end(&id,"error",Some(&error)).await;}
                 }
                 _=tick.tick()=>{
-                    self.expire_native_controls();
+                    self.expire_native_controls().await;
                     self.reconnect_claude().await;
                     previews.retain(|_,p|p.created.elapsed()<Duration::from_secs(60));
                     let expired:Vec<_>=shared_sends.iter().filter(|(_, (at,_,r))|at.elapsed()>Duration::from_secs(30) || r.reply.is_closed()).map(|(id,_)|id.clone()).collect();
@@ -2497,8 +2512,11 @@ impl Hub {
                         .unwrap_or_else(|| {
                             crate::models::fallback(&self.config.provider(agent).model)
                         });
-                    let selection = if self.chats[&id].external_claude {
-                        observer::unchanged_selection(&c["modelSelection"],&self.chats[&id].thread["modelSelection"])?
+                    let selection = if self.confirmed_settings.as_ref().is_some_and(|(chat,cmd)|*chat==id && *cmd==command) {
+                        // Acknowledged by the worker, which reports wire IDs for aliases.
+                        self.chats[&id].thread["modelSelection"].clone()
+                    } else if self.chats[&id].external_claude {
+                        crate::native_control::shared_selection(&catalog,&c["modelSelection"],&self.chats[&id].thread["modelSelection"])?
                     } else {crate::models::selection(
                         &catalog,
                         &c["modelSelection"],
@@ -3332,7 +3350,7 @@ impl Hub {
                     action,
                     &v,
                 );
-                self.complete_native_control(&id);
+                self.complete_native_control(&id).await;
                 return Ok(());
             }
             let cid = id.clone();
@@ -4548,7 +4566,7 @@ impl Hub {
         };
         // A transport failure is not a turn failure. The shared daemon owns the
         // process and continues its tools; do not send an implicit interrupt.
-        native_control::disconnect(&mut worker);
+        let _ = native_control::disconnect(&mut worker);
         self.tool_controls.remove(id);
         worker.connection.close().await;
         let chat = self.chats.get_mut(id).unwrap();
@@ -4575,7 +4593,7 @@ impl Hub {
         let Some(mut w) = self.active.remove(id) else {
             return;
         };
-        native_control::disconnect(&mut w);
+        let _ = native_control::disconnect(&mut w);
         self.tool_controls.remove(id);
         if let Some(read) = w.metadata.capability_read.take() {
             for reply in read.replies {

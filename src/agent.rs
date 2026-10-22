@@ -228,6 +228,21 @@ impl Connection {
         let (writes, mut input) = mpsc::channel::<Write>(2);
         let (output, events) = mpsc::channel(2);
         let (stop, mut stopping) = watch::channel(false);
+        #[cfg(test)]
+        if let Some(fixture) = observer_fixture::registered(&profile) {
+            let _ = fixture.send(observer_fixture::Fake {
+                input,
+                output,
+                cursor,
+                db,
+            });
+            return Self {
+                writes,
+                events,
+                stop,
+                task: None,
+            };
+        }
         let task = tokio::spawn(async move {
             let session = native.clone();
             let pending = db
@@ -792,5 +807,88 @@ pub async fn frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option
         if end.is_some() {
             return Ok(Some(bytes));
         }
+    }
+}
+
+/// Unit-test stand-in for the Remote Control relay of one isolated profile.
+/// It receives exactly the observer's writes and supplies its events.
+#[cfg(test)]
+pub(crate) mod observer_fixture {
+    use super::*;
+    use std::{path::Path, sync::Mutex};
+    pub(crate) struct Fake {
+        pub input: mpsc::Receiver<Write>,
+        pub output: mpsc::Sender<Event>,
+        pub cursor: crate::claude_cursor::Cursor,
+        pub db: crate::auth_service::AuthService,
+    }
+    type Registry = Mutex<Vec<(PathBuf, mpsc::UnboundedSender<Fake>)>>;
+    static FIXTURES: Registry = Mutex::new(Vec::new());
+    pub(crate) fn register(profile: &Path) -> mpsc::UnboundedReceiver<Fake> {
+        let (send, receive) = mpsc::unbounded_channel();
+        FIXTURES.lock().unwrap().push((profile.into(), send));
+        receive
+    }
+    pub(super) fn registered(profile: &Path) -> Option<mpsc::UnboundedSender<Fake>> {
+        let fixtures = FIXTURES.lock().unwrap();
+        fixtures
+            .iter()
+            .find(|(path, _)| path == profile)
+            .map(|(_, send)| send.clone())
+    }
+    /// An emitted worker event awaiting the hub's commit.
+    pub(crate) type Pending = Option<(crate::claude_cursor::Cursor, crate::claude_host::Receipt)>;
+    /// Offers one durable worker event, as the real observer does.
+    pub(crate) async fn emit(
+        fake: &mut Fake,
+        pending: &mut Pending,
+        payload: serde_json::Value,
+    ) -> bool {
+        let sequence = fake.cursor.sequence + 1;
+        let event = crate::claude_remote::Envelope {
+            sequence: Some(sequence),
+            event_id: Some(format!("fixture-{sequence}")),
+            created_at: None,
+            source: "worker".into(),
+            payload: Some(payload),
+            deliveries: vec![],
+            receipt_checkpoint: false,
+            recovery: None,
+        };
+        let receipt = crate::claude_host::Ledger::default()
+            .observe(event.payload.as_ref().unwrap())
+            .unwrap();
+        *pending = Some((
+            fake.cursor
+                .advance(&event, serde_json::Value::Null)
+                .unwrap(),
+            receipt,
+        ));
+        fake.output.send(Event::ClaudeRemote(event)).await.is_ok()
+    }
+    /// Answers one write; a commit saves the pending event with its receipt.
+    pub(crate) async fn answer(
+        fake: &mut Fake,
+        pending: &mut Pending,
+        (bytes, reply): Write,
+    ) -> serde_json::Value {
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if value["type"] == "remodex_observer_commit" {
+            let (mut after, receipt) = pending.take().expect("commit without a pending event");
+            after.projection = value["projection"].clone();
+            let (before, saved, state) =
+                (fake.cursor.clone(), after.clone(), value["state"].clone());
+            fake.db
+                .call(move |a| {
+                    a.store
+                        .save_claude_remote_receipt(&state, &before, &saved, Some(&receipt))
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            fake.cursor = after;
+        }
+        let _ = reply.send(Ok(()));
+        value
     }
 }

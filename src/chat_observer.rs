@@ -28,25 +28,6 @@ pub(super) fn record_stop(chat: &mut Chat) -> String {
     request
 }
 
-pub(super) fn unchanged_selection(requested: &Value, current: &Value) -> Result<Value, String> {
-    if requested["instanceId"]
-        .as_str()
-        .is_some_and(|s| s != "claude-code")
-        || requested["model"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty() && current["model"] != s)
-        || requested
-            .get("options")
-            .is_some_and(|v| v != &current["options"])
-    {
-        return Err("Keep this session's current model and effort; remote setting changes are not migrated yet".into());
-    }
-    // The original worker reports a resolved model ID, whereas the picker
-    // catalog may expose aliases only. Preserving that exact ID changes no
-    // native setting and must not require it to appear in the alias list.
-    Ok(current.clone())
-}
-
 impl Hub {
     pub(super) async fn connect_external_claude(
         &mut self,
@@ -220,7 +201,9 @@ impl Hub {
                 .as_str()
                 .is_some_and(|v| chat.thread["interactionMode"] != v)
         {
-            return Err("Keep this session's current model and access settings; remote setting changes are not migrated yet".into());
+            // Settings are confirmed by the worker first; never send a prompt
+            // whose model, effort or access differs from the confirmed state.
+            return Err("Claude has not confirmed this message's model, effort or access settings. Nothing was sent; try again.".into());
         }
         Ok(())
     }
@@ -494,7 +477,7 @@ impl Hub {
                 );
             }
         }
-        self.complete_native_control(id);
+        self.complete_native_control(id).await;
         if let Some(metadata::Reply::Context(value)) = metadata {
             self.report_usage(id, true, value).await?;
         }
@@ -512,6 +495,9 @@ impl Hub {
             && !self.chats[id].paused
             && !self.chats[id].queue.is_empty()
         {
+            if self.queue_shared_settings(id).await {
+                return Ok(());
+            }
             let next = self.chats.get_mut(id).unwrap().queue.remove(0);
             if let Err(error) = self.begin(id, next.clone(), None).await {
                 let chat = self.chats.get_mut(id).unwrap();
@@ -528,7 +514,7 @@ impl Hub {
         let Some(mut w) = self.active.remove(id) else {
             return;
         };
-        native_control::disconnect(&mut w);
+        let queued = native_control::disconnect(&mut w);
         self.tool_controls.remove(id);
         w.metadata.disconnect();
         w.connection.close().await; // Only this observer socket; never the owner.
@@ -541,6 +527,9 @@ impl Hub {
             .ok();
         let chat = self.chats.get_mut(id).unwrap();
         chat.paused = true;
+        if let Some(error) = queued {
+            chat.thread["session"]["lastError"] = json!(error);
+        }
         chat.thread["session"]["statusConfidence"] = json!("unavailable");
         projection::activity(
             chat,
@@ -552,27 +541,5 @@ impl Hub {
         );
         let _ = self.save(id, None).await;
         self.dirty = true;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn keeps_verified_native_model_without_requiring_picker_alias_or_applying_overrides() {
-        let current =
-            json!({"instanceId":"claude-code","model":"claude-resolved-model","options":[]});
-        assert_eq!(unchanged_selection(&current, &current).unwrap(), current);
-        assert_eq!(
-            unchanged_selection(&Value::Null, &current).unwrap(),
-            current
-        );
-        assert!(unchanged_selection(&json!({"model":"sonnet"}), &current).is_err());
-        assert!(unchanged_selection(&json!({"instanceId":"codex"}), &current).is_err());
-        assert!(unchanged_selection(
-            &json!({"options":[{"id":"effort","value":"high"}]}),
-            &current
-        )
-        .is_err());
     }
 }

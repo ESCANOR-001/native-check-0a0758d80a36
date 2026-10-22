@@ -1,10 +1,91 @@
 //! Durable, explicitly requested controls of an already verified Claude worker.
 //! Reservation is saved before delivery. Reconnect never repeats a control.
-use crate::{capabilities::Control, chat::Chat};
+use crate::{capabilities::Control, chat::Chat, chat_projection::s};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub(crate) const UNCERTAIN: &str = "Claude has not confirmed this control. Refresh its status before trying again; it was not replayed.";
+const MODEL_PENDING: &str = "Claude has not confirmed the model change yet; it may still apply after Claude finishes an earlier model request. Check the model before sending again; nothing was retried.";
+const INSTANCE: &str = "claude-code";
+
+/// Validates a shared session's requested model and effort against the CLI
+/// catalog. An unchanged selection returns the confirmed one exactly, even
+/// when the session reports a wire model ID that the picker lists by alias.
+pub(crate) fn shared_selection(
+    catalog: &Value,
+    requested: &Value,
+    current: &Value,
+) -> Result<Value, String> {
+    if requested.is_null() {
+        return Ok(current.clone());
+    }
+    if requested["instanceId"]
+        .as_str()
+        .is_some_and(|v| v != INSTANCE)
+    {
+        return Err("Model belongs to a different agent".into());
+    }
+    let model = requested["model"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| s(&current["model"]));
+    // The worker reports the wire model an alias resolves to, so the alias
+    // and that ID are the same confirmed model, never a change to apply.
+    let resolves = |alias: &str, wire: &str| {
+        crate::models::row(catalog, alias)
+            .is_some_and(|r| r["slug"] == alias && r["resolvedModel"] == wire)
+    };
+    let confirmed = s(&current["model"]);
+    let same = model == confirmed || resolves(model, confirmed) || resolves(confirmed, model);
+    if same {
+        let unchanged = match requested.get("options") {
+            None => true,
+            Some(options) if options == &current["options"] => true,
+            Some(options) => options.as_array().is_some_and(|a| {
+                a.iter().all(|v| v["id"] == "effort")
+                    && a.iter()
+                        .find_map(|v| v["value"].as_str().filter(|v| *v != "auto"))
+                        == crate::models::effort(current)
+            }),
+        };
+        if unchanged {
+            return Ok(current.clone());
+        }
+    }
+    // A listed alias, or the explicit wire ID that an alias resolves to. The
+    // CLI accepts both; anything else was never reported by this agent.
+    let mut row = crate::models::row(catalog, model)
+        .ok_or(if same {
+            "Select a model from the list before changing its effort"
+        } else {
+            "Select a model reported by this agent"
+        })?
+        .clone();
+    row["slug"] = json!(model);
+    let mut target = crate::models::selection(&json!([row]), requested, current, INSTANCE)?;
+    if same {
+        target["model"] = current["model"].clone();
+    }
+    if target["model"] == current["model"]
+        && crate::models::effort(&target) == crate::models::effort(current)
+    {
+        return Ok(current.clone());
+    }
+    Ok(target)
+}
+/// Native steps that make `current` equal `target`: the model first, since
+/// supported effort levels depend on it.
+pub(crate) fn settings_steps(target: &Value, current: &Value) -> Vec<Control> {
+    let mut steps = vec![];
+    if target["model"] != current["model"] {
+        steps.push(Control::Model(s(&target["model"]).into()));
+    }
+    let effort = crate::models::effort(target);
+    if effort != crate::models::effort(current) {
+        steps.push(Control::Effort(effort.map(str::to_owned)));
+    }
+    steps
+}
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Intent {
     pub key: String,
@@ -48,7 +129,22 @@ pub(crate) fn apply(chat: &mut Chat, value: &Value) -> bool {
         {
             json!({"error":"Claude's Remote Control connection does not support this action. Use the original Claude session for this control. This chat is unchanged."})
         } else {
-            json!({"error":"Claude could not apply this control in the current session. The previous settings are retained."})
+            match &intent.action {
+                // The CLI answers after its verdict deadline while the switch
+                // can still complete later. That is neither success nor refusal.
+                Control::Model(_) if message.starts_with("This model switch is still pending") => {
+                    json!({"error":MODEL_PENDING})
+                }
+                Control::Model(_) => {
+                    json!({"error":"Claude did not accept this model for the current session. The previous model is retained."})
+                }
+                Control::Effort(_) => {
+                    json!({"error":"Claude did not accept this effort for the current session. The previous effort is retained."})
+                }
+                _ => {
+                    json!({"error":"Claude could not apply this control in the current session. The previous settings are retained."})
+                }
+            }
         }
     } else {
         let result = &value["response"]["response"];
@@ -77,6 +173,18 @@ pub(crate) fn apply(chat: &mut Chat, value: &Value) -> bool {
             }
             Control::ReloadPlugins if result["error_count"].as_u64().unwrap_or(0) > 0 => {
                 json!({"warning":"Some plugins could not reload. Check their configuration on the PC."})
+            }
+            Control::Model(model) => {
+                chat.thread["modelSelection"]["instanceId"] = json!(INSTANCE);
+                chat.thread["modelSelection"]["model"] = json!(model);
+                json!({"updated":true})
+            }
+            Control::Effort(level) => {
+                chat.thread["modelSelection"]["options"] = json!(level
+                    .iter()
+                    .map(|v| json!({"id":"effort","value":v}))
+                    .collect::<Vec<_>>());
+                json!({"updated":true})
             }
             _ => json!({"updated":true}),
         }
@@ -195,6 +303,191 @@ mod tests {
                 .to_string()
                 .contains("PRIVATE_METADATA"));
         }
+    }
+    fn shared_catalog() -> Value {
+        crate::models::catalog(
+            &json!([
+                {"value":"default","displayName":"Default","resolvedModel":"claude-wire-sonnet","supportedEffortLevels":["low","high"]},
+                {"value":"sonnet","displayName":"Sonnet","resolvedModel":"claude-wire-sonnet","supportedEffortLevels":["low","high"]},
+                {"value":"opus","displayName":"Opus","resolvedModel":"claude-wire-opus","supportedEffortLevels":["low","high","max"]},
+                {"value":"haiku","displayName":"Haiku","resolvedModel":"claude-wire-haiku"}
+            ]),
+            false,
+            "default",
+        )
+    }
+    fn opus_max() -> Value {
+        json!({"model":"opus","options":[{"id":"effort","value":"max"}]})
+    }
+    #[test]
+    fn shared_selection_validates_actual_capabilities_and_keeps_unchanged_wire_models() {
+        let catalog = shared_catalog();
+        let current = json!({"instanceId":"claude-code","model":"claude-wire-sonnet","options":[]});
+        for unchanged in [
+            Value::Null,
+            current.clone(),
+            json!({"instanceId":"claude-code","model":"claude-wire-sonnet"}),
+            json!({"model":"claude-wire-sonnet","options":[{"id":"effort","value":"auto"}]}),
+        ] {
+            let selected = shared_selection(&catalog, &unchanged, &current).unwrap();
+            assert_eq!(selected, current, "{unchanged}");
+            assert!(settings_steps(&selected, &current).is_empty());
+        }
+        // An effort-only change on a reported wire model uses the alias row
+        // that resolves to it; the model itself is not touched.
+        let effort = shared_selection(
+            &catalog,
+            &json!({"model":"claude-wire-sonnet","options":[{"id":"effort","value":"high"}]}),
+            &current,
+        )
+        .unwrap();
+        assert_eq!(effort["model"], "claude-wire-sonnet");
+        assert!(matches!(
+            settings_steps(&effort, &current).as_slice(),
+            [Control::Effort(Some(level))] if level == "high"
+        ));
+        let both = shared_selection(
+            &catalog,
+            &json!({"model":"opus","options":[{"id":"effort","value":"max"}]}),
+            &current,
+        )
+        .unwrap();
+        let steps = settings_steps(&both, &current);
+        assert!(
+            matches!(steps.as_slice(), [Control::Model(m), Control::Effort(Some(e))] if m == "opus" && e == "max"),
+            "model must precede effort"
+        );
+        assert_eq!(
+            steps[0].request(),
+            json!({"subtype":"set_model","model":"opus"})
+        );
+        assert_eq!(
+            steps[1].request(),
+            json!({"subtype":"apply_flag_settings","settings":{"effortLevel":"max"}})
+        );
+        let auto = shared_selection(&catalog, &json!({"model":"opus"}), &effort).unwrap();
+        assert!(matches!(
+            settings_steps(&auto, &effort).as_slice(),
+            [Control::Model(_), Control::Effort(None)]
+        ));
+        assert_eq!(
+            Control::Effort(None).request()["settings"],
+            json!({"effortLevel":null})
+        );
+        for (requested, error) in [
+            (json!({"model":"not-reported"}), "reported by this agent"),
+            (
+                json!({"instanceId":"codex","model":"opus"}),
+                "different agent",
+            ),
+            (
+                json!({"model":"sonnet","options":[{"id":"effort","value":"max"}]}),
+                "does not support",
+            ),
+            (
+                json!({"model":"haiku","options":[{"id":"effort","value":"low"}]}),
+                "does not support",
+            ),
+            (
+                json!({"model":"opus","options":[{"id":"thinking","value":true}]}),
+                "Unsupported model option",
+            ),
+        ] {
+            assert!(
+                shared_selection(&catalog, &requested, &current)
+                    .unwrap_err()
+                    .contains(error),
+                "{requested}"
+            );
+        }
+        // After set_model("opus") the worker reports its wire ID. The alias
+        // stays the same model: only the effort is a change.
+        let reported = json!({"instanceId":"claude-code","model":"claude-wire-opus","options":[]});
+        assert_eq!(
+            shared_selection(&catalog, &json!({"model":"opus","options":[]}), &reported).unwrap(),
+            reported
+        );
+        let alias_effort = shared_selection(&catalog, &opus_max(), &reported).unwrap();
+        assert_eq!(alias_effort["model"], "claude-wire-opus");
+        assert!(matches!(
+            settings_steps(&alias_effort, &reported).as_slice(),
+            [Control::Effort(Some(e))] if e == "max"
+        ));
+        let back = shared_selection(&catalog, &current, &both).unwrap();
+        assert_eq!(
+            back, current,
+            "a reported wire ID is a valid explicit target"
+        );
+        assert!(matches!(
+            settings_steps(&back, &both).as_slice(),
+            [Control::Model(m), Control::Effort(None)] if m == "claude-wire-sonnet"
+        ));
+        let unknown = json!({"instanceId":"claude-code","model":"claude-unlisted","options":[]});
+        assert_eq!(
+            shared_selection(&catalog, &unknown, &unknown).unwrap(),
+            unknown
+        );
+        assert!(shared_selection(
+            &catalog,
+            &json!({"model":"claude-unlisted","options":[{"id":"effort","value":"high"}]}),
+            &unknown
+        )
+        .unwrap_err()
+        .contains("before changing its effort"));
+    }
+    #[test]
+    fn model_and_effort_change_only_on_their_matching_successful_acknowledgement() {
+        let base = json!({"agent":"claude","native_id":"native","resumed":true,"external_claude":true,"thread":{"modelSelection":{"instanceId":"claude-code","model":"claude-wire-sonnet","options":[]}}});
+        let ack = |subtype: &str, error: &str| json!({"type":"control_response","response":{"request_id":"request","subtype":subtype,"error":error}});
+        let mut state = base.clone();
+        state["native_control"] = json!({"key":"key","digest":"digest","request":"request","action":{"Model":"opus"},"deadline":0,"result":null});
+        let mut chat: Chat = serde_json::from_value(state.clone()).unwrap();
+        assert!(!apply(
+            &mut chat,
+            &json!({"type":"control_response","response":{"request_id":"other","subtype":"success"}})
+        ));
+        assert!(apply(&mut chat, &ack("success", "")));
+        assert_eq!(chat.thread["modelSelection"]["model"], "opus");
+        assert_eq!(chat.thread["modelSelection"]["options"], json!([]));
+        assert!(
+            !apply(&mut chat, &ack("success", "")),
+            "one acknowledgement applies once"
+        );
+        for (error, expected) in [
+            ("This model switch is still pending (an earlier model request or a PreModelSwitch hook has not finished); it will apply when that completes unless it is refused", "may still apply"),
+            ("PRIVATE_METADATA refused", "previous model is retained"),
+        ] {
+            let mut chat: Chat = serde_json::from_value(state.clone()).unwrap();
+            assert!(apply(&mut chat, &ack("error", error)));
+            assert_eq!(chat.thread, base["thread"]);
+            let result = chat.native_control.unwrap().result.unwrap();
+            assert!(response(result.clone()).unwrap_err().contains(expected));
+            assert!(!result.to_string().contains("PRIVATE_METADATA"));
+        }
+        state["native_control"]["action"] = json!({"Effort":"high"});
+        let mut chat: Chat = serde_json::from_value(state.clone()).unwrap();
+        assert!(apply(&mut chat, &ack("error", "PRIVATE_METADATA")));
+        assert_eq!(chat.thread, base["thread"]);
+        assert!(response(chat.native_control.unwrap().result.unwrap())
+            .unwrap_err()
+            .contains("previous effort is retained"));
+        let mut chat: Chat = serde_json::from_value(state.clone()).unwrap();
+        assert!(apply(&mut chat, &ack("success", "")));
+        assert_eq!(
+            chat.thread["modelSelection"],
+            json!({"instanceId":"claude-code","model":"claude-wire-sonnet","options":[{"id":"effort","value":"high"}]})
+        );
+        // A durable reservation survives a restart in the same serialized form.
+        let restored: Chat = serde_json::from_value(serde_json::to_value(&chat).unwrap()).unwrap();
+        assert!(matches!(
+            restored.native_control.unwrap().action,
+            Control::Effort(Some(level)) if level == "high"
+        ));
+        state["native_control"]["action"] = json!({"Effort":null});
+        let mut chat: Chat = serde_json::from_value(state).unwrap();
+        chat.thread["modelSelection"]["options"] = json!([{"id":"effort","value":"high"}]);
+        assert!(apply(&mut chat, &ack("success", "")));
+        assert_eq!(chat.thread["modelSelection"]["options"], json!([]));
     }
     #[test]
     fn plan_status_keeps_only_confirmed_access_and_forgets_it_after_owner_changes() {

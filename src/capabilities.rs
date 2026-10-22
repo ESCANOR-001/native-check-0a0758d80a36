@@ -166,6 +166,10 @@ pub enum Control {
         runtime_mode: String,
         interaction_mode: String,
     },
+    /// Shared sessions only; a validated catalog slug, never a guessed ID.
+    Model(String),
+    /// `None` clears the session override, matching the picker's Auto.
+    Effort(Option<String>),
 }
 impl Control {
     pub fn parse(v: &Value) -> Result<Self, String> {
@@ -205,6 +209,11 @@ impl Control {
                     _ => "default",
                 };
                 json!({"subtype":"set_permission_mode","mode":mode})
+            }
+            Self::Model(model) => json!({"subtype":"set_model","model":model}),
+            // Remote Control accepts only effortLevel/ultracode flag settings.
+            Self::Effort(level) => {
+                json!({"subtype":"apply_flag_settings","settings":{"effortLevel":level}})
             }
         }
     }
