@@ -1956,19 +1956,57 @@ impl Hub {
                     .await
                     .map_err(|_| "File service stopped")?
             }
-            "filesystem.browse"
-            | "projects.listEntries"
-            | "projects.searchEntries"
-            | "projects.readFile"
-            | "projects.writeFile" => {
+            "projects.listEntries" | "projects.searchEntries" | "projects.readFile" => {
+                // Read-only browsing may follow a registered project or a
+                // verified chat workspace outside the new-chat default root.
+                // Never turn an arbitrary cwd from the phone into a root.
+                let mut roots = vec![self.config.workspace.clone()];
+                roots.extend(
+                    self.projects
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|project| {
+                            project["workspaceRoot"]
+                                .as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(PathBuf::from)
+                        }),
+                );
+                roots.extend(
+                    self.chats
+                        .values()
+                        .filter(|chat| chat.agent == agent && chat.thread["deletedAt"].is_null())
+                        .filter_map(|chat| {
+                            chat.thread["worktreePath"]
+                                .as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(PathBuf::from)
+                        }),
+                );
+                let method = method.to_owned();
+                tokio::task::spawn_blocking(move || {
+                    let root = roots
+                        .iter()
+                        .find_map(|base| crate::workspace::resolve(base, s(&p["cwd"])).ok())
+                        .ok_or("Folder is not part of a registered project or chat")?;
+                    let mut p = p;
+                    p["cwd"] = json!(root);
+                    match method.as_str() {
+                        "projects.listEntries" => crate::workspace::entries(&root, &p, false),
+                        "projects.searchEntries" => crate::workspace::entries(&root, &p, true),
+                        _ => crate::workspace::read(&root, &p),
+                    }
+                })
+                .await
+                .map_err(|_| "File service stopped")?
+            }
+            "filesystem.browse" | "projects.writeFile" => {
                 let base = self.config.workspace.clone();
                 let method = method.to_owned();
                 tokio::task::spawn_blocking(move || match method.as_str() {
                     "filesystem.browse" => crate::workspace::browse(&base, &p),
-                    "projects.listEntries" => crate::workspace::entries(&base, &p, false),
-                    "projects.searchEntries" => crate::workspace::entries(&base, &p, true),
-                    "projects.writeFile" => crate::workspace::write(&base, &p),
-                    _ => crate::workspace::read(&base, &p),
+                    _ => crate::workspace::write(&base, &p),
                 })
                 .await
                 .map_err(|_| "File service stopped")?

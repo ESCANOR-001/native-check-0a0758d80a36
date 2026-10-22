@@ -2774,6 +2774,54 @@ async fn existing_chat_file_previews_use_the_chat_workspace_not_the_bridge_defau
             assert_eq!(result["content"], "DESKTOP_FILE_OK");
             assert!(result.get("contents").is_none());
         }
+        for method in [
+            "projects.listEntries",
+            "projects.searchEntries",
+            "projects.readFile",
+        ] {
+            let params = json!({"cwd":project.path(),"relativePath":"note.txt","query":"note"});
+            let result = t
+                .hub
+                .call(agent, "phone", method, params.clone())
+                .await
+                .unwrap();
+            if method == "projects.readFile" {
+                assert_eq!(result["contents"], "DESKTOP_FILE_OK");
+            } else {
+                assert!(result["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["path"] == "note.txt"));
+            }
+            let other = if agent == AgentKind::Codex {
+                AgentKind::Claude
+            } else {
+                AgentKind::Codex
+            };
+            assert!(t.hub.call(other, "phone", method, params).await.is_err());
+            assert!(t
+                .hub
+                .call(
+                    agent,
+                    "phone",
+                    method,
+                    json!({"cwd":project.path().parent(),"relativePath":"note.txt","query":"note"})
+                )
+                .await
+                .is_err());
+        }
+        // Read authorization must not expand the write boundary.
+        assert!(t
+            .hub
+            .call(
+                agent,
+                "phone",
+                "projects.writeFile",
+                json!({"cwd":project.path(),"relativePath":"note.txt","contents":"changed"})
+            )
+            .await
+            .is_err());
         let large = t
             .hub
             .call(

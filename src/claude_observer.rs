@@ -478,7 +478,10 @@ mod tests {
             remote,
             Link {
                 identity: identity.clone(),
-                cwd: dir.path().into(),
+                // Real links are canonicalized by claude_link::read. On
+                // macOS temp paths are symlinks; Windows adds a verbatim
+                // prefix. Keep the fixture faithful to that invariant.
+                cwd: dir.path().canonicalize().unwrap(),
                 title: "Test".into(),
             },
             cursor,
