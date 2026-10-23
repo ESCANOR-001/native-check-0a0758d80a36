@@ -195,6 +195,7 @@ fn secure(mut r: Response) -> Response {
 pub(crate) fn routes(app: App) -> Router<App> {
     Router::new()
         .route("/api/connect/activity", get(activity))
+        .route("/api/storage", get(storage_report))
         .route("/api/android-remote", get(status))
         .route(
             "/api/android-remote/claude-code",
@@ -214,6 +215,18 @@ async fn activity(State(app): State<App>) -> Response {
         );
     };
     match chats.activity.read().await {
+        Ok(value) => response(StatusCode::OK, value),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    }
+}
+async fn storage_report(State(app): State<App>) -> Response {
+    let Some(chats) = app.chats else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Select the isolated agent configuration first",
+        );
+    };
+    match chats.storage_report.read().await {
         Ok(value) => response(StatusCode::OK, value),
         Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e),
     }

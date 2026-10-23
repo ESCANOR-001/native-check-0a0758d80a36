@@ -48,6 +48,7 @@ pub mod invitation_file;
 pub mod profile_lock;
 pub mod storage;
 mod storage_disk;
+mod storage_report;
 
 mod subprocess;
 

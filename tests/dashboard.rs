@@ -184,6 +184,38 @@ async fn agents_dashboard_uses_real_profile_status_and_isolated_preferences() {
             .0,
         StatusCode::METHOD_NOT_ALLOWED
     );
+    for headers in [
+        vec![],
+        vec![("authorization", format!("Bearer {}", f.phone))],
+    ] {
+        let headers: Vec<_> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(
+            call(router.clone(), "GET", "/api/storage", &headers, Value::Null)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let (code, body) = call(router.clone(), "GET", "/api/storage", &good, Value::Null).await;
+    assert_eq!(code, StatusCode::OK);
+    let report: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        report["codexHome"],
+        f._root.path().to_string_lossy().as_ref()
+    );
+    assert_eq!(report["buckets"].as_array().unwrap().len(), 7);
+    assert_eq!(report["buckets"][0]["fileCount"], 1);
+    assert_eq!(
+        std::fs::read_to_string(sessions.join("test.jsonl")).unwrap(),
+        source
+    );
+    assert!(!body.contains("PRIVATE_THREAD"));
+    assert_eq!(
+        call(router.clone(), "POST", "/api/storage", &good, json!({}))
+            .await
+            .0,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
     let (code, body) = call(
         router.clone(),
         "PUT",
