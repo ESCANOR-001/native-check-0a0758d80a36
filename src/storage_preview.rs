@@ -105,6 +105,8 @@ fn restoring(home: &Path, budget: &mut Budget) -> Result<BTreeSet<String>> {
                                 | "restoring"
                                 | "restored"
                                 | "rows_restored"
+                                | "purging"
+                                | "purged"
                         )
                     )
                 {

@@ -129,11 +129,32 @@ fn snapshot<'a>(mut databases: Vec<Database<'a>>, paths: &[String]) -> Result<Ve
 }
 /// An explicit caller-selected quarantine; never invoked automatically.
 pub fn quarantine(home: &Path, percent: f64, digest: &str) -> std::result::Result<Value, Failure> {
-    quarantine_inner(home, percent, digest, &|_| Ok(()))
+    cleanup(home, percent, "quarantine", digest)
 }
+pub fn cleanup(
+    home: &Path,
+    percent: f64,
+    mode: &str,
+    digest: &str,
+) -> std::result::Result<Value, Failure> {
+    if !matches!(mode, "quarantine" | "permanent") {
+        return Err("invalid_mode".into());
+    }
+    cleanup_inner(home, percent, mode, digest, &|_| Ok(()))
+}
+#[cfg(test)]
 fn quarantine_inner(
     home: &Path,
     percent: f64,
+    digest: &str,
+    hook: &dyn Fn(Point) -> Result<()>,
+) -> std::result::Result<Value, Failure> {
+    cleanup_inner(home, percent, "quarantine", digest, hook)
+}
+fn cleanup_inner(
+    home: &Path,
+    percent: f64,
+    mode: &str,
     digest: &str,
     hook: &dyn Fn(Point) -> Result<()>,
 ) -> std::result::Result<Value, Failure> {
@@ -153,7 +174,7 @@ fn quarantine_inner(
         .collect();
     if logical.is_empty() {
         return Ok(
-            json!({"ok":true,"mode":"quarantine","percent":selected.percent,"count":0,"bytes":0,"removedPaths":[]}),
+            json!({"ok":true,"mode":mode,"percent":selected.percent,"count":0,"bytes":0,"removedPaths":[]}),
         );
     }
     let files: Vec<_> = selected
@@ -177,7 +198,7 @@ fn quarantine_inner(
         sections,
     };
     let raw = serde_json::to_vec(&backup).map_err(|_| Failure::from("db_reconcile_failed"))?;
-    let manifest=serde_json::to_vec(&json!({"nativeVersion":1,"quarantinedAt":crate::auth::now(),"mode":"quarantine","percent":selected.percent,"digest":selected.digest,"entries":selected.candidates})).map_err(|_|Failure::from("db_reconcile_failed"))?;
+    let manifest=serde_json::to_vec(&json!({"nativeVersion":1,"quarantinedAt":crate::auth::now(),"mode":mode,"percent":selected.percent,"digest":selected.digest,"entries":selected.candidates})).map_err(|_|Failure::from("db_reconcile_failed"))?;
     let records = (|| {
         if raw.len() > MAX_BACKUP {
             return Err("storage_backup_too_large");
@@ -224,9 +245,39 @@ fn quarantine_inner(
             trash_dir: restored.err().map(|_| id),
         });
     }
+    if mode == "permanent" {
+        let result = stage.purge_files().and_then(|_| stage.finish_purge());
+        if result.is_err() {
+            return Err(Failure {
+                error: "purge_failed",
+                trash_dir: Some(id),
+            });
+        }
+        return Ok(
+            json!({"ok":true,"mode":mode,"percent":selected.percent,"count":logical.len(),"bytes":selected.bytes,"removedPaths":logical}),
+        );
+    }
     Ok(
-        json!({"ok":true,"mode":"quarantine","percent":selected.percent,"count":logical.len(),"bytes":selected.bytes,"removedPaths":logical,"trashDir":id}),
+        json!({"ok":true,"mode":mode,"percent":selected.percent,"count":logical.len(),"bytes":selected.bytes,"removedPaths":logical,"trashDir":id}),
     )
+}
+/// Continue only a previously committed permanent deletion. Never turns an
+/// ordinary quarantine into a purge or implicitly repeats a cleanup selection.
+pub fn resume_purge(home: &Path, id: &str) -> std::result::Result<Value, Failure> {
+    let lease = acquire(home)?;
+    let mut stage = lease.resume(id).map_err(|_| Failure::from("fs_failed"))?;
+    if !stage.purge_started() {
+        return Err("purge_not_started".into());
+    }
+    let bytes = stage.bytes();
+    stage
+        .purge_files()
+        .and_then(|_| stage.finish_purge())
+        .map_err(|_| Failure {
+            error: "purge_failed",
+            trash_dir: Some(id.to_owned()),
+        })?;
+    Ok(json!({"ok":true,"trashDir":id,"bytes":bytes}))
 }
 /// Restore files and metadata without replacing newer files, rows or memory jobs.
 pub fn restore(home: &Path, id: &str) -> std::result::Result<Value, Failure> {
@@ -238,6 +289,9 @@ pub fn restore(home: &Path, id: &str) -> std::result::Result<Value, Failure> {
 }
 fn restore_locked(lease: &Lease, id: &str, hook: &dyn Fn(Point) -> Result<()>) -> Result<Value> {
     let mut stage = lease.resume(id).map_err(fs_error)?;
+    if stage.purge_started() {
+        return Err("purge_started");
+    }
     let files = stage.relatives();
     let bytes = stage.bytes();
     let restored: Vec<_> = files
@@ -655,6 +709,56 @@ mod tests {
         assert!(!h.path().join("archived_sessions/a.jsonl").exists());
         fs::write(path, raw).unwrap();
         restore(h.path(), id).unwrap();
+        restored(h.path());
+    }
+    #[test]
+    fn permanent_mode_purges_only_after_successful_reconciliation() {
+        let h = fixture();
+        let result = cleanup(h.path(), 100.0, "permanent", &digest(h.path())).unwrap();
+        assert_eq!(result["mode"], "permanent");
+        assert_eq!(result["count"], 2);
+        assert_eq!(result["bytes"], 7);
+        assert!(result.get("trashDir").is_none());
+        assert_eq!(count(h.path(), "state_1.sqlite", "threads"), 1);
+        assert_eq!(count(h.path(), "logs_1.sqlite", "logs"), 1);
+        assert!(!h.path().join("archived_sessions/a.jsonl").exists());
+        assert_eq!(
+            crate::storage_trash::list(h.path()).unwrap()["entries"],
+            json!([])
+        );
+    }
+    #[test]
+    fn permanent_mode_failure_before_commit_restores_everything() {
+        let h = fixture();
+        let error = cleanup_inner(h.path(), 100.0, "permanent", &digest(h.path()), &|p| {
+            if p == Point::DatabaseCommitted(1) {
+                Err("injected_failure")
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.error, "injected_failure");
+        assert!(error.trash_dir.is_none());
+        restored(h.path());
+    }
+    #[test]
+    fn purge_resume_refuses_to_convert_an_existing_quarantine_into_permanent_deletion() {
+        let h = fixture();
+        let result = quarantine(h.path(), 100.0, &digest(h.path())).unwrap();
+        let id = result["trashDir"].as_str().unwrap();
+        assert_eq!(
+            resume_purge(h.path(), id).unwrap_err().error,
+            "purge_not_started"
+        );
+        restore(h.path(), id).unwrap();
+        restored(h.path());
+        assert_eq!(
+            cleanup(h.path(), 100.0, "unknown", &digest(h.path()))
+                .unwrap_err()
+                .error,
+            "invalid_mode"
+        );
         restored(h.path());
     }
 }

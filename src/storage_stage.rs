@@ -377,6 +377,8 @@ enum Phase {
     Restoring,
     Restored,
     RowsRestored,
+    Purging,
+    Purged,
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -585,9 +587,67 @@ impl Stage<'_> {
         self.journal.phase = Phase::Reconciled;
         self.save()
     }
+    pub(crate) fn purge_started(&self) -> bool {
+        matches!(self.journal.phase, Phase::Purging | Phase::Purged)
+    }
+    fn begin_purge(&mut self) -> io::Result<()> {
+        self.check()?;
+        if self.purge_started() {
+            return Ok(());
+        }
+        if self.journal.phase != Phase::Reconciled {
+            return Err(invalid());
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        // Validate every file before crossing the irreversible boundary.
+        for f in &self.journal.files {
+            f.matches(&self.path.join(archive_name(&f.relative)?), deadline)?;
+        }
+        self.journal.phase = Phase::Purging;
+        self.save()
+    }
+    pub(crate) fn purge_files(&mut self) -> io::Result<()> {
+        self.purge_files_inner(&|_| Ok(()))
+    }
+    fn purge_files_inner(&mut self, hook: &dyn Fn(usize) -> io::Result<()>) -> io::Result<()> {
+        self.begin_purge()?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for (index, f) in self.journal.files.iter().enumerate() {
+            self.check()?;
+            let path = self.path.join(archive_name(&f.relative)?);
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    f.matches(&path, deadline)?;
+                    fs::remove_file(path)?;
+                    sync_directory(&self.path)?;
+                    hook(index)?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.journal.phase = Phase::Purged;
+        self.save()
+    }
+    pub(crate) fn finish_purge(self) -> io::Result<()> {
+        if self.journal.phase != Phase::Purged {
+            return Err(invalid());
+        }
+        self.check()?;
+        for f in &self.journal.files {
+            match fs::symlink_metadata(self.path.join(archive_name(&f.relative)?)) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                _ => return Err(invalid()),
+            }
+        }
+        self.remove_metadata(true)
+    }
     /// Can roll back a partial stage or resume an interrupted restore. It never
     /// replaces another file, even when its content happens to be identical.
     pub fn restore_files(&mut self) -> io::Result<()> {
+        if self.purge_started() {
+            return Err(invalid());
+        }
         self.check()?;
         self.journal.phase = Phase::Restoring;
         self.save()?;
@@ -615,8 +675,11 @@ impl Stage<'_> {
         for f in &self.journal.files {
             f.matches(&self.lease.home.join(&f.relative), deadline)?;
         }
-        let entries = fs::read_dir(&self.path)?.collect::<io::Result<Vec<_>>>()?;
         let complete = self.restoration_complete();
+        self.remove_metadata(complete)
+    }
+    fn remove_metadata(self, complete: bool) -> io::Result<()> {
+        let entries = fs::read_dir(&self.path)?.collect::<io::Result<Vec<_>>>()?;
         for e in &entries {
             let name = e.file_name();
             if name == JOURNAL {
@@ -652,5 +715,110 @@ impl Stage<'_> {
         fs::remove_file(self.path.join(JOURNAL))?;
         fs::remove_dir(&self.path)?;
         sync_directory(&self.lease.home.join(".trash"))
+    }
+}
+
+#[cfg(test)]
+mod purge_tests {
+    use super::*;
+    fn root() -> tempfile::TempDir {
+        let h = tempfile::tempdir().unwrap();
+        fs::create_dir(h.path().join("archived_sessions")).unwrap();
+        for name in ["a", "b"] {
+            fs::write(
+                h.path().join(format!("archived_sessions/{name}.jsonl")),
+                name,
+            )
+            .unwrap();
+        }
+        h
+    }
+    fn paths() -> Vec<String> {
+        vec![
+            "archived_sessions/a.jsonl".into(),
+            "archived_sessions/b.jsonl".into(),
+        ]
+    }
+    #[test]
+    fn purge_requires_committed_rows_and_never_deletes_before_reconciliation() {
+        let h = root();
+        let lease = Lease::acquire(h.path()).unwrap();
+        let mut stage = lease.prepare(&paths()).unwrap();
+        assert!(stage.purge_files().is_err());
+        stage.stage_files().unwrap();
+        assert!(stage.purge_files().is_err());
+        assert!(stage.directory().join("a.jsonl").exists());
+        stage.restore_files().unwrap();
+        stage.finish_restore().unwrap();
+        assert_eq!(
+            fs::read(h.path().join("archived_sessions/a.jsonl")).unwrap(),
+            b"a"
+        );
+    }
+    #[test]
+    fn interrupted_purge_resumes_without_restoring_metadata_or_touching_new_files() {
+        let h = root();
+        let lease = Lease::acquire(h.path()).unwrap();
+        let mut stage = lease.prepare(&paths()).unwrap();
+        let id = stage.id().to_owned();
+        stage.stage_files().unwrap();
+        stage.reconciled().unwrap();
+        assert!(stage
+            .purge_files_inner(&|i| if i == 0 {
+                Err(io::ErrorKind::Interrupted.into())
+            } else {
+                Ok(())
+            })
+            .is_err());
+        assert!(stage.purge_started());
+        assert!(!stage.directory().join("a.jsonl").exists());
+        assert!(stage.directory().join("b.jsonl").exists());
+        assert!(stage.restore_files().is_err());
+        drop(stage);
+        drop(lease);
+        fs::write(h.path().join("archived_sessions/a.jsonl"), "USER_NEW_FILE").unwrap();
+        let lease = Lease::acquire(h.path()).unwrap();
+        let mut stage = lease.resume(&id).unwrap();
+        stage.purge_files().unwrap();
+        stage.finish_purge().unwrap();
+        assert!(!h.path().join(id).exists());
+        assert_eq!(
+            fs::read(h.path().join("archived_sessions/a.jsonl")).unwrap(),
+            b"USER_NEW_FILE"
+        );
+        assert!(!h.path().join("archived_sessions/b.jsonl").exists());
+    }
+    #[test]
+    fn purge_refuses_changed_archive_and_preserves_unknown_stage_entries() {
+        let h = root();
+        let lease = Lease::acquire(h.path()).unwrap();
+        let mut stage = lease.prepare(&paths()).unwrap();
+        let id = stage.id().to_owned();
+        stage.stage_files().unwrap();
+        stage.reconciled().unwrap();
+        let path = stage.directory().join("b.jsonl");
+        let old = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, "CHANGED").unwrap();
+        assert!(stage.purge_files().is_err());
+        assert!(!stage.purge_started());
+        assert!(stage.directory().join("a.jsonl").exists());
+        fs::write(&path, "b").unwrap();
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        fs::write(stage.directory().join("unknown"), "KEEP").unwrap();
+        stage.purge_files().unwrap();
+        assert!(stage.finish_purge().is_err());
+        assert_eq!(
+            fs::read(h.path().join(&id).join("unknown")).unwrap(),
+            b"KEEP"
+        );
+        let mut stage = lease.resume(&id).unwrap();
+        assert!(stage.restore_files().is_err());
+        fs::remove_file(stage.directory().join("unknown")).unwrap();
+        stage.finish_purge().unwrap();
     }
 }

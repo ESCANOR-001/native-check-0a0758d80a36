@@ -5158,14 +5158,25 @@ async fn repository_clone_does_not_block_either_agent_and_shutdown_never_replays
         .unwrap()
         .unwrap()
         .is_err());
-    let closed = tokio::time::timeout(Duration::from_secs(4), stream.read(&mut bytes))
-        .await
-        .unwrap();
-    assert!(
-        matches!(closed, Ok(0))
-            || matches!(closed,Err(ref e) if e.kind()==std::io::ErrorKind::ConnectionReset),
-        "terminated Git connection remained open: {closed:?}"
-    );
+    // TCP may split the initial Git request across reads. Bytes buffered before
+    // shutdown do not mean the child is still alive; require EOF/reset after
+    // draining a bounded handshake, under the same absolute deadline.
+    tokio::time::timeout(Duration::from_secs(4), async {
+        let mut buffered = 0;
+        loop {
+            match stream.read(&mut bytes).await {
+                Ok(0) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+                Ok(n) => {
+                    buffered += n;
+                    assert!(buffered <= 4096, "terminated Git child kept sending data");
+                }
+                Err(e) => panic!("terminated Git connection failed unexpectedly: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("terminated Git connection remained open");
     test.hub = Chats::start(test.db.clone(), test.config.clone())
         .await
         .unwrap();
