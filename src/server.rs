@@ -30,6 +30,8 @@ pub struct App {
     pub environment_id: String,
     pub label: String,
     pub chats: Option<Chats>,
+    pub dashboard: Option<crate::dashboard::Dashboard>,
+    pub(crate) online: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     pub stopping: tokio::sync::watch::Sender<bool>,
     connections: Arc<Semaphore>,
     transfers: Arc<Semaphore>,
@@ -45,6 +47,8 @@ impl App {
             auth: AuthService::new(auth)?,
             label: label.to_owned(),
             chats: None,
+            dashboard: None,
+            online: Arc::default(),
             stopping: tokio::sync::watch::channel(false).0,
             connections: Arc::new(Semaphore::new(8)),
             transfers: Arc::new(Semaphore::new(1)),
@@ -55,8 +59,8 @@ impl App {
         })
     }
     pub fn router(self) -> Router {
+        let dashboard = crate::dashboard::routes(self.clone());
         Router::new()
-            .route("/healthz", get(health))
             .route("/.well-known/t3/environment", get(environment))
             .route("/oauth/token", post(exchange))
             .route("/api/auth/session", get(session))
@@ -71,7 +75,13 @@ impl App {
                 get(asset_thumbnail),
             )
             .route("/ws", get(upgrade))
-            .fallback(not_implemented)
+            .route_layer(axum::middleware::from_fn_with_state(
+                self.clone(),
+                phone_control_guard,
+            ))
+            .route("/healthz", get(health))
+            .merge(dashboard)
+            .fallback(crate::dashboard::static_file)
             .layer(axum::middleware::from_fn(
                 |request: Request, next: axum::middleware::Next| async move {
                     let path = request.uri().path().to_owned();
@@ -98,6 +108,35 @@ impl App {
             .with_state(self)
     }
 }
+async fn phone_control_guard(
+    State(app): State<App>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    async fn available(app: &App) -> bool {
+        matches!(app.auth.call(|a| a.control_enabled()).await, Ok(Ok(true)))
+    }
+    fn disabled() -> Response {
+        // A disabled listener is temporary unavailability, never revocation.
+        // Android discards its stored credentials on a genuine 401.
+        let mut r = failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Phone control is disabled or unavailable; retry when it is enabled on the PC",
+        );
+        r.headers_mut()
+            .insert("retry-after", axum::http::HeaderValue::from_static("5"));
+        r
+    }
+    if !available(&app).await {
+        return disabled();
+    }
+    let response = next.run(request).await;
+    // Cover disable racing a ticket/auth read that was already admitted.
+    if !available(&app).await {
+        return disabled();
+    }
+    response
+}
 fn failure(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({"error": message}))).into_response()
 }
@@ -115,7 +154,7 @@ fn descriptor() -> Value {
 }
 async fn health() -> Json<Value> {
     Json(
-        json!({"status":"running","service":"remodex-native-connect-experiment","migrationComplete":false}),
+        json!({"status":"running","service":"remodex-native-connect-experiment","version":"0.0.0-native-experiment","migrationComplete":false}),
     )
 }
 async fn environment(State(app): State<App>) -> Json<Value> {
@@ -377,6 +416,7 @@ async fn upgrade(
         })
 }
 async fn serve_socket(mut socket: WebSocket, app: App, client: String, agent: AgentKind) {
+    let _online = crate::dashboard::Online::new(app.online.clone(), client.clone());
     let mut check = tokio::time::interval(Duration::from_secs(1));
     let mut stopping = app.stopping.subscribe();
     let mut changes = app.chats.as_ref().map(Chats::subscribe);
@@ -506,7 +546,7 @@ async fn native_reply(
         Err(error) => json!({"id":id,"error":{"code":-32000,"message":error}}),
     }
 }
-async fn not_implemented() -> Response {
+pub(crate) async fn not_implemented() -> Response {
     failure(
         StatusCode::NOT_FOUND,
         "Endpoint is not implemented in this native experiment",
@@ -517,7 +557,7 @@ async fn authorized(app: &App, client: &str) -> bool {
     let client = client.to_owned();
     matches!(
         app.auth
-            .call(move |a| a.store.authorized(&client, auth::now()))
+            .call(move |a| a.authorized(&client, auth::now()))
             .await,
         Ok(Ok(true))
     )

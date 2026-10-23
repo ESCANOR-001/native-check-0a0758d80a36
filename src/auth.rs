@@ -95,6 +95,9 @@ impl Auth {
         self.recovery.retain(|_, v| v.expires > now);
     }
     pub fn invite(&mut self, label: &str, url: &str, now: i64) -> Result<Value, &'static str> {
+        if !self.control_enabled().map_err(|_| "Settings unavailable")? {
+            return Err("Phone control is disabled");
+        }
         self.prune(now);
         if self.invitations.len() >= MAX_PENDING {
             return Err("too many pending invitations");
@@ -124,6 +127,9 @@ impl Auth {
         metadata: Metadata,
         now: i64,
     ) -> Result<Option<Exchange>, rusqlite::Error> {
+        if !self.control_enabled()? {
+            return Ok(None);
+        }
         self.prune(now);
         if proof.is_some_and(|p| {
             p.len() != 64
@@ -192,14 +198,14 @@ impl Auth {
         Ok(Some(result))
     }
     pub fn authenticate(&self, token: &str, now: i64) -> rusqlite::Result<Option<Client>> {
-        if token.len() > 256 {
+        if token.len() > 256 || !self.control_enabled()? {
             return Ok(None);
         }
         self.store.client(&digest(token), now)
     }
     pub fn ticket(&mut self, client: &str, now: i64) -> Result<Option<Value>, rusqlite::Error> {
         self.prune(now);
-        if self.tickets.len() >= MAX_PENDING || !self.store.authorized(client, now)? {
+        if self.tickets.len() >= MAX_PENDING || !self.authorized(client, now)? {
             return Ok(None);
         }
         let raw = secret("ocx_ws_");
@@ -220,9 +226,40 @@ impl Auth {
             return Ok(None);
         };
         Ok(self
-            .store
             .authorized(&ticket.client, now)?
             .then_some(ticket.client))
+    }
+    pub fn control_enabled(&self) -> rusqlite::Result<bool> {
+        use rusqlite::OptionalExtension;
+        let value: Option<String> = self
+            .store
+            .db
+            .query_row(
+                "SELECT value FROM metadata WHERE key='phone_control_enabled'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match value.as_deref() {
+            None | Some("true") => Ok(true),
+            Some("false") => Ok(false),
+            _ => Err(rusqlite::Error::InvalidQuery),
+        }
+    }
+    pub fn set_control_enabled(&mut self, enabled: bool) -> rusqlite::Result<()> {
+        self.store.db.execute(
+            "INSERT INTO metadata(key,value) VALUES ('phone_control_enabled',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [if enabled { "true" } else { "false" }],
+        )?;
+        if !enabled {
+            self.invitations.clear();
+            self.tickets.clear();
+            self.recovery.clear();
+        }
+        Ok(())
+    }
+    pub fn authorized(&self, client: &str, now: i64) -> rusqlite::Result<bool> {
+        Ok(self.control_enabled()? && self.store.authorized(client, now)?)
     }
     pub fn revoke(&mut self, client: &str) -> rusqlite::Result<bool> {
         let revoked = self.store.revoke(client)?;

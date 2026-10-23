@@ -15,6 +15,7 @@ pub mod claude_outbox;
 mod claude_reconnect;
 pub mod claude_remote;
 pub mod claude_turns;
+pub mod dashboard;
 pub mod server;
 pub mod store;
 
