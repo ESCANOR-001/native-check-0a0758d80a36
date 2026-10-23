@@ -289,7 +289,10 @@ async fn run(
             &mut desired,
             &mut stopping,
             &state,
-            failures % 2 == 1,
+            AttemptPolicy {
+                quic: failures % 2 == 1,
+                initial_deadline: Duration::from_secs(45),
+            },
             &check,
         )
         .await;
@@ -311,13 +314,17 @@ async fn run(
     }
     state.send_replace(State::new("stopped", None, None));
 }
+struct AttemptPolicy {
+    quic: bool,
+    initial_deadline: Duration,
+}
 async fn attempt(
     config: &Config,
     client: &reqwest::Client,
     desired: &mut watch::Receiver<Desired>,
     stopping: &mut watch::Receiver<bool>,
     state: &watch::Sender<State>,
-    quic: bool,
+    policy: AttemptPolicy,
     check: &Notify,
 ) -> Result<(), &'static str> {
     let generation = desired.borrow().generation;
@@ -347,7 +354,7 @@ async fn attempt(
             "--metrics",
             "127.0.0.1:0",
             "--protocol",
-            if quic { "quic" } else { "http2" },
+            if policy.quic { "quic" } else { "http2" },
             "--url",
         ])
         .arg(format!("http://{}", config.origin))
@@ -383,6 +390,7 @@ async fn attempt(
     let mut url = None;
     let mut registered = false;
     let mut ready = false;
+    let mut initial_expired = false;
     let mut misses = 0;
     let start = Instant::now();
     let mut next_check = Instant::now();
@@ -400,14 +408,21 @@ async fn attempt(
             read=stdout.read(&mut out),if out_open=>match read{Ok(0)=>out_open=false,Ok(n)=>out_lines.feed(&out[..n],&mut url,&mut registered),Err(_)=>break Err("tunnel_failed")},
             read=stderr.read(&mut err),if err_open=>match read{Ok(0)=>err_open=false,Ok(n)=>err_lines.feed(&err[..n],&mut url,&mut registered),Err(_)=>break Err("tunnel_failed")},
             _=timer.tick()=>{
-                if !ready && start.elapsed()>Duration::from_secs(45){break Err(if url.is_some()&&registered{"verification_failed"}else{"tunnel_failed"});}
+                if !ready && !initial_expired && start.elapsed()>policy.initial_deadline {
+                    if !registered || url.is_none() {break Err("tunnel_failed");}
+                    // Registration can precede DNS/edge propagation. Keep the
+                    // same connector and address while showing the failed check;
+                    // rotating URLs here can make propagation fail forever.
+                    initial_expired=true;
+                    state.send_replace(State::new("error",url.clone(),Some("verification_failed")).generation(generation));
+                }
                 if registered && Instant::now()>=next_check {
                     if let Some(url)=&url {
-                        if !ready {state.send_replace(State::new("checking",Some(url.clone()),None).generation(generation));}
+                        if !ready && !initial_expired {state.send_replace(State::new("checking",Some(url.clone()),None).generation(generation));}
                         let checked=tokio::select!{_=desired.changed()=>break Ok(()),_=stopping.changed()=>break Ok(()),result=verify(client,url,&config.environment_id)=>result};
                         if checked {ready=true;misses=0;state.send_replace(State::new("ready",Some(url.clone()),None).generation(generation));}
                         else if ready {misses+=1;if misses>=2{break Err("verification_failed");}state.send_replace(State::new("checking",Some(url.clone()),None).generation(generation));}
-                        next_check=Instant::now()+Duration::from_secs(if ready{15}else{2});
+                        next_check=Instant::now()+Duration::from_secs(if ready || initial_expired{15}else{2});
                     }
                 }
             }
@@ -528,6 +543,81 @@ async fn verify(client: &reqwest::Client, url: &str, environment: &str) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initial_verification_failure_keeps_the_registered_connector_until_stopped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("fake-cloudflared");
+        std::fs::write(&executable,b"#!/bin/sh\nroot=$(dirname \"$0\")\necho $$ > \"$root/pid\"\necho https://fixture.trycloudflare.com\necho Registered tunnel connection\nexec sleep 300\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let empty_config = dir.path().join("empty.yml");
+        std::fs::write(&empty_config, b"{}\n").unwrap();
+        let config = Config {
+            executable,
+            empty_config,
+            origin: "127.0.0.1:12345".parse().unwrap(),
+            environment_id: "test".into(),
+        };
+        // This fixture never reaches the Internet: HTTPS verification fails at
+        // a closed loopback port, simulating incomplete public propagation.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(100))
+            .resolve("fixture.trycloudflare.com", "127.0.0.1:9".parse().unwrap())
+            .build()
+            .unwrap();
+        let (_desired, mut changes) = watch::channel(Desired {
+            enabled: true,
+            generation: 0,
+        });
+        let (stop, mut stopping) = watch::channel(false);
+        let (send, mut state) = watch::channel(State::new("starting", None, None));
+        let task = tokio::spawn(async move {
+            attempt(
+                &config,
+                &client,
+                &mut changes,
+                &mut stopping,
+                &send,
+                AttemptPolicy {
+                    quic: false,
+                    initial_deadline: Duration::from_millis(100),
+                },
+                &Notify::new(),
+            )
+            .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            state.wait_for(|s| s.error == Some("verification_failed")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let pid: i32 = std::fs::read_to_string(dir.path().join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+        assert_eq!(
+            state.borrow().public_url.as_deref(),
+            Some("https://fixture.trycloudflare.com")
+        );
+        assert!(
+            !task.is_finished(),
+            "a failed initial check must not rotate the URL"
+        );
+        stop.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+    }
     #[tokio::test]
     async fn retry_and_disable_hide_old_verified_urls_immediately() {
         let (desired, _changes) = watch::channel(Desired {

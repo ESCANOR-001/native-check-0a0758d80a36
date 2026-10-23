@@ -2,7 +2,16 @@
 //! depend on deleting a PID file or guessing whether another process is alive.
 use std::{fs, path::Path};
 
-pub fn acquire(directory: &Path) -> Result<fs::File, String> {
+pub struct Lease(fs::File);
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // A forked helper may briefly retain this open file description. The
+        // bridge's orderly release must not wait for that helper to exec.
+        let _ = self.0.unlock();
+    }
+}
+
+pub fn acquire(directory: &Path) -> Result<Lease, String> {
     if !directory.is_absolute() {
         return Err("An absolute isolated state directory is required".into());
     }
@@ -49,7 +58,7 @@ pub fn acquire(directory: &Path) -> Result<fs::File, String> {
         return Err("The private profile lock must be a regular file".into());
     }
     match file.try_lock() {
-        Ok(())=>Ok(file),
+        Ok(())=>Ok(Lease(file)),
         Err(fs::TryLockError::WouldBlock)=>Err("This private profile already has a running bridge. Use a different test profile or stop its owner first.".into()),
         Err(fs::TryLockError::Error(_))=>Err("Cannot lock this private profile; refusing to run two writers".into()),
     }
@@ -71,6 +80,20 @@ pub(crate) fn standard_agent_profile(profile: &Path, home: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn orderly_release_does_not_wait_for_an_inherited_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        let lease = acquire(root.path()).unwrap();
+        let inherited = lease.0.try_clone().unwrap();
+        assert!(acquire(root.path()).is_err());
+        drop(lease);
+        let next = acquire(root.path()).unwrap();
+        drop(inherited);
+        assert!(acquire(root.path()).is_err());
+        drop(next);
+        assert!(acquire(root.path()).is_ok());
+    }
     #[test]
     fn default_profile_check_resolves_native_absolute_paths() {
         let root = tempfile::tempdir().unwrap();

@@ -182,6 +182,29 @@ pub struct Lease {
     home_id: Identity,
     _lock: File,
 }
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // Close alone can leave a flock alive in a concurrently forked child
+        // until its exec. Release our lease immediately; never unlink the lock.
+        let _ = self._lock.unlock();
+    }
+}
+#[cfg(all(test, unix))]
+#[test]
+fn release_storage_lock_even_with_a_fork_inherited_descriptor() {
+    let home = tempfile::tempdir().unwrap();
+    let lease = Lease::acquire(home.path()).unwrap();
+    // A concurrently spawning child can retain the same open file description
+    // between fork and exec, even when the descriptor has CLOEXEC set.
+    let inherited = lease._lock.try_clone().unwrap();
+    assert!(matches!(Lease::acquire(home.path()), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+    drop(lease);
+    let next = Lease::acquire(home.path()).unwrap();
+    drop(inherited);
+    assert!(matches!(Lease::acquire(home.path()), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+    drop(next);
+    assert!(Lease::acquire(home.path()).is_ok());
+}
 impl Lease {
     pub fn acquire(home: &Path) -> io::Result<Self> {
         if !home.is_absolute() {
