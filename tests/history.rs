@@ -282,3 +282,61 @@ fn plans_page_and_update_without_growing_chat_metadata() {
         .unwrap()
         .is_some());
 }
+
+#[test]
+fn completed_duration_survives_spill_new_turn_stale_rows_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Store::open(dir.path()).unwrap();
+    db.init_chats().unwrap();
+    let mut s = state(vec![
+        json!({"id":"original","turnId":"old","role":"user","text":"Keep this history"}),
+    ]);
+    let old = json!({"id":"old-tool","turnId":"old","kind":"tool.completed","payload":{"status":"completed","command":"echo hello"}});
+    s["thread"]["activities"] = json!([old]);
+    db.save_chat(&s, None).unwrap();
+    let original = db
+        .history_row("large", "messages", "original")
+        .unwrap()
+        .unwrap();
+    for n in 0..60 {
+        db.save_chat(
+            &state(vec![
+                json!({"id":format!("m{n}"),"turnId":"old","text":"Saved"}),
+            ]),
+            None,
+        )
+        .unwrap();
+    }
+    let mut recent = db.load_chat("large").unwrap();
+    assert!(recent["thread"]["activities"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    recent["thread"]["latestTurn"] = json!({"turnId":"old","state":"interrupted","startedAt":"2026-01-01T01:00:00Z","completedAt":"2026-01-01T01:00:57Z"});
+    db.save_chat(&recent, None).unwrap();
+    let stamped = db
+        .history_row("large", "activities", "old-tool")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stamped["payload"]["turnDurationMs"], 57_000);
+    recent["thread"]["latestTurn"] = json!({"turnId":"new","state":"running"});
+    // Simulate a cached row from before completion being saved by a later turn.
+    recent["thread"]["activities"] = json!([old]);
+    db.save_chat(&recent, None).unwrap();
+    drop(db);
+    let db = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        db.history_row("large", "activities", "old-tool")
+            .unwrap()
+            .unwrap(),
+        stamped
+    );
+    assert_eq!(
+        db.history_row("large", "messages", "original")
+            .unwrap()
+            .unwrap(),
+        original
+    );
+    let page = db.history_page("large", None, Some("old")).unwrap();
+    assert!(page.to_string().len() < 128 * 1024);
+}

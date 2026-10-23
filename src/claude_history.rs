@@ -695,6 +695,7 @@ pub async fn project(
         );
         chat.thread["latestTurn"]["completedAt"] = json!(event_time);
         chat.thread["session"]["updatedAt"] = json!(event_time);
+        crate::turn_timing::complete(&mut chat.thread);
         reduced.requests.clear();
     }
     settle_deliveries(&mut reduced);

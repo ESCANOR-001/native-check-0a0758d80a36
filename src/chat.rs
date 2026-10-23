@@ -595,6 +595,7 @@ pub(crate) fn finish(chat: &mut Chat, state: &str, error: Option<&str>) {
             }
         }
     }
+    crate::turn_timing::complete(&mut chat.thread);
     if state != "completed" {
         chat.paused = true;
     }

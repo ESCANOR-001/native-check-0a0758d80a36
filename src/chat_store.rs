@@ -457,7 +457,18 @@ impl Store {
         for kind in ["messages", "activities", "proposedPlans"] {
             if let Some(rows) = state["thread"][kind].as_array() {
                 for row in rows {
-                    tx.execute("INSERT INTO chat_rows(chat,kind,id,turn,data) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(chat,kind,id) DO UPDATE SET turn=excluded.turn,data=excluded.data WHERE data<>excluded.data", params![id,kind,row["id"].as_str().ok_or(rusqlite::Error::InvalidQuery)?,row["turnId"].as_str(),row.to_string()])?;
+                    tx.execute("INSERT INTO chat_rows(chat,kind,id,turn,data) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(chat,kind,id) DO UPDATE SET turn=excluded.turn,data=CASE
+                        WHEN excluded.turn=chat_rows.turn AND excluded.kind='activities'
+                        AND json_type(chat_rows.data,'$.payload.turnDurationMs')='integer'
+                        AND json_extract(chat_rows.data,'$.payload.turnDurationMs')>=0
+                        AND json_type(excluded.data,'$.payload.turnDurationMs') IS NULL
+                        AND COALESCE(json_type(excluded.data,'$.payload'),'null') IN ('object','null')
+                        AND length(CAST(excluded.data AS BLOB))+360<=?6
+                        THEN json_patch(excluded.data,json_object('payload',json_object(
+                            'turnStartedAt',json_extract(chat_rows.data,'$.payload.turnStartedAt'),
+                            'turnCompletedAt',json_extract(chat_rows.data,'$.payload.turnCompletedAt'),
+                            'turnDurationMs',json_extract(chat_rows.data,'$.payload.turnDurationMs'))))
+                        ELSE excluded.data END WHERE chat_rows.data<>excluded.data", params![id,kind,row["id"].as_str().ok_or(rusqlite::Error::InvalidQuery)?,row["turnId"].as_str(),row.to_string(),ROW_BYTES as i64])?;
                 }
             }
             metadata["thread"][kind] = json!([]);
@@ -469,6 +480,16 @@ impl Store {
         let turn = &metadata["thread"]["latestTurn"];
         if let (Some(turn_id), Some(state)) = (turn["turnId"].as_str(), turn["state"].as_str()) {
             if ["completed", "interrupted", "error"].contains(&state) {
+                if let Some(timing) = crate::turn_timing::Timing::read(turn) {
+                    // Stamp spilled rows in-place using the turn index. Replaying
+                    // older in-memory rows must not erase this completion data.
+                    tx.execute("UPDATE chat_rows SET data=json_set(data,'$.payload.turnStartedAt',?3,'$.payload.turnCompletedAt',?4,'$.payload.turnDurationMs',?5)
+                        WHERE chat=?1 AND turn=?2 AND kind='activities'
+                        AND COALESCE(json_type(data,'$.payload'),'null') IN ('object','null')
+                        AND length(CAST(data AS BLOB))+360<=?6
+                        AND (json_extract(data,'$.payload.turnDurationMs') IS NOT ?5
+                        OR json_extract(data,'$.payload.turnCompletedAt') IS NOT ?4)",params![id,turn_id,timing.started,timing.completed,timing.millis,ROW_BYTES as i64])?;
+                }
                 // A pending control/tool row may be older than the live window.
                 // Finalize it on disk without materializing the whole turn.
                 tx.execute("UPDATE chat_rows SET data=json_set(data,'$.streaming',json('false')) WHERE chat=?1 AND turn=?2 AND kind='messages' AND json_extract(data,'$.streaming')=1",params![id,turn_id])?;
