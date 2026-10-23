@@ -40,6 +40,303 @@ fn count(db: &rusqlite::Connection, table: &str) -> i64 {
         .unwrap()
 }
 
+struct Images {
+    export: tempfile::TempDir,
+    old_root: std::path::PathBuf,
+    source: std::path::PathBuf,
+    destination: std::path::PathBuf,
+    bytes: Vec<u8>,
+    raw: Vec<u8>,
+}
+fn images(dir: &std::path::Path) -> Images {
+    use sha2::{Digest, Sha256};
+    let export = tempfile::tempdir().unwrap();
+    let old_root = dir.join("old-install-not-read");
+    let bytes = b"\x89PNG\r\n\x1a\nlegacy-tool-screenshot".to_vec();
+    let bucket = format!("{:x}", Sha256::digest(b"original-android-chat"));
+    let name = format!("{:x}.png", Sha256::digest(&bytes));
+    let source = export.path().join(&bucket).join(&name);
+    std::fs::create_dir(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, &bytes).unwrap();
+    let mut value = source_fixture(dir);
+    value["thread"]["activities"][0]["payload"]["data"]["toolImages"] =
+        json!([old_root.join(&bucket).join(&name)]);
+    Images {
+        export,
+        old_root,
+        source,
+        destination: dir.join("tool-images").join(bucket).join(name),
+        bytes,
+        raw: raw(&value),
+    }
+}
+fn source_fixture(dir: &std::path::Path) -> Value {
+    source(dir)
+}
+
+#[test]
+fn exported_tool_images_keep_bytes_ids_text_and_chat_scoped_access_across_retry_and_rollback() {
+    let (dir, mut store, db) = setup();
+    let img = images(dir.path());
+    store.prepare_legacy_claude(&img.raw).unwrap();
+    let before: String = db
+        .query_row(
+            "SELECT data FROM chat_rows WHERE id='assistant-message'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let report = store
+        .prepare_legacy_claude_tool_images(
+            "original-android-chat",
+            &img.old_root,
+            img.export.path(),
+        )
+        .unwrap();
+    assert_eq!(report["images"], 1);
+    assert!(!img.old_root.exists()); // serialized original path is never opened or recreated
+    assert_eq!(std::fs::read(&img.destination).unwrap(), img.bytes);
+    assert!(store.owns_tool_image("original-android-chat", &img.destination));
+    assert!(!store.owns_tool_image("other-chat", &img.destination));
+    let tool: Value = serde_json::from_str(
+        &db.query_row("SELECT data FROM chat_rows WHERE id='tool-row'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        tool["payload"]["data"]["toolImages"],
+        json!([img.destination])
+    );
+    assert_eq!(tool["payload"]["data"]["inputDetail"], "Read example.txt");
+    assert_eq!(
+        db.query_row(
+            "SELECT data FROM chat_rows WHERE id='assistant-message'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        before
+    );
+    assert_eq!(
+        db.query_row("SELECT raw FROM legacy_claude_import", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        img.raw
+    );
+    drop(store);
+    let mut store = Store::open(dir.path()).unwrap();
+    store.init_chats().unwrap();
+    assert!(store.assert_migration_ready().is_err());
+    store.prepare_legacy_claude(&img.raw).unwrap();
+    assert_eq!(
+        store
+            .prepare_legacy_claude_tool_images(
+                "original-android-chat",
+                &img.old_root,
+                img.export.path()
+            )
+            .unwrap(),
+        report
+    );
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    assert_eq!(count(&db, "tool_images"), 0);
+    assert_eq!(std::fs::read(&img.destination).unwrap(), img.bytes); // rollback retains copied blobs and original receipt
+    assert_eq!(
+        db.query_row("SELECT phase FROM legacy_claude_assets", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "rolled-back"
+    );
+    store.rollback_legacy_connection().unwrap();
+    store.rollback_legacy_connection().unwrap();
+    db.execute("INSERT INTO storage_assets VALUES('unexpected-file',9)", [])
+        .unwrap();
+    assert!(store.rollback_legacy_connection().is_err());
+}
+
+#[test]
+fn tool_image_transaction_failure_keeps_original_rows_and_retry_reuses_verified_blobs() {
+    let (dir, mut store, db) = setup();
+    let img = images(dir.path());
+    store.prepare_legacy_claude(&img.raw).unwrap();
+    let before: String = db
+        .query_row("SELECT data FROM chat_rows WHERE id='tool-row'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    db.execute_batch("CREATE TRIGGER fail_image BEFORE INSERT ON tool_images BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+    assert!(store
+        .prepare_legacy_claude_tool_images(
+            "original-android-chat",
+            &img.old_root,
+            img.export.path()
+        )
+        .is_err());
+    assert_eq!(count(&db, "tool_images"), 0);
+    assert_eq!(count(&db, "legacy_claude_assets"), 0);
+    assert_eq!(
+        db.query_row("SELECT data FROM chat_rows WHERE id='tool-row'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap(),
+        before
+    );
+    let file_count = std::fs::read_dir(img.destination.parent().unwrap())
+        .unwrap()
+        .count();
+    assert_eq!(file_count, 1);
+    db.execute_batch("DROP TRIGGER fail_image").unwrap();
+    store
+        .prepare_legacy_claude_tool_images(
+            "original-android-chat",
+            &img.old_root,
+            img.export.path(),
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_dir(img.destination.parent().unwrap())
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(std::fs::read(&img.source).unwrap(), img.bytes);
+}
+
+#[test]
+fn missing_changed_wrong_chat_and_malformed_tool_images_never_gain_read_access() {
+    for defect in [
+        "missing",
+        "changed",
+        "foreign-chat",
+        "object",
+        "outside-prefix",
+        "live-source",
+    ] {
+        let (dir, mut store, db) = setup();
+        let mut img = images(dir.path());
+        let mut value: Value = serde_json::from_slice(&img.raw).unwrap();
+        match defect {
+            "missing" => std::fs::remove_file(&img.source).unwrap(),
+            "changed" => std::fs::write(&img.source, b"wrong bytes").unwrap(),
+            "foreign-chat" => {
+                value["thread"]["activities"][0]["payload"]["data"]["toolImages"] = json!([img
+                    .old_root
+                    .join("other-chat")
+                    .join(img.source.file_name().unwrap())])
+            }
+            "object" => {
+                value["thread"]["activities"][0]["payload"]["data"]["toolImages"] =
+                    json!([{"path":img.source}])
+            }
+            "outside-prefix" => img.old_root = dir.path().join("unrelated"),
+            "live-source" => img.old_root = img.export.path().to_owned(),
+            _ => unreachable!(),
+        }
+        img.raw = raw(&value);
+        store.prepare_legacy_claude(&img.raw).unwrap();
+        assert!(
+            store
+                .prepare_legacy_claude_tool_images(
+                    "original-android-chat",
+                    &img.old_root,
+                    img.export.path()
+                )
+                .is_err(),
+            "{defect}"
+        );
+        assert_eq!(count(&db, "tool_images"), 0);
+        assert!(!img.destination.exists());
+        assert!(store.assert_migration_ready().is_err());
+    }
+}
+
+#[test]
+fn changed_destination_or_receipt_blocks_asset_retry_and_metadata_rollback() {
+    for defect in ["bytes", "reference", "extra-access", "ledger"] {
+        let (dir, mut store, db) = setup();
+        let img = images(dir.path());
+        store.prepare_legacy_claude(&img.raw).unwrap();
+        store
+            .prepare_legacy_claude_tool_images(
+                "original-android-chat",
+                &img.old_root,
+                img.export.path(),
+            )
+            .unwrap();
+        match defect {
+            "bytes" => std::fs::write(&img.destination, b"changed").unwrap(),
+            "reference" => {
+                db.execute("UPDATE chat_rows SET data=json_set(data,'$.payload.data.toolImages',json('[]')) WHERE id='tool-row'",[]).unwrap();
+            }
+            "extra-access" => {
+                db.execute(
+                    "INSERT INTO tool_images VALUES('original-android-chat','unrelated')",
+                    [],
+                )
+                .unwrap();
+            }
+            "ledger" => {
+                db.execute("UPDATE legacy_claude_assets SET data='[]'", [])
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            store
+                .prepare_legacy_claude_tool_images(
+                    "original-android-chat",
+                    &img.old_root,
+                    img.export.path()
+                )
+                .is_err(),
+            "{defect}"
+        );
+        assert!(store.prepare_legacy_claude(&img.raw).is_err(), "{defect}");
+        assert!(
+            store
+                .rollback_legacy_claude("original-android-chat")
+                .is_err(),
+            "{defect}"
+        );
+        assert_eq!(count(&db, "chats"), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn exported_image_and_bucket_symlinks_are_not_followed() {
+    for bucket in [false, true] {
+        let (dir, mut store, db) = setup();
+        let img = images(dir.path());
+        let other = tempfile::tempdir().unwrap();
+        let target = other.path().join(img.source.file_name().unwrap());
+        std::fs::write(&target, &img.bytes).unwrap();
+        std::fs::remove_file(&img.source).unwrap();
+        if bucket {
+            std::fs::remove_dir(img.source.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(other.path(), img.source.parent().unwrap()).unwrap();
+        } else {
+            std::os::unix::fs::symlink(target, &img.source).unwrap();
+        }
+        store.prepare_legacy_claude(&img.raw).unwrap();
+        assert!(store
+            .prepare_legacy_claude_tool_images(
+                "original-android-chat",
+                &img.old_root,
+                img.export.path()
+            )
+            .is_err());
+        assert_eq!(count(&db, "tool_images"), 0);
+    }
+}
+
 #[test]
 fn imports_exact_messages_tools_choices_identity_and_receipts_with_a_startup_barrier() {
     for external in [false, true] {
@@ -200,10 +497,12 @@ fn changed_messages_or_native_side_effects_are_never_erased_on_retry_or_rollback
 fn active_queued_uncertain_or_permission_state_cannot_be_silently_dropped() {
     for (path, value) in [
         ("/thread/session/status", json!("running")),
+        ("/thread/session/status", json!("unknown-future-state")),
         ("/thread/session/activeTurnId", json!("active")),
         ("/thread/hasPendingApprovals", json!(true)),
         ("/thread/hasPendingUserInput", json!(true)),
         ("/thread/messages/0/streaming", json!(true)),
+        ("/thread/messages/0/streaming", json!("true")),
     ] {
         let (dir, mut store, _) = setup();
         let mut original = source(dir.path());
@@ -217,6 +516,7 @@ fn active_queued_uncertain_or_permission_state_cannot_be_silently_dropped() {
     for (key, value) in [
         ("followUps", json!([{"id":"pending"}])),
         ("deliveries", json!([{"state":"offered"}])),
+        ("deliveries", json!([{"state":"unknown-future-state"}])),
         ("permissionRules", json!(["Bash(*)"])),
         ("branchImportPending", json!(true)),
     ] {

@@ -68,10 +68,10 @@ fn ordered(state: &Value) -> Result<Vec<(&str, &Value)>, String> {
         .map(|(_, _, kind, row)| (kind, row))
         .collect())
 }
-struct Prepared {
+pub(crate) struct Prepared {
     source: Vec<u8>,
     hash: String,
-    state: Value,
+    pub(crate) state: Value,
     commands: Vec<String>,
     checkpoints: Vec<(String, String)>,
 }
@@ -124,6 +124,20 @@ impl Prepared {
         {
             return Err(BUSY.into());
         }
+        if !matches!(
+            thread["session"]["status"].as_str(),
+            Some("idle" | "ready" | "disconnected" | "error" | "interrupted")
+        ) || (!thread["latestTurn"].is_null()
+            && !matches!(
+                thread["latestTurn"]["state"].as_str(),
+                Some("completed" | "interrupted" | "error")
+            ))
+            || list(&root, "deliveries", 100_000)?
+                .iter()
+                .any(|d| !matches!(d["state"].as_str(), Some("consumed" | "cancelled")))
+        {
+            return Err(INVALID.into());
+        }
         if !list(&root, "permissionRules", 4096)?.is_empty() {
             return Err("Saved Claude session permission rules need explicit conversion before upgrading; nothing was imported".into());
         }
@@ -137,7 +151,7 @@ impl Prepared {
                 {
                     return Err(INVALID.into());
                 }
-                if row["streaming"] == true
+                if optional_bool(&row["streaming"])?
                     || row["phase"] == "queued"
                     || (matches!(
                         row["kind"].as_str(),
@@ -240,6 +254,32 @@ impl Prepared {
 }
 
 impl Store {
+    pub(crate) fn legacy_claude_prepared(&self, id: &str) -> Result<Prepared, String> {
+        let allowed: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM legacy_connection_import WHERE id=1 AND phase='prepared')",[],|r|r.get(0)).map_err(|_|CONFLICT)?;
+        if !allowed {
+            return Err(CONFLICT.into());
+        }
+        let (digest, raw, state, phase): (String, Vec<u8>, String, String) = self
+            .db
+            .query_row(
+                "SELECT digest,raw,state,phase FROM legacy_claude_import WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(|_| CONFLICT)?;
+        let p = Prepared::parse(&raw)?;
+        let expected = p.state.to_string();
+        if digest != p.hash
+            || state != expected
+            || phase != "prepared"
+            || p.state["thread"]["id"] != id
+        {
+            return Err(CONFLICT.into());
+        }
+        verify_inactive(&self.db, id)?;
+        verify(&self.db, &p, &self.directory)?;
+        Ok(p)
+    }
     /// Call under the offline migration profile lease. Original JSON is retained
     /// byte-for-byte in the same transaction as rows and receipt tombstones.
     pub fn prepare_legacy_claude(&mut self, raw: &[u8]) -> Result<Value, String> {
@@ -275,7 +315,7 @@ impl Store {
                 return Err(CONFLICT.into());
             }
             verify_inactive(&tx, id)?;
-            verify(&tx, &prepared)?;
+            verify(&tx, &prepared, &self.directory)?;
             return Ok(prepared.report());
         }
         if tx.query_row("SELECT EXISTS(SELECT 1 FROM chats WHERE id=?1 OR json_extract(data,'$.native_id')=?2)",params![id,prepared.state["native_id"].as_str()],|r|r.get::<_,bool>(0)).map_err(|_|INVALID)? { return Err(CONFLICT.into()); }
@@ -354,8 +394,9 @@ impl Store {
         }
         verify_inactive(&tx, id)?;
         if phase == "prepared" {
-            verify(&tx, &p)?;
-            for table in ["chat_rows", "native_checkpoints"] {
+            verify(&tx, &p, &self.directory)?;
+            crate::legacy_claude_assets::rollback(&tx, id)?;
+            for table in ["chat_rows", "native_checkpoints", "tool_images"] {
                 tx.execute(&format!("DELETE FROM {table} WHERE chat=?1"), [id])
                     .map_err(|_| INVALID)?;
             }
@@ -371,7 +412,7 @@ impl Store {
             )
             .map_err(|_| INVALID)?;
         } else if phase == "rolled-back" {
-            let occupied:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM chats WHERE id=?1) OR EXISTS(SELECT 1 FROM chat_rows WHERE chat=?1) OR EXISTS(SELECT 1 FROM native_checkpoints WHERE chat=?1)",[id],|r|r.get(0)).map_err(|_|CONFLICT)?;
+            let occupied:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM chats WHERE id=?1) OR EXISTS(SELECT 1 FROM chat_rows WHERE chat=?1) OR EXISTS(SELECT 1 FROM native_checkpoints WHERE chat=?1) OR EXISTS(SELECT 1 FROM tool_images WHERE chat=?1)",[id],|r|r.get(0)).map_err(|_|CONFLICT)?;
             if occupied {
                 return Err(CONFLICT.into());
             }
@@ -395,12 +436,7 @@ impl Store {
     }
 }
 fn verify_inactive(db: &rusqlite::Connection, id: &str) -> Result<(), String> {
-    for table in [
-        "tool_images",
-        "native_turns",
-        "native_sync",
-        "claude_outbox",
-    ] {
+    for table in ["native_turns", "native_sync", "claude_outbox"] {
         let present: bool = db
             .query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE chat=?1)"),
@@ -418,12 +454,17 @@ fn verify_inactive(db: &rusqlite::Connection, id: &str) -> Result<(), String> {
     }
     Ok(())
 }
-fn verify(db: &rusqlite::Connection, p: &Prepared) -> Result<(), String> {
+fn verify(
+    db: &rusqlite::Connection,
+    p: &Prepared,
+    directory: &std::path::Path,
+) -> Result<(), String> {
     let id = p.state["thread"]["id"].as_str().unwrap();
-    let mut header = p.state.clone();
+    let state = crate::legacy_claude_assets::project(db, directory, &p.state)?;
+    let mut header = state.clone();
     let mut total = 0;
     for kind in ["messages", "activities", "proposedPlans"] {
-        for row in p.state["thread"][kind].as_array().unwrap() {
+        for row in state["thread"][kind].as_array().unwrap() {
             let (found, turn): (String, Option<String>) = db
                 .query_row(
                     "SELECT data,turn FROM chat_rows WHERE chat=?1 AND kind=?2 AND id=?3",
@@ -459,7 +500,7 @@ fn verify(db: &rusqlite::Connection, p: &Prepared) -> Result<(), String> {
     if found != expected_header || count != total {
         return Err(CONFLICT.into());
     }
-    let expected: Vec<_> = ordered(&p.state)?
+    let expected: Vec<_> = ordered(&state)?
         .into_iter()
         .map(|(k, r)| (k.to_owned(), r["id"].as_str().unwrap().to_owned()))
         .collect();

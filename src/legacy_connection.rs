@@ -298,7 +298,14 @@ impl Store {
             return Err(INVALID.into());
         }
         if phase == "rolled-back" {
-            let occupied: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM clients) OR EXISTS(SELECT 1 FROM metadata) OR EXISTS(SELECT 1 FROM storage_assets)",[],|r|r.get(0)).map_err(|_|INVALID)?;
+            let occupied: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM clients) OR EXISTS(SELECT 1 FROM metadata)",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|_| INVALID)?;
+            crate::legacy_claude_assets::retained_assets(&tx)?;
             if occupied || has_chats(&tx)? {
                 return Err(CONFLICT.into());
             }
@@ -333,9 +340,12 @@ fn has_chats(db: &rusqlite::Connection) -> Result<bool, String> {
         return Err(CONFLICT.into());
     }
     for name in tables {
-        if name == "legacy_claude_import" {
+        if matches!(
+            name.as_str(),
+            "legacy_claude_import" | "legacy_claude_assets"
+        ) {
             let active: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM legacy_claude_import WHERE COALESCE(phase,'')<>'rolled-back')", [], |r|r.get(0)
+                &format!("SELECT EXISTS(SELECT 1 FROM {name} WHERE COALESCE(phase,'')<>'rolled-back')"), [], |r|r.get(0)
             ).map_err(|_|INVALID)?;
             if active {
                 return Ok(true);
@@ -368,8 +378,9 @@ fn has_chats(db: &rusqlite::Connection) -> Result<bool, String> {
 }
 
 fn verify(db: &rusqlite::Connection, prepared: &Prepared) -> Result<(), String> {
+    let retained = crate::legacy_claude_assets::retained_assets(db)?;
     let counts:(i64,i64,i64)=db.query_row("SELECT (SELECT count(*) FROM clients),(SELECT count(*) FROM metadata),(SELECT count(*) FROM storage_assets)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|_|INVALID)?;
-    if counts != (prepared.clients.len() as i64, KEYS.len() as i64, 0) || has_chats(db)? {
+    if counts != (prepared.clients.len() as i64, KEYS.len() as i64, retained) || has_chats(db)? {
         return Err(CONFLICT.into());
     }
     for client in &prepared.clients {
