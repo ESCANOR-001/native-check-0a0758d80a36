@@ -105,9 +105,9 @@ impl Config {
             let path = p
                 .canonicalize()
                 .map_err(|_| "Cannot resolve test profile")?;
-            if let Ok(home) = std::env::var("HOME") {
-                for normal in [".codex", ".claude"] {
-                    if path == PathBuf::from(&home).join(normal) {
+            for key in ["HOME", "USERPROFILE"] {
+                if let Some(home) = std::env::var_os(key) {
+                    if crate::profile_lock::standard_agent_profile(&path, &PathBuf::from(home)) {
                         return Err("Normal agent profiles are forbidden in this experiment".into());
                     }
                 }

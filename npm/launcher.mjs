@@ -84,6 +84,8 @@ export async function main(args = process.argv.slice(2)) {
     for (const [signal, fn] of forwarders) process.off(signal, fn);
   }
 }
-if (process.argv[1] && await realpath(process.argv[1]).catch(() => '') === fileURLToPath(import.meta.url)) {
+// Resolve both sides: Windows drive casing and npm's bin links can differ from
+// the spelling in import.meta.url even when they point at this same module.
+if (process.argv[1] && await realpath(process.argv[1]).catch(() => '') === await realpath(fileURLToPath(import.meta.url))) {
   main().catch(error => { console.error(error.message); process.exitCode = 1; });
 }

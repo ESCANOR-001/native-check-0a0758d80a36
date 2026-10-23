@@ -1,5 +1,5 @@
 import { createReadStream } from 'node:fs';
-import { chmod, copyFile, mkdir, lstat, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, lstat, realpath, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,7 +29,7 @@ export async function buildPackages(binary, destination) {
   await chmod(join(launcher, 'bin/launcher.mjs'), 0o755);
   return { native, launcher, target, name };
 }
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && await realpath(process.argv[1]).catch(() => '') === await realpath(fileURLToPath(import.meta.url))) {
   if (process.argv.length !== 4) throw new Error('Usage: node build.mjs RELEASE_BINARY NEW_OUTPUT_DIRECTORY');
   console.log(JSON.stringify(await buildPackages(process.argv[2], process.argv[3])));
 }

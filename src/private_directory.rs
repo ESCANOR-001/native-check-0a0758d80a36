@@ -22,7 +22,8 @@ pub(crate) fn prepare(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
-    if !fs::symlink_metadata(path)?.is_dir() {
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_dir() || !crate::profile_snapshot::regular(&meta) {
         return Err(io::ErrorKind::InvalidInput.into());
     }
     #[cfg(unix)]
