@@ -138,8 +138,9 @@ impl Prepared {
         {
             return Err(INVALID.into());
         }
-        if !list(&root, "permissionRules", 4096)?.is_empty() {
-            return Err("Saved Claude session permission rules need explicit conversion before upgrading; nothing was imported".into());
+        let permission_rules = crate::claude_permissions::parse(&root["permissionRules"])?;
+        if root["external"] == true && !permission_rules.is_empty() {
+            return Err("Saved permissions on an externally owned Claude chat need owner reconciliation before upgrading; nothing was imported".into());
         }
         let mut rows = 0usize;
         for kind in ["messages", "activities", "proposedPlans"] {
@@ -220,6 +221,7 @@ impl Prepared {
         let plan = (thread["interactionMode"] == "plan")
             .then(|| thread["runtimeMode"].as_str().unwrap().to_owned());
         let chat = Chat {
+            claude_permission_rules: permission_rules,
             agent: AgentKind::Claude,
             thread,
             native_id: native.into(),

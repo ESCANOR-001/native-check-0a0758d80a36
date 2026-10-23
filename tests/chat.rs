@@ -4403,6 +4403,64 @@ async fn codex_service_tier_reaches_start_resume_and_turn_and_survives_restart()
 }
 
 #[tokio::test]
+async fn migrated_claude_permissions_reach_only_the_owned_chat_launch_and_survive_restart() {
+    for hosted in [false, true] {
+        let mut t = if hosted {
+            Test::hosted().await
+        } else {
+            Test::new().await
+        };
+        let a = AgentKind::Claude;
+        t.create(a, "remembered").await;
+        t.create(a, "unrelated").await;
+        t.stop().await;
+        t.db.call(|a| {
+            let mut saved = a.store.load_chat("remembered").unwrap();
+            saved["claude_permission_rules"] = json!(["Read(/fixture/**)", "Bash(echo fixture)"]);
+            a.store.save_chat(&saved, None).unwrap();
+        })
+        .await
+        .unwrap();
+        t.hub = Chats::start(t.db.clone(), t.config.clone()).await.unwrap();
+        for id in ["remembered", "unrelated"] {
+            t.call(a, prompt(id, "settings", "normal")).await.unwrap();
+            let done = t.wait(a, id, "ready").await;
+            let response = done["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["role"] == "assistant")
+                .unwrap()["text"]
+                .as_str()
+                .unwrap();
+            let args: Vec<String> = serde_json::from_str(response).unwrap();
+            let at = args.iter().position(|a| a == "--settings").unwrap();
+            let settings: Value = serde_json::from_str(&args[at + 1]).unwrap();
+            assert_eq!(settings["remoteControlAtStartup"], false);
+            assert_eq!(settings["disableAllHooks"], true);
+            if id == "remembered" {
+                assert_eq!(
+                    settings["permissions"]["allow"],
+                    json!(["Read(/fixture/**)", "Bash(echo fixture)"])
+                );
+            } else {
+                assert!(settings.get("permissions").is_none());
+            }
+            assert!(done.get("claude_permission_rules").is_none());
+        }
+        t.stop().await;
+        assert_eq!(
+            t.db.call(
+                |a| a.store.load_chat("remembered").unwrap()["claude_permission_rules"].clone()
+            )
+            .await
+            .unwrap(),
+            json!(["Read(/fixture/**)", "Bash(echo fixture)"])
+        );
+    }
+}
+
+#[tokio::test]
 async fn storage_pressure_stops_owned_workers_preserves_queue_and_rejects_new_prompts() {
     use remodex_connect_native::storage::Limits;
     for a in [AgentKind::Codex, AgentKind::Claude] {

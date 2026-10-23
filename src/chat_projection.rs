@@ -667,6 +667,7 @@ mod tests {
             native_id: String::new(),
             resumed: false,
             claude_plan_access: None,
+            claude_permission_rules: vec![],
             remote_identity: None,
             external_claude: false,
             external_stop: None,

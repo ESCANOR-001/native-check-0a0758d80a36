@@ -215,6 +215,7 @@ impl Prepared {
                 native_id: native.into(),
                 resumed: true,
                 claude_plan_access: None,
+                claude_permission_rules: vec![],
                 remote_identity: None,
                 external_claude: false,
                 external_stop: None,

@@ -35,6 +35,41 @@ fn source(dir: &std::path::Path) -> Value {
 fn raw(value: &Value) -> Vec<u8> {
     format!("  {}\n", value).into_bytes()
 }
+#[test]
+fn owned_saved_permissions_preserve_exact_rules_source_and_rollback_without_profile_writes() {
+    let (dir, mut store, db) = setup();
+    let mut original = source(dir.path());
+    original["permissionRules"] = json!(["Read(/fixture/**)", "Bash(echo fixture)"]);
+    let bytes = raw(&original);
+    store.prepare_legacy_claude(&bytes).unwrap();
+    let saved = store.load_chat("original-android-chat").unwrap();
+    assert_eq!(
+        saved["claude_permission_rules"],
+        original["permissionRules"]
+    );
+    assert!(saved["thread"].get("claude_permission_rules").is_none());
+    assert!(!dir.path().join("settings.json").exists());
+    assert_eq!(
+        db.query_row("SELECT raw FROM legacy_claude_import", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        bytes
+    );
+    store.prepare_legacy_claude(&bytes).unwrap();
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    assert_eq!(count(&db, "chats"), 0);
+    assert!(store.assert_migration_ready().is_err());
+    let (dir, mut store, _) = setup();
+    let mut original = source(dir.path());
+    original["external"] = json!(true);
+    original["permissionRules"] = json!(["Read"]);
+    assert!(store
+        .prepare_legacy_claude(&raw(&original))
+        .unwrap_err()
+        .contains("owner reconciliation"));
+}
 fn count(db: &rusqlite::Connection, table: &str) -> i64 {
     db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
         .unwrap()
@@ -517,7 +552,7 @@ fn active_queued_uncertain_or_permission_state_cannot_be_silently_dropped() {
         ("followUps", json!([{"id":"pending"}])),
         ("deliveries", json!([{"state":"offered"}])),
         ("deliveries", json!([{"state":"unknown-future-state"}])),
-        ("permissionRules", json!(["Bash(*)"])),
+        ("permissionRules", json!(["invalid\npermission"])),
         ("branchImportPending", json!(true)),
     ] {
         let (dir, mut store, _) = setup();

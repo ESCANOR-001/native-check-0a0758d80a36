@@ -16,6 +16,7 @@ pub mod claude_host;
 pub mod claude_link;
 pub mod claude_observer;
 pub mod claude_outbox;
+mod claude_permissions;
 mod claude_rebind;
 mod claude_reconnect;
 pub mod claude_remote;

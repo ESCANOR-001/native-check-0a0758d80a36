@@ -155,6 +155,8 @@ pub(crate) struct Chat {
     pub resumed: bool,
     #[serde(default)]
     pub claude_plan_access: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claude_permission_rules: Vec<String>,
     #[serde(default)]
     pub remote_identity: Option<crate::claude_host::Identity>,
     #[serde(default)]
@@ -189,6 +191,7 @@ impl Chat {
     pub(crate) fn detach_native_session(&mut self) {
         self.resumed = false;
         self.claude_plan_access = None;
+        self.claude_permission_rules.clear();
         self.remote_identity = None;
         self.external_claude = false;
         self.external_stop = None;
@@ -2621,6 +2624,7 @@ impl Hub {
             },
             resumed: false,
             claude_plan_access: None,
+            claude_permission_rules: vec![],
             remote_identity: None,
             external_claude: false,
             external_stop: None,
@@ -3413,6 +3417,7 @@ impl Hub {
         let mut env = crate::discovery::environment(chat.agent, &p.profile);
         let mut args = crate::discovery::isolated_args(chat.agent);
         if chat.agent == AgentKind::Claude {
+            crate::claude_permissions::apply(&mut args, &chat.claude_permission_rules)?;
             p.tools.apply(&mut args);
             env.insert(
                 "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING".into(),
