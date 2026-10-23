@@ -89,20 +89,16 @@ async fn serve(
             &args[3],
         )?);
     }
-    // Explicit candidate-only helper selection. Normal service configuration,
-    // credentials, and existing cloudflared processes are never changed.
-    let tunnel_origin = if let Some(executable) = std::env::var_os("REMODEX_NATIVE_CLOUDFLARED") {
-        Some(
-            remodex_connect_native::tunnel::Origin::start(
-                &mut app,
-                PathBuf::from(executable),
-                &directory,
-            )
-            .await?,
+    // The managed helper is acquired lazily, only when quick mode is enabled.
+    // Its cache and configuration belong exclusively to this native profile.
+    let tunnel_origin = Some(
+        remodex_connect_native::tunnel::Origin::start(
+            &mut app,
+            std::env::var_os("REMODEX_NATIVE_CLOUDFLARED").map(PathBuf::from),
+            &directory,
         )
-    } else {
-        None
-    };
+        .await?,
+    );
     let shutdown_tunnel = app.tunnel.clone();
     let invitation = invite
         .as_ref()

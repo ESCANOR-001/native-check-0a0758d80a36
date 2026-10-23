@@ -75,7 +75,7 @@ pub struct Origin {
 impl Origin {
     pub async fn start(
         app: &mut crate::server::App,
-        executable: PathBuf,
+        executable: Option<PathBuf>,
         directory: &std::path::Path,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         use std::io::Write;
@@ -98,7 +98,8 @@ impl Origin {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let manager = Manager::new(
             Config {
-                executable,
+                executable: executable
+                    .unwrap_or_else(|| crate::cloudflared::managed_path(directory)),
                 empty_config,
                 origin: listener.local_addr()?,
                 environment_id: app.environment_id.clone(),
@@ -165,7 +166,10 @@ impl Manager {
             return Err("A private phone origin and verified environment are required".into());
         }
         if !config.executable.is_absolute()
-            || !config.executable.is_file()
+            || (!config.executable.is_file()
+                && !config.empty_config.parent().is_some_and(|directory| {
+                    crate::cloudflared::is_managed(&config.executable, directory)
+                }))
             || !config.empty_config.is_absolute()
         {
             return Err("Select a native tunnel executable and private configuration".into());
@@ -304,9 +308,19 @@ async fn run(
             continue;
         }
         if let Err(error) = result {
+            let public_error = match error {
+                "invalid_checksum" | "download_failed" | "unsupported_platform" => {
+                    "cloudflared_unavailable"
+                }
+                other => other,
+            };
             state.send_replace(
-                State::new("error", None, Some(error)).generation(current.generation),
+                State::new("error", None, Some(public_error)).generation(current.generation),
             );
+            if matches!(error, "invalid_checksum" | "unsupported_platform") {
+                tokio::select! {_=stopping.changed()=>{},_=desired.changed()=>{failures=0;},_=check.notified()=>{}}
+                continue;
+            }
             let delay = [1, 3, 5, 10, 30][failures.min(4)];
             failures = failures.saturating_add(1);
             tokio::select! {_=tokio::time::sleep(Duration::from_secs(delay))=>{},_=stopping.changed()=>{},_=desired.changed()=>{failures=0;}}
@@ -333,7 +347,12 @@ async fn attempt(
     {
         return Err("tunnel_failed");
     }
-    let mut command = Command::new(&config.executable);
+    let executable = tokio::select! {
+        _=desired.changed()=>return Ok(()),
+        _=stopping.changed()=>return Ok(()),
+        result=crate::cloudflared::resolve(&config.executable, config.empty_config.parent().ok_or("tunnel_failed")?)=>result?,
+    };
+    let mut command = Command::new(executable);
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
         if name.starts_with("TUNNEL_")
@@ -543,6 +562,40 @@ async fn verify(client: &reqwest::Client, url: &str, environment: &str) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn disabled_managed_helper_is_lazy_and_corrupt_cache_reports_a_supported_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty_config = dir.path().join("empty.yml");
+        std::fs::write(&empty_config, b"{}\n").unwrap();
+        let executable = crate::cloudflared::managed_path(dir.path());
+        let config = Config {
+            executable: executable.clone(),
+            empty_config,
+            origin: "127.0.0.1:12345".parse().unwrap(),
+            environment_id: "test".into(),
+        };
+        let manager = Manager::new(config, false).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(manager.state().status, "stopped");
+        assert!(!dir.path().join("tools").exists());
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, b"UNVERIFIED_DO_NOT_EXECUTE").unwrap();
+        manager.configure(true);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while manager.state().status != "error" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(manager.state().error, Some("cloudflared_unavailable"));
+        assert!(manager.state().public_url.is_none());
+        assert_eq!(
+            std::fs::read(executable).unwrap(),
+            b"UNVERIFIED_DO_NOT_EXECUTE"
+        );
+        manager.shutdown().await;
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn initial_verification_failure_keeps_the_registered_connector_until_stopped() {

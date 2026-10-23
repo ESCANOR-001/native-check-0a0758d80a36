@@ -47,6 +47,7 @@ mod usage;
 mod vcs;
 mod worktrees;
 
+mod cloudflared;
 pub mod invitation_file;
 pub mod mobile_connection;
 pub mod network_access;
