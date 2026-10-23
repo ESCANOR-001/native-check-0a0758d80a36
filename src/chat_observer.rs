@@ -168,6 +168,8 @@ impl Hub {
                 checkpoint_labels: HashMap::new(),
                 unsupported_controls: 0,
                 claude_router: None,
+                claude_background: Default::default(),
+                claude_deferred_result: None,
                 local_turn: None,
                 recovering: true,
                 observer: Some(State {

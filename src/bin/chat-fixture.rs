@@ -540,6 +540,25 @@ This came from another Claude session — not typed by your user, but very likel
                     continue;
                 }
             }
+            if text == "background-fixture" {
+                out(
+                    json!({"type":"system","subtype":"task_started","task_id":"fixture-background","run_id":"001","is_backgrounded":true}),
+                );
+                std::thread::spawn(|| {
+                    for _ in 0..1500 {
+                        if std::path::Path::new("background-release").exists() {
+                            std::fs::write("background-finished", "TOOL_REALLY_FINISHED").unwrap();
+                            out(
+                                json!({"type":"system","subtype":"task_notification","task_id":"fixture-background","run_id":"001","status":"completed"}),
+                            );
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                });
+                complete(false, "FOREGROUND_COMPLETE", &last);
+                continue;
+            }
             control_loop = text == "control-loop";
             if text == "elicitation" || text == "elicitation-url" {
                 elicitation(false, if text == "elicitation" { "form" } else { "url" });

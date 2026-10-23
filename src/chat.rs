@@ -498,6 +498,8 @@ struct Worker {
     checkpoint_labels: HashMap<String, String>,
     unsupported_controls: u8,
     claude_router: Option<crate::claude_turns::Router>,
+    claude_background: crate::claude_background::Tasks,
+    claude_deferred_result: Option<Value>,
     local_turn: Option<ClaudeLocalTurn>,
     recovering: bool,
     observer: Option<observer::State>,
@@ -708,6 +710,8 @@ impl Hub {
                 checkpoint_labels: HashMap::new(),
                 unsupported_controls: 0,
                 claude_router: None,
+                claude_background: Default::default(),
+                claude_deferred_result: None,
                 local_turn: None,
                 recovering: false,
                 observer: None,
@@ -1386,6 +1390,9 @@ impl Hub {
                 (id,event)=async {
                     if self.active.is_empty(){std::future::pending().await} else {
                         let mut waits: Vec<_>=self.active.iter_mut().map(|(id,w)|Box::pin(async move {
+                            if !w.claude_background.busy() {
+                                if let Some(v)=w.claude_deferred_result.take(){return (id.clone(),Some(Event::Message(v)));}
+                            }
                             if (w.stage=="running" && !w.native_turn.is_empty()) || w.stage=="prompt" {
                                 if let Some((v,bytes))=w.pre_turn_events.pop_front(){w.pre_turn_bytes-=bytes;return (id.clone(),Some(Event::Message(v)));}
                             }
@@ -2603,7 +2610,7 @@ impl Hub {
                     return Err("Select a default model for this agent".into());
                 }
                 let catalog=self.models.get(agent.instance()).cloned().unwrap_or_else(|| crate::models::fallback(&self.config.provider(agent).model));
-                c["defaultModelSelection"]=crate::models::selection(&catalog,value,&Value::Null,agent.instance())?;
+                c["defaultModelSelection"]=crate::models::project_selection(&catalog,value,agent.instance(),c["type"]=="project.create")?;
             }
             let base = self.config.workspace.clone();
             let old = self.projects.clone();
@@ -3325,6 +3332,8 @@ impl Hub {
                 checkpoint_labels: HashMap::new(),
                 unsupported_controls: 0,
                 claude_router: hosted.then(Default::default),
+                claude_background: Default::default(),
+                claude_deferred_result: None,
                 local_turn: None,
                 recovering,
                 observer: None,
@@ -3595,6 +3604,22 @@ impl Hub {
                 .call(move |a| a.store.acknowledge_claude_input(&cid, &native, &frame))
                 .await?
                 .map_err(|_| "Could not save Claude delivery confirmation")?;
+        }
+        if self.chats[&id].agent == AgentKind::Claude && self.active[&id].claude_router.is_none() {
+            let w = self.active.get_mut(&id).unwrap();
+            w.claude_background.observe(&v)?;
+            if v["type"] == "result"
+                && v["parent_tool_use_id"].is_null()
+                && w.claude_background.busy()
+            {
+                if v.to_string().len() > 256 * 1024 {
+                    return Err(
+                        "Claude completion exceeds its bounded background-task budget".into(),
+                    );
+                }
+                w.claude_deferred_result = Some(v);
+                return Ok(());
+            }
         }
         let hosted_change = if self.active[&id].claude_router.is_some() {
             Some(self.route_claude(&id, &v).await?)

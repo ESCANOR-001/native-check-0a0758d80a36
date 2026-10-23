@@ -8,6 +8,7 @@ pub mod auth_service;
 pub mod chat;
 mod chat_projection;
 mod chat_store;
+mod claude_background;
 pub mod claude_cursor;
 pub mod claude_history;
 pub mod claude_host;

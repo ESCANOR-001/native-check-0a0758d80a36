@@ -1213,6 +1213,104 @@ async fn hosted_claude_stop_before_native_start_finishes_without_result_or_disco
 }
 
 #[tokio::test]
+async fn claude_background_tools_finish_before_queue_and_do_not_get_killed_at_foreground_result() {
+    for hosted in [false, true] {
+        let t = if hosted {
+            Test::hosted().await
+        } else {
+            Test::new().await
+        };
+        let a = AgentKind::Claude;
+        t.create(a, "background").await;
+        t.call(a, prompt("background", "background-fixture", "normal"))
+            .await
+            .unwrap();
+        let first = t.wait(a, "background", "running").await;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let detail = t.detail(a, "background").await;
+                if detail["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["text"] == "FOREGROUND_COMPLETE")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            t.detail(a, "background").await["session"]["status"],
+            "running"
+        );
+        t.call(a, prompt("background", "AFTER_BACKGROUND_QUEUE", "queue"))
+            .await
+            .unwrap();
+        t.call(a, prompt("background", "BACKGROUND_STEER", "steer"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let held = t.detail(a, "background").await;
+        assert_eq!(held["session"]["status"], "running");
+        assert_eq!(held["latestTurn"]["turnId"], first["latestTurn"]["turnId"]);
+        assert!(!held["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "assistant" && m["text"] == "AFTER_BACKGROUND_QUEUE"));
+        std::fs::write(t.dir.path().join("background-release"), "finish").unwrap();
+        let done = t.wait(a, "background", "ready").await;
+        assert_eq!(
+            std::fs::read_to_string(t.dir.path().join("background-finished")).unwrap(),
+            "TOOL_REALLY_FINISHED"
+        );
+        for text in ["BACKGROUND_STEER", "AFTER_BACKGROUND_QUEUE"] {
+            assert_eq!(
+                done["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|m| m["role"] == "assistant" && m["text"] == text)
+                    .count(),
+                1
+            );
+        }
+        t.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn android_folder_picker_legacy_model_placeholder_uses_each_agents_default() {
+    let t = Test::new().await;
+    for (agent, id) in [
+        (AgentKind::Codex, "codex-project"),
+        (AgentKind::Claude, "claude-project"),
+    ] {
+        let command = json!({"type":"project.create","commandId":id,"projectId":id,"title":id,"workspaceRoot":t.dir.path().join(id),"createWorkspaceRootIfMissing":true,"defaultModelSelection":{"instanceId":"codex","model":"gpt-5.4"}});
+        t.call(agent, command.clone()).await.unwrap();
+        t.call(agent, command).await.unwrap();
+        let shell = t
+            .hub
+            .call(agent, "phone", "orchestration.subscribeShell", json!({}))
+            .await
+            .unwrap();
+        let p = shell["snapshot"]["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == id)
+            .unwrap();
+        assert_eq!(p["defaultModelSelection"]["model"], "test");
+        assert_eq!(p["defaultModelSelection"]["instanceId"], agent.instance());
+        assert!(t.call(agent,json!({"type":"project.meta.update","commandId":format!("edit-{id}"),"projectId":id,"defaultModelSelection":{"instanceId":"codex","model":"gpt-5.4"}})).await.is_err());
+    }
+    t.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_claude_steer_queue_and_stop_keep_native_connection() {
     let test = Test::hosted().await;
     let a = AgentKind::Claude;
@@ -4962,12 +5060,13 @@ async fn repository_clone_does_not_block_either_agent_and_shutdown_never_replays
         .unwrap()
         .unwrap()
         .is_err());
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(4), stream.read(&mut bytes))
-            .await
-            .unwrap()
-            .unwrap(),
-        0
+    let closed = tokio::time::timeout(Duration::from_secs(4), stream.read(&mut bytes))
+        .await
+        .unwrap();
+    assert!(
+        matches!(closed, Ok(0))
+            || matches!(closed,Err(ref e) if e.kind()==std::io::ErrorKind::ConnectionReset),
+        "terminated Git connection remained open: {closed:?}"
     );
     test.hub = Chats::start(test.db.clone(), test.config.clone())
         .await

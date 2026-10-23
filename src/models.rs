@@ -144,6 +144,37 @@ pub fn selection(
     }
     Ok(json!({"instanceId":instance,"model":model,"options":options}))
 }
+/// The existing folder picker emits this historical Codex default for both
+/// agents, without offering a model choice. It is a creation placeholder, not
+/// an explicit chat model. Never apply this compatibility rule to model edits.
+pub fn project_selection(
+    catalog: &Value,
+    requested: &Value,
+    instance: &str,
+    creating: bool,
+) -> Result<Value, String> {
+    if creating
+        && requested["instanceId"] == "codex"
+        && requested["model"] == "gpt-5.4"
+        && requested
+            .get("options")
+            .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
+    {
+        let default = catalog
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["isDefault"] == true)
+            .ok_or("This agent has not reported a default model")?;
+        return selection(
+            catalog,
+            &json!({"instanceId":instance,"model":default["slug"]}),
+            &Value::Null,
+            instance,
+        );
+    }
+    selection(catalog, requested, &Value::Null, instance)
+}
 /// The catalog row that reports `model`, by alias or by the wire model it
 /// resolves to. Used only to validate options of an unchanged native model.
 pub fn row<'a>(catalog: &'a Value, model: &str) -> Option<&'a Value> {

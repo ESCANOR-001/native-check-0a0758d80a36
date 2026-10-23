@@ -150,7 +150,7 @@ pub struct Turn {
     pub local: bool,
     pub inputs: Vec<String>,
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
     pub turn: Option<Turn>,
     /// Rows to associate with this verified turn, including native batches.
@@ -172,6 +172,10 @@ pub struct Router {
     completed_inputs: Vec<String>,
     #[serde(default)]
     rejected_tool_notice: bool,
+    #[serde(default)]
+    background: crate::claude_background::Tasks,
+    #[serde(default)]
+    deferred_completion: Option<Change>,
 }
 impl Router {
     /// Claude emits a user-role control notice after a rejected tool, without
@@ -231,7 +235,7 @@ impl Router {
     /// a root result and its server PROCESSED receipt have both been observed.
     /// Multiple pending inputs require normal native turn identity evidence.
     pub fn settle_historical_result(&mut self, public_turn: &str, processed: &[String]) -> bool {
-        if self.active.is_some() || self.pending.len() != 1 {
+        if self.active.is_some() || self.pending.len() != 1 || self.background.busy() {
             return false;
         }
         let input = self.pending.values().next().unwrap();
@@ -268,6 +272,9 @@ impl Router {
     /// Caller requires the exact Stop acknowledgement, a terminal worker result
     /// and processing receipts for every input. Never infer this from silence.
     pub fn confirm_stopped(&mut self, public_turn: &str) -> bool {
+        if self.background.busy() {
+            return false;
+        }
         let Some(turn) = self
             .active
             .as_ref()
@@ -282,6 +289,7 @@ impl Router {
         self.active = None;
         self.unscoped_result = None;
         self.completed_inputs.clear();
+        self.deferred_completion = None;
         true
     }
     pub fn register(&mut self, input: Input) -> Result<bool, String> {
@@ -322,14 +330,63 @@ impl Router {
         // Invalid or contradictory receipts must leave the entire reducer
         // unchanged, including partially consumed native batches.
         let mut next = self.clone();
-        let change = next.apply(frame)?;
+        next.background.observe(frame)?;
+        let mut change = next.apply(frame)?;
+        if frame["type"] == "system" && frame["subtype"] == "worker_shutting_down" {
+            next.background = Default::default();
+            next.deferred_completion = None;
+        } else if change.completed && next.background.busy() {
+            // The foreground has finished, but closing this turn/worker now
+            // would kill its detached tools or release the next queued prompt.
+            // Keep only verified turn metadata, never a raw result/output.
+            if change.outcome.is_none() {
+                change.outcome = Some(
+                    if ["aborted_tools", "aborted_streaming"]
+                        .contains(&frame["terminal_reason"].as_str().unwrap_or(""))
+                    {
+                        "interrupted"
+                    } else if frame["is_error"] == true {
+                        "error"
+                    } else {
+                        "completed"
+                    }
+                    .into(),
+                );
+            }
+            next.pending = self.pending.clone();
+            next.retired = self.retired.clone();
+            next.active = change.turn.clone();
+            next.deferred_completion = Some(change.clone());
+            change.completed = false;
+            change.outcome = None;
+        } else if change.completed {
+            next.deferred_completion = None;
+        } else if let Some(deferred) = next.deferred_completion.clone() {
+            if deferred.turn.as_ref() != next.active.as_ref() {
+                // A new consumed steer needs its own completion. An older
+                // foreground result cannot complete that new input.
+                next.deferred_completion = None;
+            } else if !next.background.busy() {
+                if let Some(turn) = &deferred.turn {
+                    for id in &turn.inputs {
+                        next.retire(id);
+                    }
+                }
+                next.active = None;
+                next.unscoped_result = None;
+                next.completed_inputs.clear();
+                next.deferred_completion = None;
+                change = deferred;
+                change.started = false;
+            }
+        }
         *self = next;
         Ok(change)
     }
     /// The worker process that held the active turn and pending inputs is
     /// gone without a result: they end exactly as for a graceful shutdown.
     pub fn owner_gone(&mut self) -> Change {
-        self.apply(&serde_json::json!({"type":"system","subtype":"worker_shutting_down"}))
+        self.observe(&serde_json::json!({"type":"system","subtype":"worker_shutting_down"}))
             .unwrap_or_default()
     }
     fn retire(&mut self, id: &str) {
@@ -643,6 +700,78 @@ mod tests {
     }
     fn consumed(ids: &[&str], done: bool) -> Value {
         json!({"type":if done{"result"}else{"assistant"},"user_message_uuids":ids})
+    }
+    #[test]
+    fn foreground_completion_waits_for_tasks_across_saved_projection_and_keeps_queued_input() {
+        let mut r = Router::default();
+        r.register(input(A, "running", true)).unwrap();
+        r.register(input(B, "queued", true)).unwrap();
+        r.observe(&consumed(&[A], false)).unwrap();
+        r.observe(&json!({"type":"system","subtype":"task_started","task_id":"tool","run_id":"2"}))
+            .unwrap();
+        let mut result = consumed(&[A], true);
+        result["is_error"] = json!(true);
+        assert!(!r.observe(&result).unwrap().completed);
+        assert_eq!(r.active().unwrap().public_turn, "running");
+        assert!(
+            !r.confirm_stopped("running"),
+            "foreground interrupt does not stop background tools"
+        );
+        let saved = serde_json::to_value(&r).unwrap();
+        let mut r: Router = serde_json::from_value(saved).unwrap();
+        let mut done = json!({"type":"system","subtype":"task_notification","task_id":"tool","run_id":"1","status":"completed"});
+        assert!(!r.observe(&done).unwrap().completed);
+        done["run_id"] = json!("2");
+        let c = r.observe(&done).unwrap();
+        assert!(c.completed);
+        assert_eq!(c.outcome.as_deref(), Some("error"));
+        assert!(r.active().is_none());
+        assert_eq!(r.pending().count(), 1);
+        assert_eq!(r.pending().next().unwrap().native, B);
+        assert!(!r.observe(&done).unwrap().completed);
+        assert!(!r.observe(&result).unwrap().completed);
+    }
+    #[test]
+    fn held_completion_cannot_finish_a_new_steer_and_owner_loss_clears_background_tasks() {
+        let mut r = Router::default();
+        r.register(input(A, "turn", true)).unwrap();
+        r.observe(&consumed(&[A], false)).unwrap();
+        r.observe(&json!({"type":"system","subtype":"task_started","task_id":"tool"}))
+            .unwrap();
+        assert!(!r.observe(&consumed(&[A], true)).unwrap().completed);
+        let mut steer = input(B, "turn", true);
+        steer.steer = true;
+        r.register(steer).unwrap();
+        r.observe(&consumed(&[A, B], false)).unwrap();
+        let done = json!({"type":"system","subtype":"task_notification","task_id":"tool","status":"completed"});
+        assert!(!r.observe(&done).unwrap().completed);
+        assert!(r.observe(&consumed(&[A, B], true)).unwrap().completed);
+        r.register(input(C, "next", true)).unwrap();
+        r.observe(&consumed(&[C], false)).unwrap();
+        r.observe(&json!({"type":"system","subtype":"task_started","task_id":"other"}))
+            .unwrap();
+        r.observe(&consumed(&[C], true)).unwrap();
+        assert_eq!(r.owner_gone().outcome.as_deref(), Some("interrupted"));
+        assert!(!r.background.busy());
+        assert!(r.deferred_completion.is_none());
+    }
+    #[test]
+    fn remote_peer_completion_also_waits_for_background_tasks_and_retains_error_outcome() {
+        let mut r = Router::default();
+        r.register(input(A, "peer", false)).unwrap();
+        r.observe(&consumed(&[A], false)).unwrap();
+        r.observe(&json!({"type":"system","subtype":"task_started","task_id":"tool"}))
+            .unwrap();
+        r.observe(&json!({"type":"result","origin":{"kind":"peer"},"is_error":true}))
+            .unwrap();
+        assert!(
+            !r.observe(&json!({"type":"command_lifecycle","state":"completed","command_uuid":A}))
+                .unwrap()
+                .completed
+        );
+        let c=r.observe(&json!({"type":"system","subtype":"task_notification","task_id":"tool","status":"failed"})).unwrap();
+        assert!(c.completed);
+        assert_eq!(c.outcome.as_deref(), Some("error"));
     }
     #[test]
     fn peer_results_require_exact_lifecycle_completion_and_keep_pending_android_input() {

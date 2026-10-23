@@ -726,6 +726,45 @@ mod tests {
         )
     }
     #[tokio::test]
+    async fn shared_background_completion_survives_cursor_reload_without_ending_early() {
+        let (_dir, db, mut cursor, _native) = setup().await;
+        let input = uuid::Uuid::new_v4().to_string();
+        step(&db,&mut cursor,1,json!({"type":"user","uuid":input,"message":{"role":"user","content":"Run a background tool"}})).await;
+        step(&db,&mut cursor,2,json!({"type":"assistant","user_message_uuid":input,"message":{"id":"reply","content":[{"type":"text","text":"Starting"}]}})).await;
+        step(
+            &db,
+            &mut cursor,
+            3,
+            json!({"type":"system","subtype":"task_started","task_id":"tool","run_id":"2"}),
+        )
+        .await;
+        let held = step(
+            &db,
+            &mut cursor,
+            4,
+            json!({"type":"result","user_message_uuid":input,"is_error":false}),
+        )
+        .await;
+        assert_eq!(held["thread"]["latestTurn"]["state"], "running");
+        let identity = cursor.identity.clone();
+        cursor = db
+            .call(move |a| a.store.claude_remote_cursor("history-chat", identity))
+            .await
+            .unwrap()
+            .unwrap();
+        let old=step(&db,&mut cursor,5,json!({"type":"system","subtype":"task_notification","task_id":"tool","run_id":"1","status":"completed"})).await;
+        assert_eq!(old["thread"]["latestTurn"]["state"], "running");
+        let done=step(&db,&mut cursor,6,json!({"type":"system","subtype":"task_notification","task_id":"tool","run_id":"2","status":"completed"})).await;
+        assert_eq!(done["thread"]["latestTurn"]["state"], "completed");
+        assert!(control_state(&cursor.projection)
+            .unwrap()
+            .0
+            .active()
+            .is_none());
+        assert_eq!(held["thread"]["messages"], done["thread"]["messages"]);
+    }
+
+    #[tokio::test]
     async fn shared_tool_control_accepts_only_durable_original_worker_acknowledgements() {
         let (_dir, db, mut cursor, _) = setup().await;
         db.call(|a| {
