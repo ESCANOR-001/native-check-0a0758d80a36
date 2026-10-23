@@ -47,7 +47,7 @@ pub(crate) struct ClaudeSetup {
     cwd: PathBuf,
     files: Arc<tokio::sync::Semaphore>,
     probes: Arc<tokio::sync::Semaphore>,
-    account: Arc<Mutex<Option<(Instant, Value)>>>,
+    account: Arc<Mutex<Option<(Instant, PathBuf, Value)>>>,
 }
 impl ClaudeSetup {
     pub fn new(mut config: AgentConfig, cwd: PathBuf) -> Result<Self, String> {
@@ -80,14 +80,15 @@ impl ClaudeSetup {
         .await
         .map_err(|_| "Claude settings worker stopped")?
     }
-    pub async fn account(&self, refresh: bool) -> Value {
+    pub async fn account(&self, refresh: bool, executable: &Path) -> Value {
         let cached = || {
             self.account.lock().ok().and_then(|v| {
                 v.as_ref()
-                    .filter(|(at, _)| {
-                        at.elapsed() < Duration::from_secs(if refresh { 2 } else { 60 })
+                    .filter(|(at, path, _)| {
+                        path == executable
+                            && at.elapsed() < Duration::from_secs(if refresh { 2 } else { 60 })
                     })
-                    .map(|(_, v)| v.clone())
+                    .map(|(_, _, v)| v.clone())
             })
         };
         if let Some(value) = cached() {
@@ -99,7 +100,7 @@ impl ClaudeSetup {
         if let Some(value) = cached() {
             return value;
         }
-        let mut command = tokio::process::Command::new(&self.config.executable);
+        let mut command = tokio::process::Command::new(executable);
         command
             .args(["auth", "status", "--json"])
             .current_dir(&self.cwd)
@@ -122,7 +123,7 @@ impl ClaudeSetup {
             }
         };
         if let Ok(mut cache) = self.account.lock() {
-            *cache = Some((Instant::now(), value.clone()));
+            *cache = Some((Instant::now(), executable.into(), value.clone()));
         }
         value
     }

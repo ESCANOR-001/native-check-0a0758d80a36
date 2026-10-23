@@ -208,6 +208,13 @@ impl Chats {
     pub async fn start(db: AuthService, mut config: Config) -> Result<Self, String> {
         config.validate()?;
         let switches = setup::Settings::load(&db, config.claude.remote_control).await?;
+        let claude_default_binary = config.claude.executable.clone();
+        if let Some(binary) = &switches.binary {
+            if !binary.is_absolute() || binary.as_os_str().len() > 2048 {
+                return Err("Saved Claude executable path is invalid".into());
+            }
+            config.claude.executable = binary.clone();
+        }
         config.claude.remote_control = switches.desktop_sync;
         let setup =
             crate::agent_setup::ClaudeSetup::new(config.claude.clone(), config.workspace.clone())?;
@@ -344,6 +351,8 @@ impl Chats {
                 db,
                 config,
                 claude_enabled: switches.enabled,
+                claude_default_binary,
+                claude_binary_override: switches.binary,
                 chats,
                 projects,
                 models,
@@ -416,7 +425,8 @@ impl Chats {
         if state["enabled"] != true {
             return Ok(state);
         }
-        let account = self.setup.account(refresh).await;
+        let executable = PathBuf::from(s(&state["binary"]));
+        let account = self.setup.account(refresh, &executable).await;
         state["ready"] = json!(account["ready"] == true && state["catalogReady"] == true);
         state["account"] = account["account"].clone();
         if account["error"].is_string() {
@@ -517,6 +527,8 @@ struct Hub {
     db: AuthService,
     config: Config,
     claude_enabled: bool,
+    claude_default_binary: PathBuf,
+    claude_binary_override: Option<PathBuf>,
     chats: HashMap<String, Chat>,
     projects: Value,
     models: HashMap<String, Value>,
@@ -1044,7 +1056,7 @@ impl Hub {
                     if r.method=="native.configureClaude" {
                         // Wait for bounded metadata/jobs rather than racing a configuration
                         // change against a CLI launched with the previous setup.
-                        let result = if !discovery.is_empty() || !capability_jobs.is_empty() || !tool_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !worktree_jobs.is_empty() {
+                        let result = if !discovery.is_empty() || !capability_jobs.is_empty() || !tool_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !worktree_jobs.is_empty() || self.usage_task.is_some() {
                             Err("Wait for agent setup or pending background controls to finish".into())
                         } else {self.configure_claude(&r.params).await};
                         if result.is_ok() && self.claude_enabled && !self.models.contains_key(AgentKind::Claude.instance()) && !to_discover.contains(&AgentKind::Claude) {to_discover.push(AgentKind::Claude);}

@@ -86,7 +86,12 @@ fn main() {
             .append(true)
             .open(profile.join("setup-auth-probes.log"))
             .unwrap();
-        writeln!(log, "probe").unwrap();
+        writeln!(
+            log,
+            "{}",
+            serde_json::to_string(&std::env::current_exe().unwrap()).unwrap()
+        )
+        .unwrap();
         out(
             json!({"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"pro","email":"PRIVATE_FIXTURE_EMAIL","orgId":"PRIVATE_FIXTURE_ORG","configDirectory":"PRIVATE_FIXTURE_PATH"}),
         );
@@ -324,7 +329,7 @@ fn main() {
                 writeln!(
                     log,
                     "{}",
-                    json!({"bridge":bridge,"reattach":v["request"]["reattach_session_id"],"disabled":mcp_disabled})
+                    json!({"bridge":bridge,"reattach":v["request"]["reattach_session_id"],"disabled":mcp_disabled,"executable":std::env::current_exe().unwrap()})
                 )
                 .unwrap();
                 if v["request"]["reattach_session_id"].is_string()

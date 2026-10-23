@@ -139,6 +139,209 @@ async fn configure_switches(test: &Test, value: Value) -> Value {
     }
 }
 
+fn alternate_claude(test: &Test) -> PathBuf {
+    let folder = test.dir.path().join("CLI with spaces");
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join(format!("claude-fixture{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(&test.config.claude.executable, &path).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn claude_executable_changes_use_new_probe_reconnect_same_host_and_survive_restart() {
+    let mut test = Test::hosted().await;
+    let a = AgentKind::Claude;
+    let alternate = alternate_claude(&test);
+    test.create(a, "binary-host").await;
+    test.call(a, prompt("binary-host", "before-binary", "normal"))
+        .await
+        .unwrap();
+    let before = test.wait(a, "binary-host", "ready").await;
+    let initial = configure_switches(&test, json!({"enabled":true})).await;
+    assert_eq!(initial["binary"], json!(test.config.claude.executable));
+    let codex = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let v = test
+                .hub
+                .call(AgentKind::Codex, "phone", "server.getConfig", json!({}))
+                .await
+                .unwrap();
+            if v["providers"][0]["status"] == "ready" {
+                break v;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let changed = configure_switches(&test, json!({"binary":alternate})).await;
+    assert_eq!(changed["binary"], json!(alternate));
+    wait_links(&test, 2).await;
+    assert_eq!(
+        test.detail(a, "binary-host").await["messages"],
+        before["messages"]
+    );
+    let probes: Vec<PathBuf> =
+        std::fs::read_to_string(test.dir.path().join("setup-auth-probes.log"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+    assert_eq!(
+        probes.len(),
+        2,
+        "an executable change must invalidate cached sign-in status"
+    );
+    assert_eq!(
+        probes[1].canonicalize().unwrap(),
+        alternate.canonicalize().unwrap()
+    );
+    let now = test
+        .hub
+        .call(AgentKind::Codex, "phone", "server.getConfig", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        now["providers"][0]["models"],
+        codex["providers"][0]["models"]
+    );
+    test.call(a, prompt("binary-host", "after-binary", "normal"))
+        .await
+        .unwrap();
+    test.wait(a, "binary-host", "ready").await;
+    test.stop().await;
+    test.hub = Chats::start(test.db.clone(), test.config.clone())
+        .await
+        .unwrap();
+    wait_links(&test, 3).await;
+    let restored = test
+        .hub
+        .call(a, "phone", "claude.getSyncSettings", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(restored["binary"], json!(alternate));
+    let reset = configure_switches(&test, json!({"binary":""})).await;
+    assert_eq!(reset["binary"], json!(test.config.claude.executable));
+    wait_links(&test, 4).await;
+    let links: Vec<Value> =
+        std::fs::read_to_string(test.dir.path().join("host-remote-links.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+    for link in &links[1..] {
+        assert_eq!(link["reattach"], links[0]["bridge"]);
+    }
+    for link in &links[1..3] {
+        assert_eq!(
+            PathBuf::from(link["executable"].as_str().unwrap())
+                .canonicalize()
+                .unwrap(),
+            alternate.canonicalize().unwrap()
+        );
+    }
+    assert_eq!(links[3]["executable"], links[0]["executable"]);
+    assert_eq!(
+        std::fs::read_to_string(test.dir.path().join("host-prompts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    test.stop().await;
+}
+
+#[tokio::test]
+async fn claude_executable_same_path_does_not_reconnect_and_invalid_or_failed_writes_do_nothing() {
+    let test = Test::hosted().await;
+    let a = AgentKind::Claude;
+    test.create(a, "binary-safe").await;
+    test.call(a, prompt("binary-safe", "before", "normal"))
+        .await
+        .unwrap();
+    let before = test.wait(a, "binary-safe", "ready").await;
+    for path in [json!(test.config.claude.executable), json!("")] {
+        let status = configure_switches(&test, json!({"binary":path})).await;
+        assert_eq!(status["connectedSessions"], 1);
+    }
+    let alternate = alternate_claude(&test);
+    for value in [
+        json!("relative-claude"),
+        json!(test.dir.path().join("missing")),
+        json!(test.dir.path()),
+        json!(true),
+        json!("/bad\npath"),
+        json!("x".repeat(2049)),
+    ] {
+        assert!(test
+            .hub
+            .configure_claude(json!({"binary":value}))
+            .await
+            .is_err());
+    }
+    let db = rusqlite::Connection::open(test.dir.path().join("native-connect.sqlite")).unwrap();
+    let old: String = db
+        .query_row(
+            "SELECT value FROM metadata WHERE key='native.models'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    // Failure after the settings write exercises rollback of the entire transaction.
+    db.execute_batch("CREATE TRIGGER fail_catalog BEFORE INSERT ON metadata WHEN NEW.key='native.models' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+    let error = test
+        .hub
+        .configure_claude(json!({"binary":alternate}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("Cannot save Claude bridge settings"),
+        "{error}"
+    );
+    let saved: String = db
+        .query_row(
+            "SELECT value FROM metadata WHERE key='native.claudeSettings'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&saved).unwrap()["binary"],
+        Value::Null
+    );
+    let unchanged: String = db
+        .query_row(
+            "SELECT value FROM metadata WHERE key='native.models'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(old, unchanged);
+    let current = test
+        .hub
+        .call(a, "phone", "claude.getSyncSettings", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(current["binary"], json!(test.config.claude.executable));
+    assert_eq!(current["connectedSessions"], 1);
+    assert_eq!(
+        test.detail(a, "binary-safe").await["messages"],
+        before["messages"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(test.dir.path().join("host-remote-links.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    test.call(a, prompt("binary-safe", "after-rejection", "normal"))
+        .await
+        .unwrap();
+    test.wait(a, "binary-safe", "ready").await;
+    test.stop().await;
+}
+
 #[tokio::test]
 async fn claude_setup_switches_are_durable_preserve_history_and_leave_codex_running() {
     let mut test = Test::hosted().await;
@@ -254,6 +457,7 @@ async fn claude_setup_switches_are_durable_preserve_history_and_leave_codex_runn
 #[tokio::test]
 async fn claude_setup_refuses_busy_work_and_failed_persistence_without_disconnecting() {
     let test = Test::hosted().await;
+    let alternate = alternate_claude(&test);
     configure_switches(&test, json!({"enabled":true})).await;
     let a = AgentKind::Claude;
     test.create(a, "protected").await;
@@ -261,6 +465,11 @@ async fn claude_setup_refuses_busy_work_and_failed_persistence_without_disconnec
         .await
         .unwrap();
     test.wait(a, "protected", "running").await;
+    assert!(test
+        .hub
+        .configure_claude(json!({"binary":alternate}))
+        .await
+        .is_err());
     assert!(test
         .hub
         .configure_claude(json!({"enabled":false}))
