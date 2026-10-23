@@ -35,6 +35,8 @@ pub struct App {
     /// Present only after an inherited native supervisor pipe is verified.
     pub restart: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub tunnel: Option<crate::tunnel::Manager>,
+    pub local_url: Option<String>,
+    mobile_connection: Arc<std::sync::Mutex<crate::mobile_connection::State>>,
     pub(crate) network: crate::network_access::Access,
     pub(crate) metrics: crate::runtime_metrics::Metrics,
     pub(crate) online: Arc<std::sync::Mutex<HashMap<String, usize>>>,
@@ -76,6 +78,8 @@ impl App {
             diagnostics: None,
             restart: None,
             tunnel: None,
+            local_url: None,
+            mobile_connection: Arc::default(),
             metrics: Default::default(),
             online: Arc::default(),
             stopping: tokio::sync::watch::channel(false).0,
@@ -89,6 +93,17 @@ impl App {
     }
     pub fn router(self) -> Router {
         self.routes(true)
+    }
+    fn connection_state(&self) -> Value {
+        let local = if self.network.enabled() {
+            self.local_url.as_ref().cloned().into_iter().collect()
+        } else {
+            vec![]
+        };
+        self.mobile_connection
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot(local, self.tunnel.as_ref().map(|t| t.state()))
     }
     /// Dedicated tunnel origin: deliberately contains no browser bootstrap,
     /// dashboard administration or static assets, even for loopback clients.
@@ -517,6 +532,7 @@ async fn serve_socket(
     }
     let mut changes = app.chats.as_ref().map(Chats::subscribe);
     let mut subscription: Option<(Value, String, Value)> = None;
+    let mut connection_revision = None;
     loop {
         let incoming = tokio::select! {
             _=stopping.changed()=>{break;}
@@ -531,6 +547,16 @@ async fn serve_socket(
             }
             _=check.tick() => {
                 if !app.network.permits(peer) || !authorized(&app,&client).await {break;}
+                if let Some((id,method,_))=&subscription {
+                    if method=="subscribeServerConfig" {
+                        let connection=app.connection_state();
+                        let revision=connection["revision"].as_u64();
+                        if revision!=connection_revision {
+                            if !send(&mut socket,json!({"id":id,"event":{"version":1,"type":"remodexMobileConnectionUpdated","payload":{"connection":connection}}})).await {break;}
+                            connection_revision=revision;
+                        }
+                    }
+                }
                 if let (Some(chats),Some((_,method,params)))=(&app.chats,&subscription) {
                     if method=="orchestration.subscribeThread" {let _=chats.call(agent,&client,"native.watchShared",params.clone()).await;}
                 }
@@ -567,6 +593,10 @@ async fn serve_socket(
             subscription = Some((id.clone(), method.to_owned(), params.clone()));
         }
         let reply = native_reply(&app, agent, &client, id, method, params).await;
+        if method == "subscribeServerConfig" {
+            connection_revision =
+                reply["event"]["config"]["remodexMobileConnection"]["revision"].as_u64();
+        }
         if !send(&mut socket, reply).await {
             break;
         }
@@ -631,6 +661,7 @@ async fn native_reply(
             if method == "server.getConfig" || method == "subscribeServerConfig" {
                 value["environment"] = environment_descriptor(app);
                 value["auth"] = descriptor();
+                value["remodexMobileConnection"] = app.connection_state();
             }
             if method == "subscribeServerConfig" {
                 json!({"id":id,"event":{"version":1,"type":"snapshot","config":value}})

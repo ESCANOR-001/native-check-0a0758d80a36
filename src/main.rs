@@ -71,6 +71,7 @@ async fn serve(
         None
     };
     let mut app = App::new(auth, "Rust native foundation")?;
+    app.local_url = Some(args[3].clone());
     let diagnostics = remodex_connect_native::diagnostics::Log::new(&directory)?;
     app.diagnostics = Some(diagnostics.clone());
     let restart = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

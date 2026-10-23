@@ -425,6 +425,127 @@ async fn quick_tunnel_preferences_persist_but_unverified_urls_cannot_pair() {
 }
 
 #[tokio::test]
+async fn both_agents_receive_connection_changes_without_new_pairing_or_chat_activity() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
+    let (mut f, hub) = storage_fixture().await;
+    f.app.local_url = Some("http://127.0.0.1:18900".into());
+    let router = f.app.clone().router();
+    let (token, csrf) = session(router.clone()).await;
+    let headers = [
+        ("x-opencodex-api-key", token.as_str()),
+        ("x-opencodex-csrf-token", csrf.as_str()),
+        ("origin", "http://localhost:18900"),
+        ("x-opencodex-gui-origin", "http://localhost:18900"),
+    ];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let serve_router = router.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            serve_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+    let mut sockets = vec![];
+    for suffix in ["", "&agent=claude-code"] {
+        let (_, ticket) = call(
+            router.clone(),
+            "POST",
+            "/api/auth/websocket-ticket",
+            &[("authorization", &format!("Bearer {}", f.phone))],
+            json!({}),
+        )
+        .await;
+        let ticket: Value = serde_json::from_str(&ticket).unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{address}/ws?wsTicket={}{suffix}",
+            ticket["ticket"].as_str().unwrap()
+        ))
+        .await
+        .unwrap();
+        ws.send(Message::Text(
+            json!({"id":"config","method":"subscribeServerConfig"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let reply: Value =
+            serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        let connection = &reply["event"]["config"]["remodexMobileConnection"];
+        assert_eq!(connection["localUrls"], json!(["http://127.0.0.1:18900"]));
+        assert!(connection["desktopInstanceId"].is_string());
+        sockets.push((ws, connection.clone()));
+    }
+    async fn update(ws: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                let reply: Value =
+                    serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                if reply["event"]["type"] == "remodexMobileConnectionUpdated" {
+                    return reply["event"]["payload"]["connection"].clone();
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+    assert_eq!(
+        call(
+            router.clone(),
+            "PUT",
+            "/api/android-remote/settings",
+            &headers,
+            json!({"localNetworkEnabled":false})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    for (ws, previous) in &mut sockets {
+        let next = update(ws).await;
+        assert_eq!(next["localUrls"], json!([]));
+        assert_eq!(next["desktopInstanceId"], previous["desktopInstanceId"]);
+        assert!(next["revision"].as_u64() > previous["revision"].as_u64());
+        assert!(!next.to_string().contains(&f.phone));
+        *previous = next;
+    }
+    assert_eq!(
+        call(
+            router,
+            "PUT",
+            "/api/android-remote/settings",
+            &headers,
+            json!({"localNetworkEnabled":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    for (ws, previous) in &mut sockets {
+        let next = update(ws).await;
+        assert_eq!(next["localUrls"], json!(["http://127.0.0.1:18900"]));
+        assert!(next["revision"].as_u64() > previous["revision"].as_u64());
+        ws.close(None).await.unwrap();
+    }
+    f.app.stopping.send_replace(true);
+    server.abort();
+    let _ = server.await;
+    hub.call(
+        remodex_connect_native::chat::AgentKind::Codex,
+        "local",
+        "native.shutdown",
+        json!({}),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn restart_requires_supervisor_and_local_csrf_authority_and_stop_overrides_it() {
     use std::sync::{
         atomic::{AtomicBool, Ordering},
