@@ -224,3 +224,267 @@ fn corrupted_receipts_and_recreated_rows_block_rollback() {
     .unwrap();
     assert!(store.rollback_legacy_codex().is_err());
 }
+
+fn desktop_header(cwd: &std::path::Path) -> Value {
+    json!({"version":1,"futureExportData":{"retain":"raw"},"headers":[{
+        "alias":source(cwd)["threadAliases"][0],
+        "native":{"id":NATIVE,"cwd":cwd,"modelProvider":"openai","status":{"type":"idle"}},
+        "activeTurnId":null,"hasPendingApprovals":false,"hasPendingUserInput":false,
+        "hasActionableProposedPlan":false,"hasQueuedPrompts":false,
+        "archivedAt":TIME,"deletedAt":null,"branch":"retained-branch"
+    }]})
+}
+fn desktop_source(cwd: &std::path::Path) -> Value {
+    let mut v = source(cwd);
+    v["threadAliases"] = json!([]);
+    v
+}
+#[test]
+fn desktop_only_headers_keep_public_identity_settings_and_exact_exports() {
+    let cwd = tempfile::tempdir().unwrap();
+    let input = desktop_source(cwd.path());
+    let (dir, mut store, db, original) = setup(&input);
+    assert!(store.prepare_legacy_codex().is_err());
+    let headers = format!("  {}\n", desktop_header(cwd.path())).into_bytes();
+    let staged = store.prepare_legacy_codex_headers(&headers).unwrap();
+    assert_eq!(staged["chats"], 1);
+    assert_eq!(count(&db, "chats"), 0);
+    assert!(store.assert_migration_ready().is_err());
+    let report = store.prepare_legacy_codex().unwrap();
+    let saved = state(&db);
+    assert_eq!(saved["thread"]["id"], "original-android-id");
+    assert_eq!(saved["native_id"], NATIVE);
+    assert_eq!(saved["thread"]["projectId"], "original-project");
+    assert_eq!(saved["thread"]["branch"], "retained-branch");
+    assert_eq!(saved["thread"]["archivedAt"], TIME);
+    assert_eq!(saved["thread"]["deletedAt"], Value::Null);
+    assert_eq!(saved["thread"]["modelSelection"]["model"], "selected-model");
+    assert_eq!(
+        saved["thread"]["modelSelection"]["options"],
+        json!([{"id":"effort","value":"low"},{"id":"serviceTier","value":"fast"}])
+    );
+    assert_eq!(saved["paused"], true);
+    assert!(store.rollback_legacy_codex_headers().is_err());
+    assert!(store.rollback_legacy_connection().is_err());
+    drop(store);
+    let mut store = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        store.prepare_legacy_codex_headers(&headers).unwrap(),
+        staged
+    );
+    assert_eq!(store.prepare_legacy_codex().unwrap(), report);
+    assert_eq!(state(&db), saved);
+    store.rollback_legacy_codex().unwrap();
+    store.rollback_legacy_codex_headers().unwrap();
+    store.rollback_legacy_codex().unwrap();
+    store.rollback_legacy_codex_headers().unwrap();
+    assert!(store.prepare_legacy_codex_headers(&headers).is_err());
+    assert!(store.prepare_legacy_codex().is_err());
+    store.rollback_legacy_connection().unwrap();
+    store.rollback_legacy_connection().unwrap();
+    assert_eq!(
+        db.query_row("SELECT raw FROM legacy_connection_import", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        original
+    );
+    assert_eq!(
+        db.query_row("SELECT raw FROM legacy_codex_headers", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        headers
+    );
+}
+#[test]
+fn headers_refuse_live_ambiguous_foreign_or_incomplete_metadata_atomically() {
+    let cwd = tempfile::tempdir().unwrap();
+    for (path, value) in [
+        ("/headers/0/native/id", json!(SECOND)),
+        ("/headers/0/native/cwd", json!("other")),
+        ("/headers/0/native/modelProvider", json!("other-provider")),
+        ("/headers/0/native/status/type", json!("active")),
+        ("/headers/0/activeTurnId", json!("running")),
+        ("/headers/0/hasPendingApprovals", json!(true)),
+        ("/headers/0/hasPendingUserInput", json!(true)),
+        ("/headers/0/hasQueuedPrompts", json!(true)),
+        ("/headers/0/hasActionableProposedPlan", json!(true)),
+        ("/headers/0/alias/model", json!("")),
+        ("/headers/0/alias/runtimeMode", json!("guess")),
+        ("/headers/0/alias/remoteThreadId", json!("different")),
+        ("/headers/0/archivedAt", json!("unknown-date")),
+        ("/headers/0/branch", json!("bad\nbranch")),
+    ] {
+        let (_dir, mut store, db, _) = setup(&desktop_source(cwd.path()));
+        let mut header = desktop_header(cwd.path());
+        *header.pointer_mut(path).unwrap() = value;
+        assert!(
+            store
+                .prepare_legacy_codex_headers(header.to_string().as_bytes())
+                .is_err(),
+            "{path}"
+        );
+        assert!(store.prepare_legacy_codex().is_err());
+        store.init_chats().unwrap();
+        assert_eq!(count(&db, "chats"), 0);
+        if db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='legacy_codex_headers')",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap()
+        {
+            assert_eq!(count(&db, "legacy_codex_headers"), 0);
+        }
+    }
+    for key in [
+        "activeTurnId",
+        "hasQueuedPrompts",
+        "archivedAt",
+        "deletedAt",
+        "branch",
+    ] {
+        let (_dir, mut store, _, _) = setup(&desktop_source(cwd.path()));
+        let mut header = desktop_header(cwd.path());
+        header["headers"][0].as_object_mut().unwrap().remove(key);
+        assert!(
+            store
+                .prepare_legacy_codex_headers(header.to_string().as_bytes())
+                .is_err(),
+            "{key}"
+        );
+    }
+}
+#[test]
+fn headers_cannot_replace_existing_aliases_or_ignore_other_selections() {
+    let cwd = tempfile::tempdir().unwrap();
+    let header = desktop_header(cwd.path());
+    let (_dir, mut store, _, _) = setup(&source(cwd.path()));
+    assert!(store
+        .prepare_legacy_codex_headers(header.to_string().as_bytes())
+        .is_err());
+    let mut duplicate = header.clone();
+    duplicate["headers"]
+        .as_array_mut()
+        .unwrap()
+        .push(header["headers"][0].clone());
+    let (_dir, mut store, _, _) = setup(&desktop_source(cwd.path()));
+    assert!(store
+        .prepare_legacy_codex_headers(duplicate.to_string().as_bytes())
+        .is_err());
+    let mut input = desktop_source(cwd.path());
+    let mut selection = input["taskSelections"][0].clone();
+    selection["nativeThreadId"] = json!(SECOND);
+    selection["remoteThreadId"] = json!("second-public");
+    input["taskSelections"]
+        .as_array_mut()
+        .unwrap()
+        .push(selection);
+    let (_dir, mut store, db, _) = setup(&input);
+    assert!(store
+        .prepare_legacy_codex_headers(header.to_string().as_bytes())
+        .is_err());
+    assert_eq!(count(&db, "legacy_codex_headers"), 0);
+    assert_eq!(count(&db, "chats"), 0);
+}
+#[test]
+fn partial_header_write_retries_and_changed_receipts_cannot_import_or_rollback() {
+    let cwd = tempfile::tempdir().unwrap();
+    let headers = desktop_header(cwd.path()).to_string();
+    let (_dir, mut store, db, _) = setup(&desktop_source(cwd.path()));
+    // Create the empty schema through a combined-validation failure.
+    let mut bad = desktop_header(cwd.path());
+    bad["headers"][0]["alias"]["title"] = json!("");
+    assert!(store
+        .prepare_legacy_codex_headers(bad.to_string().as_bytes())
+        .is_err());
+    db.execute_batch("CREATE TRIGGER fail_headers BEFORE INSERT ON legacy_codex_headers BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(store
+        .prepare_legacy_codex_headers(headers.as_bytes())
+        .is_err());
+    assert_eq!(count(&db, "legacy_codex_headers"), 0);
+    db.execute_batch("DROP TRIGGER fail_headers").unwrap();
+    store
+        .prepare_legacy_codex_headers(headers.as_bytes())
+        .unwrap();
+    store.prepare_legacy_codex().unwrap();
+    let original: (String, String, Vec<u8>) = db
+        .query_row(
+            "SELECT source_hash,digest,raw FROM legacy_codex_headers",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    for sql in [
+        "UPDATE legacy_codex_headers SET digest='changed'",
+        "UPDATE legacy_codex_headers SET source_hash='changed'",
+        "UPDATE legacy_codex_headers SET raw=x'7b7d'",
+    ] {
+        db.execute_batch(sql).unwrap();
+        assert!(store.prepare_legacy_codex().is_err(), "{sql}");
+        assert!(store.rollback_legacy_codex().is_err());
+        assert!(store.rollback_legacy_codex_headers().is_err());
+        assert_eq!(count(&db, "chats"), 1);
+        db.execute(
+            "UPDATE legacy_codex_headers SET source_hash=?1,digest=?2,raw=?3",
+            rusqlite::params![original.0, original.1, original.2],
+        )
+        .unwrap();
+    }
+}
+#[test]
+fn all_desktop_headers_and_existing_aliases_can_be_staged_together_without_selections() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut input = source(cwd.path());
+    input["taskSelections"] = json!([]);
+    let (_dir, mut store, db, _) = setup(&input);
+    let mut header = desktop_header(cwd.path());
+    let row = &mut header["headers"][0];
+    row["alias"]["nativeThreadId"] = json!(SECOND);
+    row["native"]["id"] = json!(SECOND);
+    row["alias"]["remoteThreadId"] = json!(SECOND);
+    row["alias"]["projectId"] = json!("codex-project-chats");
+    row["alias"]["workspaceKind"] = json!("projectless");
+    row["native"]["status"]["type"] = json!("notLoaded");
+    row["deletedAt"] = json!(TIME);
+    store
+        .prepare_legacy_codex_headers(header.to_string().as_bytes())
+        .unwrap();
+    assert_eq!(store.prepare_legacy_codex().unwrap()["chats"], 2);
+    let data: String = db
+        .query_row("SELECT data FROM chats WHERE id=?1", [SECOND], |r| r.get(0))
+        .unwrap();
+    let saved: Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(saved["thread"]["workspaceKind"], "projectless");
+    assert_eq!(saved["thread"]["deletedAt"], TIME);
+    assert_eq!(saved["thread"]["modelSelection"]["model"], "old-model");
+    for table in ["chat_rows", "native_turns", "chat_commands"] {
+        assert_eq!(count(&db, table), 0);
+    }
+    assert!(store.assert_migration_ready().is_err());
+    store.rollback_legacy_codex().unwrap();
+    store.rollback_legacy_codex_headers().unwrap();
+    store.rollback_legacy_connection().unwrap();
+}
+#[test]
+fn staged_headers_can_roll_back_without_conversion_and_cannot_be_added_late() {
+    let cwd = tempfile::tempdir().unwrap();
+    let header = desktop_header(cwd.path()).to_string();
+    let (_dir, mut store, db, _) = setup(&desktop_source(cwd.path()));
+    store
+        .prepare_legacy_codex_headers(header.as_bytes())
+        .unwrap();
+    store.rollback_legacy_codex_headers().unwrap();
+    store.rollback_legacy_codex_headers().unwrap();
+    assert!(store.prepare_legacy_codex().is_err());
+    store.rollback_legacy_connection().unwrap();
+    assert_eq!(count(&db, "chats"), 0);
+    let mut input = desktop_source(cwd.path());
+    input["taskSelections"] = json!([]);
+    let (_dir, mut store, db, _) = setup(&input);
+    store.prepare_legacy_codex().unwrap();
+    assert!(store
+        .prepare_legacy_codex_headers(header.as_bytes())
+        .is_err());
+    assert_eq!(count(&db, "chats"), 0);
+}

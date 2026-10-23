@@ -121,7 +121,7 @@ struct Prepared {
     states: Vec<Value>,
 }
 impl Prepared {
-    fn read(db: &rusqlite::Connection) -> Result<Self, String> {
+    fn read(db: &rusqlite::Connection, rollback: bool) -> Result<Self, String> {
         let (digest, environment, raw, phase): (String, String, Vec<u8>, String) = db
             .query_row(
                 "SELECT digest,environment,raw,phase FROM legacy_connection_import WHERE id=1",
@@ -137,7 +137,9 @@ impl Prepared {
         }
         crate::legacy_connection::Prepared::parse(&raw, &environment)?;
         let root: Value = serde_json::from_slice(&raw).map_err(|_| INVALID)?;
-        let aliases = array(&root, "threadAliases", 1024)?;
+        let mut aliases = array(&root, "threadAliases", 1024)?.to_vec();
+        let (digest, extra) = crate::legacy_codex_headers::read(db, &digest, &root, rollback)?;
+        aliases.extend(extra);
         let selections = array(&root, "taskSelections", 4096)?;
         let mut selected = BTreeMap::new();
         let mut selected_public = BTreeSet::new();
@@ -165,7 +167,7 @@ impl Prepared {
         let mut ids = BTreeSet::new();
         let mut natives = BTreeSet::new();
         let mut states = Vec::new();
-        for alias in aliases {
+        for alias in &aliases {
             let id = text(&alias["remoteThreadId"], 128)?;
             let native = uuid(&alias["nativeThreadId"])?;
             let project = text(&alias["projectId"], 256)?;
@@ -208,6 +210,14 @@ impl Prepared {
                 "session":{"threadId":id,"providerName":"codex","providerInstanceId":"codex","status":"disconnected","statusConfidence":"unknown","runtimeMode":alias["runtimeMode"],"interactionMode":alias["interactionMode"],"activeTurnId":null,"lastError":null,"updatedAt":updated}});
             if project == "codex-project-chats" {
                 thread["workspaceKind"] = json!("projectless");
+            }
+            for key in ["archivedAt", "deletedAt"] {
+                if !alias[key].is_null() {
+                    thread[key] = json!(timestamp(&alias[key])?);
+                }
+            }
+            if !alias["branch"].is_null() {
+                thread["branch"] = json!(text(&alias["branch"], 1024)?);
             }
             let chat = Chat {
                 agent: AgentKind::Codex,
@@ -258,9 +268,40 @@ impl Prepared {
         Ok(())
     }
 }
+pub(crate) fn validate_headers(db: &rusqlite::Connection) -> Result<(), String> {
+    Prepared::read(db, false).map(|_| ())
+}
+pub(crate) fn headers_can_rollback(db: &rusqlite::Connection) -> Result<(), String> {
+    let p = Prepared::read(db, true)?;
+    if crate::legacy_codex_headers::table(db, "legacy_codex_import")? {
+        let record: Option<(String, String, String)> = db
+            .query_row(
+                "SELECT digest,data,phase FROM legacy_codex_import WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| CONFLICT)?;
+        if let Some((digest, data, phase)) = record {
+            let expected = serde_json::to_string(&p.states).map_err(|_| INVALID)?;
+            if phase != "rolled-back" || digest != p.digest || data != expected {
+                return Err(CONFLICT.into());
+            }
+        }
+    }
+    for state in &p.states {
+        let id = state["thread"]["id"].as_str().ok_or(INVALID)?;
+        let occupied:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM chats WHERE id=?1 OR json_extract(data,'$.native_id')=?2)",params![id,state["native_id"].as_str()],|r|r.get(0)).map_err(|_|CONFLICT)?;
+        if occupied {
+            return Err(CONFLICT.into());
+        }
+        no_effects(db, id)?;
+    }
+    Ok(())
+}
 impl Store {
     pub fn prepare_legacy_codex(&mut self) -> Result<Value, String> {
-        let p = Prepared::read(&self.db)?;
+        let p = Prepared::read(&self.db, false)?;
         let data = serde_json::to_string(&p.states).map_err(|_| INVALID)?;
         self.check_history(data.len() as u64 * 3 + 1024 * 1024)?;
         self.init_chats().map_err(|_| INVALID)?;
@@ -302,7 +343,7 @@ impl Store {
         Ok(p.report())
     }
     pub fn rollback_legacy_codex(&mut self) -> Result<Value, String> {
-        let p = Prepared::read(&self.db)?;
+        let p = Prepared::read(&self.db, true)?;
         let tx = self.db.transaction().map_err(|_| INVALID)?;
         let (digest, data, phase): (String, String, String) = tx
             .query_row(
