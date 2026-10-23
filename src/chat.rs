@@ -2201,7 +2201,7 @@ impl Hub {
         json!({"cwd":self.config.workspace,"keybindingsConfigPath":"","keybindings":[],"issues":[],"availableEditors":[],
         "providers":[{"instanceId":agent.instance(),"driver":agent.driver(),"displayName":title,"enabled":enabled,"installed":true,"status":if !enabled{"disabled"}else if error.is_some(){"error"}else if known{"ready"}else{"unknown"},"version":null,"auth":{"status":"unknown"},"checkedAt":now(),"availability":if enabled{"available"}else{"unavailable"},"showInteractionModeToggle":true,"message":error.map(String::as_str).unwrap_or(if known {"Model list loaded. Account access is checked when a request is sent."}else{"Checking the isolated CLI's available models..."}),"models":self.models.get(agent.instance()).cloned().unwrap_or_else(||crate::models::fallback(&p.model)),"skills":[],"plugins":[],"slashCommands":[]}],
         "settings":{"addProjectBaseDirectory":self.config.workspace,"providerInstances":{agent.instance():{"driver":agent.driver(),"displayName":title,"enabled":enabled}},"providers":{agent.driver():{"enabled":enabled}}},
-        "environment":{"capabilities":{"androidRemoteAtomicPromptEdit":true,"androidRemoteOptimisticPromptAcknowledgement":true}},
+        "environment":{"capabilities":{"androidRemoteAtomicPromptEdit":true,"androidRemoteOptimisticPromptAcknowledgement":true,"androidRemoteConversationOnlyRevert":agent == AgentKind::Codex}},
         "observability":{"logsDirectoryPath":"","localTracingEnabled":false,"otlpTracesEnabled":false,"otlpMetricsEnabled":false}})
     }
     fn shell(&self, agent: AgentKind) -> Value {
