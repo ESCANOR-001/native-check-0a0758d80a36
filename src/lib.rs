@@ -64,3 +64,7 @@ mod codex_assets;
 mod shared_history;
 
 pub mod supervisor;
+
+pub mod storage_stage;
+
+pub mod storage_rows;
