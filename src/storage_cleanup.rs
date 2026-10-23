@@ -70,7 +70,11 @@ fn lock(lease: &Lease) -> Result<Vec<Database<'_>>> {
     }
     Ok(out)
 }
-fn snapshot<'a>(mut databases: Vec<Database<'a>>, paths: &[String]) -> Result<Vec<Locked<'a>>> {
+fn snapshot<'a>(
+    mut databases: Vec<Database<'a>>,
+    paths: &[String],
+    protected: &[String],
+) -> Result<Vec<Locked<'a>>> {
     let ids = match databases
         .iter()
         .find(|db| db.binding().is_ok_and(|b| b.kind == Kind::State))
@@ -78,6 +82,13 @@ fn snapshot<'a>(mut databases: Vec<Database<'a>>, paths: &[String]) -> Result<Ve
         Some(db) => db.cleanup_ids(paths)?,
         None => vec![],
     };
+    if ids.iter().any(|id| protected.contains(id))
+        || (!protected.is_empty() && ids.len() != paths.len())
+    {
+        // Missing native metadata cannot establish that an archive is unrelated
+        // to the bridge's saved chats. Do not guess from filenames or drop it.
+        return Err("referenced_history");
+    }
     let mut out = Vec::new();
     let mut budget = 0;
     for mut db in databases.drain(..) {
@@ -140,7 +151,16 @@ pub fn cleanup(
     if !matches!(mode, "quarantine" | "permanent") {
         return Err("invalid_mode".into());
     }
-    cleanup_inner(home, percent, mode, digest, &|_| Ok(()))
+    cleanup_protected(home, percent, mode, digest, &[])
+}
+pub(crate) fn cleanup_protected(
+    home: &Path,
+    percent: f64,
+    mode: &str,
+    digest: &str,
+    protected: &[String],
+) -> std::result::Result<Value, Failure> {
+    cleanup_inner(home, percent, mode, digest, protected, &|_| Ok(()))
 }
 #[cfg(test)]
 fn quarantine_inner(
@@ -149,15 +169,19 @@ fn quarantine_inner(
     digest: &str,
     hook: &dyn Fn(Point) -> Result<()>,
 ) -> std::result::Result<Value, Failure> {
-    cleanup_inner(home, percent, "quarantine", digest, hook)
+    cleanup_inner(home, percent, "quarantine", digest, &[], hook)
 }
 fn cleanup_inner(
     home: &Path,
     percent: f64,
     mode: &str,
     digest: &str,
+    protected: &[String],
     hook: &dyn Fn(Point) -> Result<()>,
 ) -> std::result::Result<Value, Failure> {
+    if !matches!(mode, "quarantine" | "permanent") {
+        return Err("invalid_mode".into());
+    }
     if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("invalid_digest".into());
     }
@@ -182,7 +206,7 @@ fn cleanup_inner(
         .iter()
         .flat_map(|c| c.physical_rel_paths.clone())
         .collect();
-    let locked = snapshot(databases, &logical)?;
+    let locked = snapshot(databases, &logical, protected)?;
     let mut stage = lease.prepare(&files).map_err(fs_error)?;
     let id = stage.id().to_owned();
     let mut databases = Vec::new();
@@ -265,7 +289,7 @@ fn cleanup_inner(
 /// ordinary quarantine into a purge or implicitly repeats a cleanup selection.
 pub fn resume_purge(home: &Path, id: &str) -> std::result::Result<Value, Failure> {
     let lease = acquire(home)?;
-    let mut stage = lease.resume(id).map_err(|_| Failure::from("fs_failed"))?;
+    let mut stage = resume_stage(&lease, id)?;
     if !stage.purge_started() {
         return Err("purge_not_started".into());
     }
@@ -288,7 +312,7 @@ pub fn restore(home: &Path, id: &str) -> std::result::Result<Value, Failure> {
     })
 }
 fn restore_locked(lease: &Lease, id: &str, hook: &dyn Fn(Point) -> Result<()>) -> Result<Value> {
-    let mut stage = lease.resume(id).map_err(fs_error)?;
+    let mut stage = resume_stage(lease, id)?;
     if stage.purge_started() {
         return Err("purge_started");
     }
@@ -345,6 +369,32 @@ fn restore_locked(lease: &Lease, id: &str, hook: &dyn Fn(Point) -> Result<()>) -
     hook(Point::RowsRestored)?;
     stage.finish_restore().map_err(fs_error)?;
     Ok(response)
+}
+fn resume_stage<'a>(lease: &'a Lease, id: &str) -> Result<Stage<'a>> {
+    // Accept the older epoch-only spelling for diagnostics, without interpreting
+    // arbitrary input as a host path. Native journals use epoch-random IDs.
+    let name = id.strip_prefix(".trash/").ok_or("invalid_trash")?;
+    let parts: Vec<_> = name.split('-').collect();
+    if !(1..=2).contains(&parts.len())
+        || parts
+            .iter()
+            .any(|v| v.is_empty() || v.len() > 20 || !v.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err("invalid_trash");
+    }
+    crate::storage_stage::open(&lease.home().join(id), true).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "missing_trash"
+        } else {
+            "fs_failed"
+        }
+    })?;
+    match std::fs::symlink_metadata(lease.home().join(id).join("native-stage.json")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err("legacy_trash"),
+        Err(_) => return Err("fs_failed"),
+        Ok(_) => {}
+    }
+    lease.resume(id).map_err(fs_error)
 }
 fn validate_backup(stage: &Stage<'_>, backup: &Backup) -> Result<()> {
     if backup.version != 1
@@ -439,6 +489,41 @@ mod tests {
         ] {
             assert_eq!(count(home, db, table), n, "{db}:{table}");
         }
+    }
+    #[test]
+    fn connected_chat_references_refuse_cleanup_before_any_file_moves() {
+        let h = fixture();
+        let result = cleanup_protected(
+            h.path(),
+            100.0,
+            "permanent",
+            &digest(h.path()),
+            &["a".into()],
+        );
+        assert_eq!(result.unwrap_err().error, "referenced_history");
+        restored(h.path());
+        assert_eq!(
+            crate::storage_trash::list(h.path()).unwrap()["entries"],
+            json!([])
+        );
+        let db = Connection::open(h.path().join("state_1.sqlite")).unwrap();
+        db.execute("DELETE FROM threads WHERE id='a'", []).unwrap();
+        assert_eq!(
+            cleanup_protected(
+                h.path(),
+                100.0,
+                "permanent",
+                &digest(h.path()),
+                &["a".into()]
+            )
+            .unwrap_err()
+            .error,
+            "referenced_history"
+        );
+        assert_eq!(
+            fs::read(h.path().join("archived_sessions/a.jsonl")).unwrap(),
+            b"A\n"
+        );
     }
     #[test]
     fn quarantine_and_restore_keep_all_files_and_database_rows() {
@@ -730,7 +815,7 @@ mod tests {
     #[test]
     fn permanent_mode_failure_before_commit_restores_everything() {
         let h = fixture();
-        let error = cleanup_inner(h.path(), 100.0, "permanent", &digest(h.path()), &|p| {
+        let error = cleanup_inner(h.path(), 100.0, "permanent", &digest(h.path()), &[], &|p| {
             if p == Point::DatabaseCommitted(1) {
                 Err("injected_failure")
             } else {

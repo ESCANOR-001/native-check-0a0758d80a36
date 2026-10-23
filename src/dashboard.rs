@@ -1,5 +1,7 @@
 //! Opt-in local dashboard. Phone and dashboard credentials are separate.
 //! Uses the existing React bootstrap/header contract; never discovers a normal profile.
+#[path = "dashboard_storage.rs"]
+mod storage;
 use crate::{auth, server::App};
 use axum::{
     extract::{ConnectInfo, Path, Query, Request, State},
@@ -198,6 +200,12 @@ pub(crate) fn routes(app: App) -> Router<App> {
         .route("/api/storage", get(storage_report))
         .route("/api/storage/cleanup/preview", post(storage_preview))
         .route("/api/storage/trash", get(storage_trash))
+        .route("/api/storage/cleanup", post(storage::cleanup))
+        .route("/api/storage/trash/restore", post(storage::restore))
+        .route(
+            "/api/storage/trash/purge/resume",
+            post(storage::resume_purge),
+        )
         .route("/api/system/memory", get(memory))
         .route("/api/diagnostics/desktop-log", get(diagnostics))
         .route("/api/stop", post(stop))

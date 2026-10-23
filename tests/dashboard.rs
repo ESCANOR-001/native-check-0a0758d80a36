@@ -1354,3 +1354,295 @@ async fn stop_requires_local_csrf_rejects_stale_process_and_preserves_pairing() 
         .unwrap()
         .unwrap());
 }
+
+async fn storage_fixture() -> (Fixture, remodex_connect_native::chat::Chats) {
+    use remodex_connect_native::chat::{AgentConfig, Chats, Config};
+    let mut f = setup();
+    let agent = AgentConfig {
+        executable: env!("CARGO_BIN_EXE_chat-fixture").into(),
+        profile: f._root.path().into(),
+        model: "test".into(),
+        tools: Default::default(),
+        shared_server: None,
+        remote_control: false,
+    };
+    let config = Config {
+        storage: Default::default(),
+        max_active_chats: 1,
+        workspace: f._root.path().into(),
+        codex: agent.clone(),
+        claude: agent,
+    };
+    let hub = Chats::start(f.app.auth.clone(), config).await.unwrap();
+    f.app.chats = Some(hub.clone());
+    std::fs::create_dir(f._root.path().join("archived_sessions")).unwrap();
+    std::fs::write(
+        f._root.path().join("archived_sessions/retired.jsonl"),
+        b"archived fixture\n",
+    )
+    .unwrap();
+    let db = rusqlite::Connection::open(f._root.path().join("state_1.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,archived INTEGER);INSERT INTO threads VALUES('retired','archived_sessions/retired.jsonl',1);").unwrap();
+    (f, hub)
+}
+async fn storage_idle_call(
+    router: Router,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Value,
+) -> (StatusCode, Value) {
+    let started = std::time::Instant::now();
+    loop {
+        let (code, text) = call(router.clone(), "POST", path, headers, body.clone()).await;
+        let value: Value = serde_json::from_str(&text).unwrap();
+        if value["error"] != "codex_busy" || started.elapsed() > std::time::Duration::from_secs(5) {
+            return (code, value);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+#[tokio::test]
+async fn storage_mutations_require_local_authority_bind_preview_and_restore_exact_archive() {
+    use remodex_connect_native::chat::AgentKind;
+    let (f, hub) = storage_fixture().await;
+    let router = f.app.clone().router();
+    let (token, csrf) = session(router.clone()).await;
+    let good = [
+        ("x-opencodex-api-key", token.as_str()),
+        ("x-opencodex-gui-origin", "http://localhost:18900"),
+        ("origin", "http://localhost:18900"),
+        ("x-opencodex-csrf-token", csrf.as_str()),
+    ];
+    for path in [
+        "/api/storage/cleanup",
+        "/api/storage/trash/restore",
+        "/api/storage/trash/purge/resume",
+    ] {
+        for bad in [
+            vec![],
+            vec![("authorization", format!("Bearer {}", f.phone))],
+            vec![
+                ("x-opencodex-api-key", token.clone()),
+                ("x-opencodex-gui-origin", "http://localhost:18900".into()),
+            ],
+        ] {
+            let headers: Vec<_> = bad.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            assert_eq!(
+                call(router.clone(), "POST", path, &headers, json!({}))
+                    .await
+                    .0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            call(
+                router.clone(),
+                "POST",
+                path,
+                &good,
+                json!({"id":"../escape","extra":true})
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let (_, text) = call(
+        router.clone(),
+        "POST",
+        "/api/storage/cleanup/preview",
+        &good,
+        json!({"percent":100}),
+    )
+    .await;
+    let preview: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(preview["count"], 1);
+    let archived = f._root.path().join("archived_sessions/retired.jsonl");
+    let before = std::fs::read(&archived).unwrap();
+    let modified = std::fs::metadata(&archived).unwrap().modified().unwrap();
+    let request = json!({"percent":100,"mode":"quarantine","digest":preview["digest"]});
+    let (_, text) = call(router.clone(), "GET", "/api/storage", &good, Value::Null).await;
+    let report: Value = serde_json::from_str(&text).unwrap();
+    let count = |v: &Value| {
+        v["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["key"] == "archived_sessions")
+            .unwrap()["fileCount"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!(count(&report), 1);
+    let (code, result) = storage_idle_call(
+        router.clone(),
+        "/api/storage/cleanup",
+        &good,
+        request.clone(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{result}");
+    assert_eq!(result["count"], 1);
+    assert!(!archived.exists());
+    let id = result["trashDir"].as_str().unwrap();
+    let db = rusqlite::Connection::open(f._root.path().join("state_1.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM threads", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let (_, text) = call(router.clone(), "GET", "/api/storage", &good, Value::Null).await;
+    assert_eq!(
+        count(&serde_json::from_str(&text).unwrap()),
+        0,
+        "cache must invalidate immediately"
+    );
+    let (_, text) = call(
+        router.clone(),
+        "GET",
+        "/api/storage/trash",
+        &good,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap()["entries"][0]["id"],
+        id
+    );
+    let (code, result) =
+        storage_idle_call(router.clone(), "/api/storage/cleanup", &good, request).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{result}");
+    assert_eq!(result["error"], "stale_preview");
+    let (code, result) = storage_idle_call(
+        router.clone(),
+        "/api/storage/trash/purge/resume",
+        &good,
+        json!({"id":id}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT, "{result}");
+    assert_eq!(result["error"], "purge_not_started");
+    let (code, result) = storage_idle_call(
+        router.clone(),
+        "/api/storage/trash/restore",
+        &good,
+        json!({"id":id}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{result}");
+    assert_eq!(std::fs::read(&archived).unwrap(), before);
+    assert_eq!(
+        std::fs::metadata(&archived).unwrap().modified().unwrap(),
+        modified
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM threads", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert!(!f._root.path().join(id).exists());
+    let (code, result) = storage_idle_call(
+        router.clone(),
+        "/api/storage/trash/restore",
+        &good,
+        json!({"id":id}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{result}");
+    let (_, text) = call(
+        router.clone(),
+        "POST",
+        "/api/storage/cleanup/preview",
+        &good,
+        json!({"percent":100}),
+    )
+    .await;
+    let preview: Value = serde_json::from_str(&text).unwrap();
+    let (code, result) = storage_idle_call(
+        router.clone(),
+        "/api/storage/cleanup",
+        &good,
+        json!({"percent":100,"mode":"permanent","digest":preview["digest"]}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{result}");
+    assert!(!archived.exists());
+    assert!(result.get("trashDir").is_none());
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM threads", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    hub.call(AgentKind::Codex, "local", "native.shutdown", json!({}))
+        .await
+        .unwrap();
+}
+#[tokio::test]
+async fn storage_cleanup_refuses_active_and_queued_tasks_without_stopping_either_agent() {
+    use remodex_connect_native::chat::AgentKind;
+    for agent in [AgentKind::Codex, AgentKind::Claude] {
+        let (f, hub) = storage_fixture().await;
+        let router = f.app.clone().router();
+        let (token, csrf) = session(router.clone()).await;
+        let good = [
+            ("x-opencodex-api-key", token.as_str()),
+            ("x-opencodex-gui-origin", "http://localhost:18900"),
+            ("origin", "http://localhost:18900"),
+            ("x-opencodex-csrf-token", csrf.as_str()),
+        ];
+        hub.call(agent,"phone","orchestration.dispatchCommand",json!({"type":"thread.create","threadId":"busy-storage","projectId":"native-test-project","commandId":"create-storage"})).await.unwrap();
+        hub.call(agent,"phone","orchestration.dispatchCommand",json!({"type":"thread.turn.start","threadId":"busy-storage","commandId":"hold-storage","message":{"messageId":"hold-message","text":"hold","attachments":[]}})).await.unwrap();
+        let (_, text) = call(
+            router.clone(),
+            "POST",
+            "/api/storage/cleanup/preview",
+            &good,
+            json!({"percent":100}),
+        )
+        .await;
+        let preview: Value = serde_json::from_str(&text).unwrap();
+        let (code, text) = call(
+            router.clone(),
+            "POST",
+            "/api/storage/cleanup",
+            &good,
+            json!({"percent":100,"mode":"permanent","digest":preview["digest"]}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT, "{text}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap()["error"],
+            "codex_busy"
+        );
+        assert!(f
+            ._root
+            .path()
+            .join("archived_sessions/retired.jsonl")
+            .exists());
+        hub.call(agent,"phone","orchestration.dispatchCommand",json!({"type":"thread.turn.start","threadId":"busy-storage","commandId":"queue-storage","deliveryMode":"queue","message":{"messageId":"queued-storage","text":"queued after hold","attachments":[]}})).await.unwrap();
+        // Admission must reopen after refusal so the user's Stop still works.
+        hub.call(agent,"phone","orchestration.dispatchCommand",json!({"type":"thread.turn.interrupt","threadId":"busy-storage","commandId":"stop-storage"})).await.unwrap();
+        let (code, text) = call(
+            router.clone(),
+            "POST",
+            "/api/storage/cleanup",
+            &good,
+            json!({"percent":100,"mode":"permanent","digest":preview["digest"]}),
+        )
+        .await;
+        assert_eq!(
+            code,
+            StatusCode::CONFLICT,
+            "paused queued work must be retained: {text}"
+        );
+        assert!(f
+            ._root
+            .path()
+            .join("archived_sessions/retired.jsonl")
+            .exists());
+
+        hub.call(agent, "local", "native.shutdown", json!({}))
+            .await
+            .unwrap();
+    }
+}

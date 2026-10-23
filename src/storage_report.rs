@@ -418,6 +418,15 @@ mod tests {
         assert_eq!(row_count(&alias.join("state_2.sqlite"), "threads"), None);
     }
 }
+pub(crate) enum Mutation {
+    Cleanup {
+        percent: f64,
+        mode: String,
+        digest: String,
+    },
+    Restore(String),
+    ResumePurge(String),
+}
 #[derive(Clone)]
 pub(crate) struct Reader {
     home: PathBuf,
@@ -431,6 +440,56 @@ impl Reader {
             cache: Arc::default(),
             gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
+    }
+    pub async fn mutate(
+        &self,
+        action: Mutation,
+        reservation: crate::chat::RestartReservation,
+        protected: Vec<String>,
+    ) -> Result<Value, crate::storage_cleanup::Failure> {
+        self.blocking_mutation(reservation, move |home| match action {
+            Mutation::Cleanup {
+                percent,
+                mode,
+                digest,
+            } => {
+                crate::storage_cleanup::cleanup_protected(home, percent, &mode, &digest, &protected)
+            }
+            Mutation::Restore(id) => crate::storage_cleanup::restore(home, &id),
+            Mutation::ResumePurge(id) => crate::storage_cleanup::resume_purge(home, &id),
+        })
+        .await
+    }
+    async fn blocking_mutation<G, F>(
+        &self,
+        reservation: G,
+        action: F,
+    ) -> Result<Value, crate::storage_cleanup::Failure>
+    where
+        G: Send + 'static,
+        F: FnOnce(&std::path::Path) -> Result<Value, crate::storage_cleanup::Failure>
+            + Send
+            + 'static,
+    {
+        let permit = self
+            .gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| crate::storage_cleanup::Failure::from("storage_mutation_busy"))?;
+        let home = self.home.clone();
+        let cache = self.cache.clone();
+        tokio::task::spawn_blocking(move || {
+            // HTTP cancellation cannot release admission or allow a second scan
+            // while an irreversible filesystem/SQLite step is still running.
+            let _reservation = reservation;
+            let _permit = permit;
+            *cache
+                .lock()
+                .map_err(|_| crate::storage_cleanup::Failure::from("storage_unavailable"))? = None;
+            action(&home)
+        })
+        .await
+        .map_err(|_| crate::storage_cleanup::Failure::from("storage_worker_failed"))?
     }
     pub async fn read(&self) -> Result<Value, String> {
         let permit = self
@@ -482,5 +541,53 @@ impl Reader {
         })
         .await
         .map_err(|_| "Storage scanner stopped".to_owned())?
+    }
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Reservation(Arc<AtomicBool>);
+    impl Drop for Reservation {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_http_owner_cannot_release_storage_or_chat_admission_early() {
+        let root = tempfile::tempdir().unwrap();
+        let reader = Reader::new(root.path().into());
+        reader.read().await.unwrap();
+        assert!(reader.cache.lock().unwrap().is_some());
+        let reserved = Arc::new(AtomicBool::new(true));
+        let guard = Reservation(reserved.clone());
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let other = reader.clone();
+        let task = tokio::spawn(async move {
+            other
+                .blocking_mutation(guard, move |_| {
+                    let _ = started.send(());
+                    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Err("injected_failure".into())
+                })
+                .await
+        });
+        start.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        assert!(reserved.load(Ordering::Acquire));
+        assert!(reader.read().await.is_err());
+        assert!(reader.cache.lock().unwrap().is_none());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while reserved.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        reader.read().await.unwrap();
     }
 }

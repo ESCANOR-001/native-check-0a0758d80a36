@@ -24,7 +24,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -205,7 +205,7 @@ struct Request {
     reply: oneshot::Sender<Result<Value, String>>,
 }
 pub struct RestartReservation {
-    gate: Arc<AtomicBool>,
+    gate: Arc<AtomicU8>,
     committed: bool,
 }
 impl RestartReservation {
@@ -216,14 +216,14 @@ impl RestartReservation {
 impl Drop for RestartReservation {
     fn drop(&mut self) {
         if !self.committed {
-            self.gate.store(false, Ordering::Release);
+            self.gate.store(0, Ordering::Release);
         }
     }
 }
 
 #[derive(Clone)]
 pub struct Chats {
-    restart_gate: Arc<AtomicBool>,
+    restart_gate: Arc<AtomicU8>,
     send: mpsc::Sender<Request>,
     changes: watch::Receiver<u64>,
     setup: crate::agent_setup::ClaudeSetup,
@@ -374,7 +374,7 @@ impl Chats {
                 )
             })
             .collect();
-        let restart_gate = Arc::new(AtomicBool::new(false));
+        let restart_gate = Arc::new(AtomicU8::new(0));
         tokio::spawn(
             Hub {
                 db,
@@ -415,7 +415,7 @@ impl Chats {
     /// The guard also releases admission when a dashboard request is cancelled.
     pub async fn prepare_restart(&self) -> Result<RestartReservation, String> {
         self.restart_gate
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| "A bridge restart is already being prepared")?;
         let reservation = RestartReservation {
             gate: self.restart_gate.clone(),
@@ -429,6 +429,29 @@ impl Chats {
         )
         .await?;
         Ok(reservation)
+    }
+    /// Hold admission through the blocking storage transaction, even if its HTTP
+    /// caller goes away. Known chat histories are protected from archive cleanup.
+    pub(crate) async fn prepare_storage(
+        &self,
+    ) -> Result<(RestartReservation, Vec<String>), String> {
+        self.restart_gate
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "storage_mutation_busy")?;
+        let guard = RestartReservation {
+            gate: self.restart_gate.clone(),
+            committed: false,
+        };
+        let value = self
+            .send_request(
+                AgentKind::Codex,
+                "local",
+                "native.prepareStorage",
+                json!({}),
+            )
+            .await?;
+        let ids = serde_json::from_value(value).map_err(|_| "storage_mutation_busy")?;
+        Ok((guard, ids))
     }
     pub async fn call(
         &self,
@@ -1020,7 +1043,7 @@ impl Hub {
         self.dirty = true;
         Ok(())
     }
-    async fn run(mut self, mut receive: mpsc::Receiver<Request>, restart_gate: Arc<AtomicBool>) {
+    async fn run(mut self, mut receive: mpsc::Receiver<Request>, restart_gate: Arc<AtomicU8>) {
         let mut tick = tokio::time::interval(Duration::from_millis(120));
         let mut inspections = tokio::task::JoinSet::new();
         let mut clone_jobs = tokio::task::JoinSet::new();
@@ -1045,7 +1068,7 @@ impl Hub {
         let mut retention_due = Instant::now() + Duration::from_secs(30);
         let mut storage_checked = Instant::now();
         loop {
-            let restart_pending = restart_gate.load(Ordering::Acquire);
+            let restart_pending = restart_gate.load(Ordering::Acquire) != 0;
             self.shared_watches.retain(|id, (until, _)| {
                 *until > Instant::now()
                     || shared_sends.contains_key(id)
@@ -1118,13 +1141,18 @@ impl Hub {
                 request=receive.recv()=>{
                     let Some(r)=request else {break};
                     if r.method=="native.shutdown" {self.shutdown().await; let _=r.reply.send(Ok(json!({})));break;}
-                    if matches!(r.method.as_str(),"native.prepareRestart"|"native.restartStatus") {
-                        let busy=self.busy_count()>0 || !self.tool_controls.is_empty() || !clone_jobs.is_empty() || !worktree_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !tool_jobs.is_empty() || !shared_sends.is_empty() || self.chats.values().any(|c|!c.queue.is_empty() || matches!(s(&c.thread["session"]["status"]),"starting"|"running"|"stopping"));
-                        if r.method=="native.restartStatus" {let _=r.reply.send(Ok(json!({"ready":!busy && !restart_gate.load(Ordering::Acquire),"activeTurnCount":self.busy_count()})));continue;}
-                        let result=if !restart_gate.load(Ordering::Acquire) {Err("Restart reservation is no longer active".into())}else if busy {Err("Finish or stop active tasks and clear queued messages before restarting this bridge".into())}else {Ok(json!({"reserved":true}))};
+                    if r.method=="native.prepareStorage" {
+                        let busy=self.busy_count()>0 || !self.tool_controls.is_empty() || !clone_jobs.is_empty() || !worktree_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !tool_jobs.is_empty() || !shared_sends.is_empty() || !shared_jobs.is_empty() || !discovery.is_empty() || !capability_jobs.is_empty() || !inspections.is_empty() || self.usage_task.is_some() || self.chats.values().any(|c|!c.queue.is_empty() || matches!(s(&c.thread["session"]["status"]),"starting"|"running"|"stopping"));
+                        let result=if restart_gate.load(Ordering::Acquire)!=2 {Err("storage_mutation_busy".into())}else if busy {Err("codex_busy".into())}else {Ok(json!(self.chats.values().filter(|c|c.agent==AgentKind::Codex && !c.native_id.is_empty() && c.thread["deletedAt"].is_null()).map(|c|c.native_id.clone()).collect::<Vec<_>>()))};
                         let _=r.reply.send(result);continue;
                     }
-                    if restart_gate.load(Ordering::Acquire) {let _=r.reply.send(Err("Bridge is restarting; retry after it reconnects".into()));continue;}
+                    if matches!(r.method.as_str(),"native.prepareRestart"|"native.restartStatus") {
+                        let busy=self.busy_count()>0 || !self.tool_controls.is_empty() || !clone_jobs.is_empty() || !worktree_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !tool_jobs.is_empty() || !shared_sends.is_empty() || self.chats.values().any(|c|!c.queue.is_empty() || matches!(s(&c.thread["session"]["status"]),"starting"|"running"|"stopping"));
+                        if r.method=="native.restartStatus" {let _=r.reply.send(Ok(json!({"ready":!busy && restart_gate.load(Ordering::Acquire)==0,"activeTurnCount":self.busy_count()})));continue;}
+                        let result=if restart_gate.load(Ordering::Acquire)==0 {Err("Restart reservation is no longer active".into())}else if busy {Err("Finish or stop active tasks and clear queued messages before restarting this bridge".into())}else {Ok(json!({"reserved":true}))};
+                        let _=r.reply.send(result);continue;
+                    }
+                    if restart_gate.load(Ordering::Acquire)!=0 {let message=if restart_gate.load(Ordering::Acquire)==2 {"Storage maintenance is in progress; retry shortly"}else{"Bridge is restarting; retry after it reconnects"};let _=r.reply.send(Err(message.into()));continue;}
                     if r.method=="native.configureClaude" {
                         // Wait for bounded metadata/jobs rather than racing a configuration
                         // change against a CLI launched with the previous setup.
