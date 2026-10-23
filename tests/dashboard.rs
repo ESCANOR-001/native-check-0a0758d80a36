@@ -210,6 +210,63 @@ async fn agents_dashboard_uses_real_profile_status_and_isolated_preferences() {
         source
     );
     assert!(!body.contains("PRIVATE_THREAD"));
+    let preview_path = "/api/storage/cleanup/preview";
+    for headers in [
+        vec![],
+        vec![("authorization", format!("Bearer {}", f.phone))],
+        vec![("x-opencodex-api-key", token.clone())],
+    ] {
+        let headers: Vec<_> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_ne!(
+            call(
+                router.clone(),
+                "POST",
+                preview_path,
+                &headers,
+                json!({"percent":50})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    for body in [
+        json!({}),
+        json!({"percent":"50"}),
+        json!({"percent":-1}),
+        json!({"percent":101}),
+    ] {
+        assert_eq!(
+            call(router.clone(), "POST", preview_path, &good, body)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    std::fs::create_dir(f._root.path().join("archived_sessions")).unwrap();
+    let archived = f._root.path().join("archived_sessions/test.jsonl");
+    std::fs::write(&archived, "PRIVATE_ARCHIVED").unwrap();
+    let (code, body) = call(
+        router.clone(),
+        "POST",
+        preview_path,
+        &good,
+        json!({"percent":50}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let p: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(p["count"], 1);
+    assert_eq!(
+        p["candidates"][0]["relPath"],
+        "archived_sessions/test.jsonl"
+    );
+    assert!(!body.contains("PRIVATE_ARCHIVED"));
+    assert!(!body.contains(f._root.path().to_str().unwrap()));
+    assert_eq!(
+        std::fs::read_to_string(&archived).unwrap(),
+        "PRIVATE_ARCHIVED"
+    );
     assert_eq!(
         call(router.clone(), "POST", "/api/storage", &good, json!({}))
             .await

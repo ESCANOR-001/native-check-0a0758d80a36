@@ -48,9 +48,11 @@ mod worktrees;
 
 pub mod invitation_file;
 pub mod profile_lock;
+mod profile_snapshot;
 mod repository_clone;
 pub mod storage;
 mod storage_disk;
+mod storage_preview;
 mod storage_report;
 
 mod subprocess;

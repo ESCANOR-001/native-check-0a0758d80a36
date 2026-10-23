@@ -196,6 +196,7 @@ pub(crate) fn routes(app: App) -> Router<App> {
     Router::new()
         .route("/api/connect/activity", get(activity))
         .route("/api/storage", get(storage_report))
+        .route("/api/storage/cleanup/preview", post(storage_preview))
         .route("/api/android-remote", get(status))
         .route(
             "/api/android-remote/claude-code",
@@ -227,6 +228,30 @@ async fn storage_report(State(app): State<App>) -> Response {
         );
     };
     match chats.storage_report.read().await {
+        Ok(value) => response(StatusCode::OK, value),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    }
+}
+async fn storage_preview(
+    State(app): State<App>,
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    let Some(percent) = body["percent"]
+        .as_f64()
+        .filter(|n| n.is_finite() && (0.0..=100.0).contains(n))
+    else {
+        return error(StatusCode::BAD_REQUEST, "invalid_percent");
+    };
+    let Some(chats) = app.chats else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Select the isolated agent configuration first",
+        );
+    };
+    match chats.storage_report.preview(percent).await {
         Ok(value) => response(StatusCode::OK, value),
         Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e),
     }

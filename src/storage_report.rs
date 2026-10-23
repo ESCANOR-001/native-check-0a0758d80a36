@@ -441,4 +441,18 @@ impl Reader {
         .await
         .map_err(|_| "Storage scanner stopped".to_owned())?
     }
+    pub async fn preview(&self, percent: f64) -> Result<Value, String> {
+        let permit = self
+            .gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "Storage scan is busy; retry shortly")?;
+        let home = self.home.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            crate::storage_preview::preview(&home, percent).map_err(str::to_owned)
+        })
+        .await
+        .map_err(|_| "Storage scanner stopped".to_owned())?
+    }
 }
