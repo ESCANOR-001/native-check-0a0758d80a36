@@ -333,6 +333,15 @@ fn has_chats(db: &rusqlite::Connection) -> Result<bool, String> {
         return Err(CONFLICT.into());
     }
     for name in tables {
+        if name == "legacy_claude_import" {
+            let active: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM legacy_claude_import WHERE COALESCE(phase,'')<>'rolled-back')", [], |r|r.get(0)
+            ).map_err(|_|INVALID)?;
+            if active {
+                return Ok(true);
+            }
+            continue;
+        }
         if [
             "clients",
             "metadata",

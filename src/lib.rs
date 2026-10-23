@@ -22,6 +22,7 @@ pub mod claude_remote;
 pub mod claude_turns;
 pub mod dashboard;
 pub mod diagnostics;
+mod legacy_claude;
 pub mod legacy_connection;
 pub mod migration_snapshot;
 pub mod restart_drain;
