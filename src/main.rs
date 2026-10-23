@@ -61,6 +61,7 @@ async fn serve(
     let stopping = shutdown()?;
     let listener = tokio::net::TcpListener::bind(&args[2]).await?;
     let store = Store::open(&directory)?;
+    store.assert_migration_ready()?;
     let mut auth = Auth::new(store);
     let invite = if auth.control_enabled()?
         && auth.local_network_enabled()?

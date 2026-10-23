@@ -63,6 +63,7 @@ impl App {
         self.storage_policy.drain().await;
     }
     pub fn new(auth: Auth, label: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        auth.store.assert_migration_ready()?;
         let network = crate::network_access::Access::new(auth.local_network_enabled()?);
         let environment_id = auth.store.environment_id()?;
         let auth = AuthService::new(auth)?;

@@ -232,6 +232,7 @@ pub struct Chats {
 }
 impl Chats {
     pub async fn start(db: AuthService, mut config: Config) -> Result<Self, String> {
+        db.call(|a| a.store.assert_migration_ready()).await??;
         config.validate()?;
         let switches = setup::Settings::load(&db, config.claude.remote_control).await?;
         let claude_default_binary = config.claude.executable.clone();

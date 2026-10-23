@@ -20,6 +20,7 @@ pub mod claude_remote;
 pub mod claude_turns;
 pub mod dashboard;
 pub mod diagnostics;
+pub mod legacy_connection;
 pub mod server;
 pub mod store;
 
