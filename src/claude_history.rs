@@ -340,24 +340,14 @@ pub async fn project(
     if event.source == "worker" && event.sequence.is_some() {
         crate::native_control::apply(&mut chat, &value);
     }
-    if event.source == "worker"
-        && value["type"] == "user"
-        && chat.external_stop.as_ref().is_some_and(|s| s.acknowledged)
-        && value["message"]["content"].as_array().is_some_and(|a| {
-            a.len() == 1
-                && a[0]["type"] == "text"
-                && matches!(
-                    a[0]["text"].as_str(),
-                    Some(
-                        "[Request interrupted by user]"
-                            | "[Request interrupted by user for tool use]"
-                    )
-                )
-        })
-    {
-        // Native interruption notices are not newly submitted human prompts.
-        value["isSynthetic"] = json!(true);
-        value["shouldQuery"] = json!(false);
+    if event.source == "worker" {
+        // Shared history has the same untagged rejection notices as hosted
+        // output. Preserve the rejection checkpoint across reconnects so its
+        // following notice cannot become a new user prompt during catch-up.
+        reduced.router.filter_interruption_notice(
+            &mut value,
+            chat.external_stop.as_ref().is_some_and(|s| s.acknowledged),
+        );
     }
     if value["session_id"]
         .as_str()
@@ -1476,6 +1466,33 @@ mod tests {
         assert_eq!(cursor, reloaded);
     }
     #[tokio::test]
+    async fn observer_rejection_notice_survives_checkpoint_without_creating_a_prompt() {
+        let (_dir, db, mut cursor, native) = setup().await;
+        step(&db,&mut cursor,1,json!({"type":"user","session_id":native,"message":{"role":"user","content":[{"type":"tool_result","is_error":true,"tool_use_id":"rejected-tool","content":"The user doesn't want to proceed with this tool use. STOP."}]}})).await;
+        let identity = cursor.identity.clone();
+        cursor = db
+            .call(move |a| a.store.claude_remote_cursor("history-chat", identity))
+            .await
+            .unwrap()
+            .unwrap();
+        let notice = json!({"type":"user","session_id":native,"uuid":uuid::Uuid::new_v4().to_string(),"message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}});
+        let saved = step(&db, &mut cursor, 2, notice.clone()).await;
+        assert!(saved["thread"]["messages"].as_array().unwrap().is_empty());
+        assert_eq!(
+            control_state(&cursor.projection)
+                .unwrap()
+                .0
+                .pending()
+                .count(),
+            0
+        );
+        let mut human = notice;
+        human["uuid"] = json!(uuid::Uuid::new_v4().to_string());
+        human["origin"] = json!({"kind":"human"});
+        let saved = step(&db, &mut cursor, 3, human).await;
+        assert_eq!(saved["thread"]["messages"].as_array().unwrap().len(), 1);
+    }
+    #[tokio::test]
     async fn relink_replay_preserves_old_rows_and_accepts_new_remote_input_once() {
         let (dir, db, mut cursor, native) = setup().await;
         let input = uuid::Uuid::new_v4().to_string();
@@ -1502,6 +1519,15 @@ mod tests {
             let mut chat = a.store.load_chat("history-chat").unwrap();
             chat["external_claude"] = json!(true);
             chat["thread"]["worktreePath"] = json!(cwd);
+            for row in chat["thread"]["activities"].as_array_mut().unwrap() {
+                if row["kind"] == "approval.resolved" {
+                    // Real older phone approvals kept only the tool ID.
+                    row["payload"]["data"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("nativeRequestId");
+                }
+            }
             a.store.save_chat(&chat, None).unwrap();
         })
         .await

@@ -3680,6 +3680,10 @@ impl Hub {
         }
         chat.thread["hasPendingApprovals"] =
             json!(w.requests.values().any(|r| !crate::questions::is_input(r)));
+        let mut resolved = json!({"requestId":rid,"status":"completed","data":{"toolCallId":if chat.agent == AgentKind::Codex {&original["params"]["itemId"]}else{&original["request"]["tool_use_id"]}}});
+        if chat.agent == AgentKind::Claude {
+            resolved["data"]["nativeRequestId"] = original["request_id"].clone();
+        }
         projection::activity(
             chat,
             rid,
@@ -3692,7 +3696,7 @@ impl Hub {
                 "Declined"
             },
             "info",
-            json!({"requestId":rid,"status":"completed","data":{"toolCallId":if chat.agent == AgentKind::Codex {&original["params"]["itemId"]}else{&original["request"]["tool_use_id"]}}}),
+            resolved,
         );
         self.save(id, None).await
     }

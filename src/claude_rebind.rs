@@ -13,7 +13,9 @@ impl Store {
         turn: &str,
         tool: &Value,
     ) -> rusqlite::Result<Option<Value>> {
-        self.db.query_row("SELECT data FROM chat_rows WHERE chat=?1 AND kind='activities' AND seq<=?2 AND json_extract(data,'$.payload.data.nativeRequestId')=?3 AND turn=?4 AND json_extract(data,'$.payload.data.toolCallId') IS json_extract(?5,'$') AND json_extract(data,'$.kind') IN ('approval.resolved','user-input.resolved') ORDER BY seq DESC LIMIT 1",params![chat,before,native,turn,tool.to_string()],|r|r.get::<_,String>(0)).optional()?.map(|s|serde_json::from_str(&s).map_err(|_|rusqlite::Error::InvalidQuery)).transpose()
+        // Earlier resolved rows kept the tool ID but omitted the native request
+        // ID. Only an exact nonempty tool + turn match repairs that legacy case.
+        self.db.query_row("SELECT data FROM chat_rows WHERE chat=?1 AND kind='activities' AND seq<=?2 AND (json_extract(data,'$.payload.data.nativeRequestId')=?3 OR (json_extract(data,'$.payload.data.nativeRequestId') IS NULL AND json_type(?5,'$')='text' AND length(json_extract(?5,'$'))>0)) AND turn=?4 AND json_extract(data,'$.payload.data.toolCallId') IS json_extract(?5,'$') AND json_extract(data,'$.kind') IN ('approval.resolved','user-input.resolved') ORDER BY seq DESC LIMIT 1",params![chat,before,native,turn,tool.to_string()],|r|r.get::<_,String>(0)).optional()?.map(|s|serde_json::from_str(&s).map_err(|_|rusqlite::Error::InvalidQuery)).transpose()
     }
     pub(crate) fn claude_relink_rows(
         &self,
