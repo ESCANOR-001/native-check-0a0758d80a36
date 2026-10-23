@@ -282,6 +282,15 @@ pub async fn project(
                 crate::chat::finish(&mut chat, "interrupted", Some(OWNER_RESTARTED));
             }
         }
+        if let Some(ids) = event
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("internal_inputs"))
+        {
+            let ids: Vec<String> = serde_json::from_value(ids.clone())
+                .map_err(|_| "Invalid Claude internal input checkpoint")?;
+            reduced.router.retire_internal_inputs(&ids)?;
+        }
         reduced.owner_pid = pid.or(reduced.owner_pid);
         settle_deliveries(&mut reduced);
         return Ok((
@@ -735,6 +744,65 @@ mod tests {
             Cursor::new(identity).unwrap(),
             native,
         )
+    }
+    #[tokio::test]
+    async fn internal_task_checkpoint_repairs_legacy_pending_without_changing_history() {
+        let (_dir, db, mut cursor, _) = setup().await;
+        let old = uuid::Uuid::new_v4().to_string();
+        let human = uuid::Uuid::new_v4().to_string();
+        // Simulate an old cursor that classified a native notice as human input.
+        step(&db,&mut cursor,1,json!({"type":"user","uuid":old,"message":{"role":"user","content":"An already saved row"}})).await;
+        step(&db,&mut cursor,2,json!({"type":"user","uuid":human,"message":{"role":"user","content":"Real pending prompt"}})).await;
+        let before = db
+            .call(|a| a.store.load_chat("history-chat"))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut checkpoint = Envelope::owner(None);
+        checkpoint.payload.as_mut().unwrap()["internal_inputs"] = json!([old]);
+        apply_delivery(&db, &mut cursor, &checkpoint).await;
+        let identity = cursor.identity.clone();
+        cursor = db
+            .call(move |a| a.store.claude_remote_cursor("history-chat", identity))
+            .await
+            .unwrap()
+            .unwrap();
+        let router = control_state(&cursor.projection).unwrap().0;
+        assert_eq!(router.pending().count(), 1);
+        assert_eq!(router.pending().next().unwrap().native, human);
+        let next=step(&db,&mut cursor,3,json!({"type":"user","uuid":old,"origin":{"kind":"task-notification","producer":"session-task","runId":"run"},"message":{"role":"user","content":"<task-notification><task-id>t</task-id><status>completed</status></task-notification>"}})).await;
+        assert_eq!(before["thread"]["messages"], next["thread"]["messages"]);
+        assert_eq!(
+            control_state(&cursor.projection)
+                .unwrap()
+                .0
+                .pending()
+                .count(),
+            1
+        );
+        step(
+            &db,
+            &mut cursor,
+            4,
+            json!({"type":"assistant","user_message_uuid":human}),
+        )
+        .await;
+        let done = step(
+            &db,
+            &mut cursor,
+            5,
+            json!({"type":"result","user_message_uuid":human}),
+        )
+        .await;
+        assert_eq!(done["thread"]["latestTurn"]["state"], "completed");
+        assert_eq!(
+            control_state(&cursor.projection)
+                .unwrap()
+                .0
+                .pending()
+                .count(),
+            0
+        );
     }
     #[tokio::test]
     async fn shared_background_completion_survives_cursor_reload_without_ending_early() {

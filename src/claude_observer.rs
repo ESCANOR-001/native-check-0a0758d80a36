@@ -63,10 +63,16 @@ impl Observer {
         cursor: Cursor,
     ) -> Result<Self, String> {
         cursor.validate()?;
+        let pending = crate::claude_history::control_state(&cursor.projection)?
+            .0
+            .pending()
+            .filter(|i| !i.local)
+            .map(|i| i.native.clone())
+            .collect::<Vec<_>>();
         let read_profile = profile.clone();
         let read_workspace = workspace.clone();
         let link = tokio::task::spawn_blocking(move || {
-            crate::claude_link::read(&read_profile, &read_workspace, &native)
+            crate::claude_link::read_for_inputs(&read_profile, &read_workspace, &native, &pending)
         })
         .await
         .map_err(|_| "Native history reader stopped")??;
@@ -188,7 +194,10 @@ impl Observer {
                 // the session, the previous process's turn can never finish.
                 let previous = self.cursor.projection["owner_pid"].as_u64();
                 let replaced = matches!((previous, self.worker_pid), (Some(a), Some(b)) if a != b);
-                self.incoming = Some(Envelope::owner(self.worker_pid));
+                let mut checkpoint = Envelope::owner(self.worker_pid);
+                checkpoint.payload.as_mut().unwrap()["internal_inputs"] =
+                    json!(self.link.internal_inputs);
+                self.incoming = Some(checkpoint);
                 self.pending_receipt = Some(crate::claude_host::Receipt {
                     owner_replaced: replaced,
                     ..Default::default()
@@ -634,6 +643,7 @@ mod tests {
                 identity: identity.clone(),
                 cwd: dir.path().canonicalize().unwrap(),
                 title: "Test".into(),
+                internal_inputs: vec![],
             },
             Cursor::new(identity.clone()).unwrap(),
         )
@@ -760,6 +770,7 @@ mod tests {
                 // prefix. Keep the fixture faithful to that invariant.
                 cwd: dir.path().canonicalize().unwrap(),
                 title: "Test".into(),
+                internal_inputs: vec![],
             },
             cursor,
         )

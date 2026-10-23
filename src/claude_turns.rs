@@ -24,6 +24,40 @@ fn peer_text(frame: &Value) -> Option<&str> {
         .strip_suffix(PEER_SUFFIX)
 }
 
+/// A native background completion is a control input, not a pending human
+/// prompt. Require native origin metadata as well as its complete envelope so
+/// literal XML pasted by a human remains an ordinary message.
+pub(crate) fn internal_task_input(frame: &Value) -> bool {
+    if frame["type"] != "user"
+        || frame["message"]["role"] != "user"
+        || !frame["parent_tool_use_id"].is_null()
+        || frame["origin"]["kind"] != "task-notification"
+        || frame["origin"]["producer"] != "session-task"
+        || !frame["origin"]["runId"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty() && s.len() <= 256)
+    {
+        return false;
+    }
+    let content = &frame["message"]["content"];
+    let text = content.as_str().or_else(|| {
+        content
+            .as_array()
+            .filter(|a| a.len() == 1 && a[0]["type"] == "text")
+            .and_then(|a| a[0]["text"].as_str())
+    });
+    text.is_some_and(|text| {
+        let trim = text.trim();
+        trim.starts_with("<task-notification>")
+            && trim.ends_with("</task-notification>")
+            && trim.contains("<task-id>")
+            && trim.contains("</task-id>")
+            && ["completed", "failed", "stopped", "killed"]
+                .iter()
+                .any(|s| trim.contains(&format!("<status>{s}</status>")))
+    })
+}
+
 /// Display only actual root user input. Desktop's internal leading reminder
 /// blocks are not a prompt, and tool-result/user-role control frames are not
 /// new turns. Literal reminder tags inside the user's own text stay intact.
@@ -76,14 +110,7 @@ pub fn user_input(frame: &Value) -> Result<Option<(String, String)>, String> {
     {
         return Ok(None);
     }
-    if trim.starts_with("<task-notification>")
-        && trim.ends_with("</task-notification>")
-        && trim.contains("<task-id>")
-        && trim.contains("</task-id>")
-        && ["completed", "failed", "stopped", "killed"]
-            .iter()
-            .any(|s| trim.contains(&format!("<status>{s}</status>")))
-    {
+    if internal_task_input(frame) {
         return Ok(None);
     }
     if text.len() > 192 * 1024 {
@@ -108,7 +135,7 @@ fn reminder(text: &str) -> bool {
 /// also starts real work but must never expose its instruction wrapper in the
 /// Android transcript. Track its identity separately from displayable text.
 pub fn input_identity(frame: &Value) -> Result<Option<String>, String> {
-    if !frame["parent_tool_use_id"].is_null() {
+    if internal_task_input(frame) || !frame["parent_tool_use_id"].is_null() {
         return Ok(None);
     }
     let id = if frame["type"] == "command_lifecycle" && frame["state"] == "started" {
@@ -234,6 +261,25 @@ impl Router {
         } else if frame["type"] == "result" || frame["type"] == "assistant" {
             self.rejected_tool_notice = false;
         }
+    }
+    /// Repair only old, unconsumed remote entries proven by the matching local
+    /// native transcript. Never remove local outbox input or an active turn.
+    pub(crate) fn retire_internal_inputs(&mut self, ids: &[String]) -> Result<(), String> {
+        if ids.len() > 64
+            || ids
+                .iter()
+                .any(|id| id.len() != 36 || uuid::Uuid::parse_str(id).is_err())
+        {
+            return Err("Invalid Claude internal input checkpoint".into());
+        }
+        for id in ids {
+            if self.pending.get(id).is_some_and(|i| !i.local)
+                && !self.active.as_ref().is_some_and(|t| t.inputs.contains(id))
+            {
+                self.retire(id);
+            }
+        }
+        Ok(())
     }
     pub fn active(&self) -> Option<&Turn> {
         self.active.as_ref()
@@ -631,6 +677,32 @@ mod tests {
     const A: &str = "00000000-0000-4000-8000-000000000001";
     const B: &str = "00000000-0000-4000-8000-000000000002";
     const C: &str = "00000000-0000-4000-8000-000000000003";
+    #[test]
+    fn internal_task_completion_is_not_input_and_repair_never_retires_human_work() {
+        let text = "<task-notification>\n<task-id>task</task-id><status>completed</status>\n</task-notification>";
+        let mut v = json!({"type":"user","uuid":A,"origin":{"kind":"task-notification","producer":"session-task","runId":"run"},"message":{"role":"user","content":text}});
+        assert!(internal_task_input(&v));
+        assert!(user_input(&v).unwrap().is_none());
+        assert!(input_identity(&v).unwrap().is_none());
+        v["message"]["content"] = json!([{"type":"text","text":text}]);
+        assert!(internal_task_input(&v));
+        v["origin"]["kind"] = json!("human");
+        assert_eq!(user_input(&v).unwrap().unwrap().1, text);
+        assert_eq!(input_identity(&v).unwrap().as_deref(), Some(A));
+        v["origin"] = Value::Null;
+        assert!(input_identity(&v).unwrap().is_some());
+        let mut r = Router::default();
+        r.register(input(A, "old-internal", false)).unwrap();
+        r.register(input(B, "local", true)).unwrap();
+        r.register(input(C, "active", false)).unwrap();
+        r.observe(&consumed(&[C], false)).unwrap();
+        r.retire_internal_inputs(&[A.into(), B.into(), C.into()])
+            .unwrap();
+        assert_eq!(r.pending().count(), 2);
+        assert_eq!(r.active().unwrap().public_turn, "active");
+        assert!(!r.register(input(A, "old-internal", false)).unwrap());
+        assert!(r.retire_internal_inputs(&["invalid".into()]).is_err());
+    }
     #[test]
     fn native_rejection_notice_is_control_data_but_literal_human_text_is_preserved() {
         let mut router = Router::default();
