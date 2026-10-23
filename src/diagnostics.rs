@@ -99,7 +99,10 @@ fn append(path: &Path, event: &Event, limit: u64) -> io::Result<()> {
         return Err(io::ErrorKind::InvalidData.into());
     }
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    // One bounded writer owns this log. Windows append-only handles cannot
+    // truncate at rotation, so obtain write access without truncating on open.
+    // Validate the opened handle first, then choose the write position below.
+    options.create(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -121,6 +124,7 @@ fn append(path: &Path, event: &Event, limit: u64) -> io::Result<()> {
     bytes.push(b'\n');
     if file.metadata()?.len().saturating_add(bytes.len() as u64) > limit {
         file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
         let mut rotation = serde_json::to_vec(&Event {
             version: 1,
             at_ms: event.at_ms,
@@ -130,6 +134,8 @@ fn append(path: &Path, event: &Event, limit: u64) -> io::Result<()> {
         })?;
         rotation.push(b'\n');
         file.write_all(&rotation)?;
+    } else {
+        file.seek(SeekFrom::End(0))?;
     }
     file.write_all(&bytes)?;
     file.flush()
