@@ -413,6 +413,28 @@ async fn attempt(
             }
         }
     };
+    // Keep the old authenticated transport briefly during an explicit retry.
+    // Its URL is already hidden by the generation check, while config sockets
+    // can deliver the new local fallback addresses before this transport ends.
+    // Disable, shutdown and unexpected helper exit never wait for this grace.
+    if result.is_ok()
+        && !*stopping.borrow()
+        && desired.borrow().enabled
+        && desired.borrow().generation != generation
+    {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if *stopping.borrow() || !desired.borrow().enabled {
+                break;
+            }
+            tokio::select! {
+                _=tokio::time::sleep_until(deadline)=>break,
+                _=stopping.changed()=>break,
+                _=desired.changed()=>{},
+                _=child.wait()=>break,
+            }
+        }
+    }
     drop(tree);
     let _ = child.kill().await;
     let _ = child.wait().await;
@@ -606,10 +628,21 @@ mod tests {
         assert_ne!(manager.state().status, "ready");
         assert!(manager.state().public_url.is_none());
         manager.retry();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            unsafe { libc::kill(first, 0) },
+            0,
+            "retry must leave time to deliver fallback routes"
+        );
+        assert!(manager.state().public_url.is_none());
         starts(dir.path(), 2).await;
         gone(first).await;
+        manager.retry();
+        tokio::time::sleep(Duration::from_millis(100)).await;
         manager.configure(false);
-        manager.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(2), manager.shutdown())
+            .await
+            .unwrap();
         let manager = Manager::new(config, true).unwrap();
         let pids = starts(dir.path(), 3).await;
         drop(manager);
