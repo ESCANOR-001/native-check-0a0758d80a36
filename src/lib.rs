@@ -45,6 +45,7 @@ mod private_directory;
 mod process_tree;
 mod questions;
 mod retention;
+mod revert;
 mod usage;
 mod vcs;
 mod worktrees;

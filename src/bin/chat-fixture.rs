@@ -117,9 +117,65 @@ fn main() {
                 "model/list" => out(
                     json!({"id":v["id"],"result":{"data":[{"model":"test","displayName":"Test model","supportedReasoningEfforts":[{"reasoningEffort":"high"},{"reasoningEffort":"low"}]}]}}),
                 ),
-                "thread/start" | "thread/resume" => out(
-                    json!({"id":v["id"],"result":{"thread":{"id":v["params"]["threadId"].as_str().filter(|s|!s.is_empty()).unwrap_or("native-fixture-thread")}}}),
+                "thread/start" | "thread/resume" | "thread/read" => out(
+                    json!({"id":v["id"],"result":{"thread":{"id":v["params"]["threadId"].as_str().filter(|s|!s.is_empty()).unwrap_or("native-fixture-thread"),"status":{"type":if std::path::Path::new("revert-fixture-native-busy").exists(){"active"}else{"idle"}}}}}),
                 ),
+                "thread/turns/list" => {
+                    let rows: Value = std::fs::read("revert-fixture-turns.json")
+                        .ok()
+                        .and_then(|b| serde_json::from_slice(&b).ok())
+                        .unwrap_or(json!([]));
+                    let mut rows = rows.as_array().unwrap().clone();
+                    if v["params"]["sortDirection"] == "desc" {
+                        rows.reverse();
+                    }
+                    let offset = v["params"]["cursor"]
+                        .as_str()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let limit = v["params"]["limit"].as_u64().unwrap_or(50) as usize;
+                    let end = offset.saturating_add(limit).min(rows.len());
+                    let page = &rows[offset.min(end)..end];
+                    let next = (end < rows.len()).then(|| end.to_string());
+                    out(json!({"id":v["id"],"result":{"data":page,"nextCursor":next}}));
+                }
+                "thread/revert" => {
+                    let mut log = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("revert-fixture-calls.jsonl")
+                        .unwrap();
+                    writeln!(log, "{}", v["params"]).unwrap();
+                    if std::path::Path::new("reject-fixture-revert").exists() {
+                        out(
+                            json!({"id":v["id"],"error":{"code":-32601,"message":"Unsupported fixture operation"}}),
+                        );
+                        continue;
+                    }
+                    if std::path::Path::new("revert-fixture-lose-before").exists() {
+                        return;
+                    }
+                    let mut rows: Vec<Value> = serde_json::from_slice(
+                        &std::fs::read("revert-fixture-turns.json").unwrap(),
+                    )
+                    .unwrap();
+                    let point = rows
+                        .iter()
+                        .position(|r| r["id"] == v["params"]["beforeTurnId"])
+                        .unwrap();
+                    rows.truncate(point);
+                    std::fs::write(
+                        "revert-fixture-turns.json",
+                        serde_json::to_vec(&rows).unwrap(),
+                    )
+                    .unwrap();
+                    if std::path::Path::new("revert-fixture-lose-after").exists() {
+                        return;
+                    }
+                    out(
+                        json!({"id":v["id"],"result":{"thread":{"id":v["params"]["threadId"],"status":{"type":"idle"}}}}),
+                    );
+                }
                 "thread/fork" => {
                     assert_eq!(v["params"]["excludeTurns"], true);
                     assert_eq!(v["params"]["deferGoalContinuation"], true);

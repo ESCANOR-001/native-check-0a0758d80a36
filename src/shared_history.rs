@@ -14,6 +14,8 @@ const PROJECTION_VERSION: u8 = 6;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Cursor {
     #[serde(default)]
+    generation: u64,
+    #[serde(default)]
     projection_version: u8,
     turns: Option<String>,
     turn: String,
@@ -24,6 +26,7 @@ pub(crate) struct Cursor {
 impl Default for Cursor {
     fn default() -> Self {
         Self {
+            generation: 0,
             projection_version: PROJECTION_VERSION,
             turns: None,
             turn: String::new(),
@@ -31,6 +34,24 @@ impl Default for Cursor {
             complete: false,
             final_pass: false,
         }
+    }
+}
+impl Cursor {
+    pub(crate) fn invalidated(previous: Option<&str>) -> Result<String, String> {
+        let previous: Self = previous
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|_| "Saved history cursor is invalid")?
+            .unwrap_or_default();
+        let generation = previous
+            .generation
+            .checked_add(1)
+            .ok_or("History generation exhausted")?;
+        serde_json::to_string(&Self {
+            generation,
+            ..Self::default()
+        })
+        .map_err(|_| "Cannot reset history cursor".into())
     }
 }
 pub(crate) struct Batch {
@@ -158,7 +179,7 @@ pub(crate) async fn read(
         // was lost. Exact native client IDs can recover those receipts.
         // v2 did not capture image results during history catch-up.
         // v3 omitted MCP images carried inside native JSON text envelopes.
-        let after=if before.projection_version<PROJECTION_VERSION {Cursor::default()}else{before.clone()};
+        let after=if before.projection_version<PROJECTION_VERSION {Cursor{generation:before.generation,..Default::default()}}else{before.clone()};
         let mut batch=Batch{native:native.clone(),before,after,turn:None,public_turn:None,items:vec![],recovered_images:Default::default(),final_page:false,caught_up:false,busy,missing_empty_session:false};
         // Skip a bounded number of turns already reconciled by this projection.
         for _ in 0..8 {
@@ -178,7 +199,7 @@ pub(crate) async fn read(
             if batch.after.turn==tid && batch.after.complete && completed {
                 if !completed || next.is_none() {batch.caught_up=true;return Ok(batch);}
                 if next==batch.after.turns {return Err("Shared history cursor did not advance".into());}
-                batch.after=Cursor{turns:next,..Default::default()};
+                batch.after=Cursor{generation:batch.after.generation,turns:next,..Default::default()};
                 continue;
             }
             let cid=chat.clone();let turn_id=tid.clone();
@@ -245,7 +266,7 @@ pub(crate) async fn read(
                 batch.after.complete=true;
                 if next.is_some() {
                     if next==batch.after.turns {return Err("Shared history cursor did not advance".into());}
-                    batch.after=Cursor{turns:next,..Default::default()};
+                    batch.after=Cursor{generation:batch.after.generation,turns:next,..Default::default()};
                 } else {batch.caught_up=true;}
             } else {
                 // Keep the input cursor of the last page so streaming updates
@@ -258,4 +279,57 @@ pub(crate) async fn read(
     }).await.unwrap_or_else(|_|Err("Shared history check timed out; existing history is intact".into()));
     connection.close().await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn invalidated_cursor_rejects_an_old_page_without_restoring_removed_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::store::Store::open(dir.path()).unwrap();
+        store.init_chats().unwrap();
+        let before = Cursor::default();
+        let next = Cursor::invalidated(None).unwrap();
+        let latest = Cursor::invalidated(Some(&next)).unwrap();
+        assert_ne!(before, serde_json::from_str::<Cursor>(&next).unwrap());
+        assert_ne!(next, latest);
+        store
+            .db
+            .execute(
+                "INSERT INTO native_sync VALUES('chat','native',?1)",
+                [&next],
+            )
+            .unwrap();
+        let batch = Batch {
+            native: "native".into(),
+            before: before.clone(),
+            after: before,
+            turn: None,
+            public_turn: None,
+            items: vec![],
+            recovered_images: Default::default(),
+            final_page: true,
+            caught_up: true,
+            busy: false,
+            missing_empty_session: false,
+        };
+        let state = json!({"agent":"codex","native_id":"native","thread":{"id":"chat","messages":[{"id":"removed","turnId":"removed-turn","text":"must not return"}],"activities":[],"proposedPlans":[]}});
+        assert!(store.save_shared_history(&state, &batch).is_err());
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT count(*) FROM chat_rows", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT cursor FROM native_sync", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            next
+        );
+    }
 }
