@@ -1135,6 +1135,87 @@ async fn owned_claude_link_replacement_is_pinned_durable_and_never_replays_a_pro
 }
 
 #[tokio::test]
+async fn large_replacement_history_keeps_reads_and_stop_responsive_without_prompt_replay() {
+    use std::io::Write;
+    let mut test = Test::hosted().await;
+    let a = AgentKind::Claude;
+    test.create(a, "large-recovery").await;
+    test.call(a, prompt("large-recovery", "ORIGINAL_ONLY", "normal"))
+        .await
+        .unwrap();
+    let before = test.wait(a, "large-recovery", "ready").await;
+    test.stop().await;
+    let original = test
+        .db
+        .call(|a| a.store.load_chat("large-recovery"))
+        .await
+        .unwrap()
+        .unwrap();
+    let native = original["native_id"].as_str().unwrap().to_owned();
+    let target = uuid::Uuid::new_v4().to_string();
+    let folder = test.dir.path().join("projects/large");
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut file = std::io::BufWriter::new(
+        std::fs::File::create(folder.join(format!("{native}.jsonl"))).unwrap(),
+    );
+    let text = "bounded-history ".repeat(4096); //64MiB total, one small row retained at a time.
+    let mut point = Value::Null;
+    for _ in 0..1024 {
+        let next = uuid::Uuid::new_v4().to_string();
+        writeln!(file, "{}", json!({"type":"assistant","uuid":next,"parentUuid":point,"sessionId":native,"message":{"content":text}})).unwrap();
+        point = json!(next);
+    }
+    file.flush().unwrap();
+    drop(file);
+    let mut saved = original.clone();
+    saved["native_id"] = json!(target);
+    saved["remote_identity"] = Value::Null;
+    saved["resumed"] = json!(false);
+    saved["fork_from"] = json!({"session":native,"point":point});
+    saved["sync_replacement"] = saved["fork_from"].clone();
+    saved["paused"] = json!(true);
+    test.db
+        .call(move |a| a.store.save_chat(&saved, None))
+        .await
+        .unwrap()
+        .unwrap();
+    test.hub = Chats::start(test.db.clone(), test.config.clone())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let status = test.hub.call(a,"phone","native.claudeSyncStatus",json!({"threadId":"large-recovery"})).await.unwrap();
+            if status["status"] == "connecting" { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(test.detail(a,"large-recovery").await["messages"],before["messages"]);
+        assert!(test.hub.prepare_restart().await.is_err());
+        test.call(a,json!({"type":"thread.session.stop","commandId":"cancel-history-check","threadId":"large-recovery"})).await.unwrap();
+    }).await.expect("History preparation blocked chat reads or Stop");
+    assert_eq!(
+        test.detail(a, "large-recovery").await["messages"],
+        before["messages"]
+    );
+    // Shutdown waits for the cancelled copy to release its profile lease.
+    test.stop().await;
+    assert_eq!(
+        std::fs::read_to_string(test.dir.path().join("host-prompts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(test.dir.path().join("host-remote-links.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(folder.join(format!("{target}.jsonl")).exists());
+}
+
+#[tokio::test]
 async fn hosted_claude_recovers_process_loss_without_replaying_or_reopening() {
     let test = Test::hosted().await;
     let a = AgentKind::Claude;

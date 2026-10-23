@@ -333,6 +333,7 @@ pub(crate) fn materialize(profile: &Path, target: &str, fork: &Fork) -> Result<(
         .map_err(|_| "Cannot stage Claude recovery history")?;
     let mut out_hash = Sha256::new();
     let mut count = 0usize;
+    let mut written = 0u64;
     let check_hash = scan(&source, |_, mut v| {
         if is_message(&v) && v["type"] != "progress" {
             v = transform(v, target, fork, &links)?;
@@ -352,6 +353,15 @@ pub(crate) fn materialize(profile: &Path, target: &str, fork: &Fork) -> Result<(
         }
         let mut bytes = serde_json::to_vec(&v).map_err(|_| "Cannot encode recovery history")?;
         bytes.push(b'\n');
+        written += bytes.len() as u64;
+        // Reference/provenance fields make the destination slightly larger.
+        // Refuse before installation rather than leaving an unreadable target.
+        if bytes.len() as u64 > MAX_ROW || written > MAX_FILE - 4096 {
+            return Err(
+                "The copied history exceeds the safe recovery budget; the original is intact"
+                    .into(),
+            );
+        }
         out.write_all(&bytes)
             .map_err(|_| "Cannot save recovery history")?;
         out_hash.update(&bytes);
@@ -467,6 +477,21 @@ mod tests {
         std::fs::write(&path, &corrupted).unwrap();
         assert!(ready(dir.path(), &target, &fork).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupted);
+    }
+    #[test]
+    fn provenance_growth_cannot_install_a_transcript_larger_than_the_reader_budget() {
+        let (dir, fork, target, source) = fixture();
+        let mut row = json!({"type":"assistant","uuid":fork.point,"sessionId":fork.session,"parentUuid":null,"message":{"content":""}});
+        let overhead = row.to_string().len() + 1;
+        row["message"]["content"] = json!("x".repeat(MAX_ROW as usize - overhead - 1));
+        let bytes = format!("{row}\n");
+        assert_eq!(bytes.len() as u64, MAX_ROW - 1);
+        std::fs::write(&source, &bytes).unwrap();
+        assert!(materialize(dir.path(), &target, &fork)
+            .unwrap_err()
+            .contains("budget"));
+        assert!(!source.with_file_name(format!("{target}.jsonl")).exists());
+        assert_eq!(std::fs::read_to_string(source).unwrap(), bytes);
     }
     #[test]
     fn source_advance_cycles_and_partial_rows_cannot_start_empty_replacements() {

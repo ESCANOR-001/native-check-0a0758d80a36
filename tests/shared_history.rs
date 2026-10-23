@@ -92,7 +92,12 @@ impl Fixture {
         let event=json!({"method":if t["status"]=="inProgress"{"item/started"}else{"item/completed"},"params":{"threadId":"shared-native","turnId":t["id"],"item":row["item"]}});
         if ws.send(Message::Text(event.to_string().into())).await.is_err(){return;}
        }
-       if t["status"]!="inProgress" {let event=json!({"method":"turn/completed","params":{"threadId":"shared-native","turn":t}});if ws.send(Message::Text(event.to_string().into())).await.is_err(){return;}}
+       if t["status"]!="inProgress" {
+        // Final text and turn completion are distinct native events. Exercise
+        // the scheduling gap observed on Windows instead of relying on both
+        // events being consumed before the next snapshot request.
+        if t["id"]=="stream" {tokio::time::sleep(Duration::from_millis(35)).await;}
+        let event=json!({"method":"turn/completed","params":{"threadId":"shared-native","turn":t}});if ws.send(Message::Text(event.to_string().into())).await.is_err(){return;}}
        sent=t;
       }}
       let pending:Vec<_>=notices.lock().unwrap().iter().skip(notice_index).cloned().collect();notice_index+=pending.len();
@@ -737,7 +742,18 @@ async fn updates_streaming_items_then_finalizes_without_interrupting_desktop() {
         *t = external("stream", "completed", 2);
         t["items"][1]["item"]["text"] = json!("FINISHED_DESKTOP");
     }
-    let v = f.wait_text("FINISHED_DESKTOP").await;
+    let v = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            f.watch().await;
+            let v = f.detail().await;
+            if v.to_string().contains("FINISHED_DESKTOP") && v["session"]["status"] == "ready" {
+                break v;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("Final text and completion were not both observed");
     assert_eq!(v["session"]["status"], "ready");
     assert_eq!(
         v["messages"]

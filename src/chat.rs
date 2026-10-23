@@ -304,6 +304,7 @@ impl Chats {
                 );
             }
             chat.paused = true;
+
             if chat.agent == AgentKind::Claude {
                 let id = s(&chat.thread["id"]).to_owned();
                 let native = chat.native_id.clone();
@@ -399,6 +400,8 @@ impl Chats {
                 claude_recovery,
                 shared_watches,
                 tool_controls: HashSet::new(),
+                recovery_checks: HashMap::new(),
+                prepared_recoveries: HashMap::new(),
                 confirmed_settings: None,
                 prepared_edits: HashMap::new(),
                 prepared_bootstraps: HashMap::new(),
@@ -620,6 +623,8 @@ struct PreparedBootstrap {
 }
 struct Hub {
     tool_controls: HashSet<String>,
+    recovery_checks: HashMap<String, sync_recovery::HistoryCheck>,
+    prepared_recoveries: HashMap<String, String>,
     /// Chat whose model/effort the shared worker has just acknowledged for
     /// the command now being dispatched (set only around that dispatch).
     confirmed_settings: Option<String>,
@@ -747,7 +752,8 @@ impl Hub {
         self.active.get(id).is_some_and(|w| w.stage != "idle")
     }
     fn busy_count(&self) -> usize {
-        self.active.values().filter(|w| w.stage != "idle").count()
+        self.recovery_checks.len()
+            + self.active.values().filter(|w| w.stage != "idle").count()
             + self
                 .chats
                 .keys()
@@ -1530,6 +1536,7 @@ impl Hub {
                 }
                 _=tick.tick()=>{
                     if matches!(restart_gate.load(Ordering::Acquire),1|2) {continue;}
+                    self.finish_recovery_checks().await;
                     self.expire_native_controls().await;
                     if !restart_pending {self.reconnect_claude().await;}
                     previews.retain(|_,p|p.created.elapsed()<Duration::from_secs(60));
@@ -1606,6 +1613,12 @@ impl Hub {
         self.shutdown().await;
     }
     async fn shutdown(&mut self) {
+        // A blocking history copy must finish before releasing the profile
+        // lease. It can commit a resumable file, but never launch a CLI here.
+        for (id, check) in std::mem::take(&mut self.recovery_checks) {
+            let _ = check.task.await;
+            self.tool_controls.remove(&id);
+        }
         for id in self.active.keys().cloned().collect::<Vec<_>>() {
             self.end(&id, "interrupted", Some("Test bridge stopped"))
                 .await;
@@ -2729,6 +2742,26 @@ impl Hub {
         };
         let cleanup_key = key.clone();
         let result = async {
+        if self.recovery_checks.contains_key(&id)
+            && matches!(s(&c["type"]), "thread.turn.interrupt" | "thread.session.stop") {
+            self.checked(agent, &id)?;
+            let old = self.chats[&id].clone();
+            let chat = self.chats.get_mut(&id).unwrap();
+            if chat.thread["latestTurn"]["state"] == "running" {
+                finish(chat, "interrupted", None);
+                chat.pending_message = Value::Null;
+            }
+            projection::activity(chat, "claude-native-sync", "claude.desktop-sync.updated", "Claude Desktop sync", "info", json!({"status":"disconnected","detail":"Connection attempt cancelled. Saved history is intact."}));
+            chat.paused = true;
+            if let Err(e) = self.save(&id, receipt).await {
+                self.chats.insert(id.clone(), old);
+                return Err(e);
+            }
+            self.recovery_checks.get_mut(&id).unwrap().cancelled = true;
+            self.claude_recovery.forget(&id);
+            self.publish();
+            return Ok(json!({"sequence":self.seq}));
+        }
         if self.tool_controls.contains(&id) {
             return Err("Wait for this chat's control to finish".into());
         }
@@ -3339,7 +3372,9 @@ impl Hub {
         if self.chats[id].agent == AgentKind::Claude && !self.claude_enabled {
             return Err("Enable Claude Code in the Remodex dashboard first".into());
         }
-        self.prepare_replacement_resume(id).await?;
+        if self.start_recovery_check(id, recovering)? {
+            return Ok(());
+        }
         let chat = &self.chats[id];
         if chat.external_claude {
             if !recovering {
@@ -3359,6 +3394,20 @@ impl Hub {
             w.deadline = Some(Instant::now() + Duration::from_secs(15));
             w.connection.send(&json!({"type":"control_request","request_id":"reuse-model","request":{"subtype":"set_model","model":chat.thread["modelSelection"]["model"]}})).await.map_err(|_|"Claude settings could not be applied")?;
             return Ok(());
+        }
+        // History checks finish asynchronously. Recheck admission here so two
+        // completed copies cannot both take the last available shared worker.
+        if chat.agent == AgentKind::Claude
+            && (self.busy_count() >= self.config.max_active_chats
+                || (self.config.claude.remote_control
+                    && self
+                        .active
+                        .values()
+                        .filter(|w| w.claude_router.is_some() || w.observer.is_some())
+                        .count()
+                        >= crate::claude_reconnect::HOST_LIMIT))
+        {
+            return Err("Claude connection is waiting for an available worker".into());
         }
         let p = self.config.provider(chat.agent);
         let mut env = crate::discovery::environment(chat.agent, &p.profile);
