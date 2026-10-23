@@ -156,6 +156,21 @@ impl Rows {
         self.rows.is_empty()
     }
 }
+/// Captured before/after images of the global memory job. Recovery restores it
+/// only while the current image still belongs to this cleanup operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsolidationChange {
+    before: Rows,
+    after: Rows,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Binding {
+    pub kind: Kind,
+    filename: String,
+    identity: Identity,
+}
 /// A live write transaction. Dropping it rolls back pending changes. File moves
 /// must retain their journal until every database has committed or been restored.
 pub struct Database<'a> {
@@ -512,6 +527,155 @@ impl<'a> Database<'a> {
         });
         Ok(Some(out))
     }
+    fn global_job(&self) -> Result<Rows> {
+        let (columns, keys) = self.schema(Table::Jobs)?.ok_or(FAILED)?;
+        if keys != ["kind", "job_key"] {
+            return Err("storage_schema_not_supported");
+        }
+        let mut out = Rows {
+            table: Table::Jobs,
+            columns,
+            keys,
+            rows: vec![],
+        };
+        let sql = format!(
+            "SELECT {} FROM jobs WHERE kind='memory_consolidate_global' AND job_key='global'",
+            out.columns
+                .iter()
+                .map(|s| quote(s))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut q = self.db.prepare(&sql).map_err(failure)?;
+        let mut rows = q.query([]).map_err(failure)?;
+        let mut budget = Budget { bytes: 0, rows: 0 };
+        while let Some(row) = rows.next().map_err(failure)? {
+            if !out.rows.is_empty() {
+                return Err(FAILED);
+            }
+            let mut cells = Vec::new();
+            for i in 0..out.columns.len() {
+                cells.push(Cell::capture(
+                    row.get_ref(i).map_err(failure)?,
+                    &mut budget,
+                )?);
+            }
+            out.rows.push(cells);
+        }
+        Ok(out)
+    }
+    /// Refresh the global memory job inside this uncommitted transaction, only
+    /// when cleanup removes inputs that were selected for consolidation. The
+    /// coordinator must persist both row images before committing any database.
+    pub fn refresh_consolidation(&mut self, inputs: &Rows) -> Result<Option<ConsolidationChange>> {
+        let result = self.refresh_consolidation_inner(inputs);
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+    fn refresh_consolidation_inner(&self, inputs: &Rows) -> Result<Option<ConsolidationChange>> {
+        if !self.active || self.kind != Kind::Memories || inputs.table != Table::Stage1 {
+            return Err(FAILED);
+        }
+        self.validate(inputs)?;
+        let Some(index) = inputs
+            .columns
+            .iter()
+            .position(|s| s == "selected_for_phase2")
+        else {
+            return Ok(None);
+        };
+        let mut selected = false;
+        for row in &inputs.rows {
+            match row[index] {
+                Cell::Integer(n) => selected |= n != 0,
+                Cell::Null => {}
+                _ => return Err(FAILED),
+            }
+        }
+        if !selected || self.schema(Table::Jobs)?.is_none() {
+            return Ok(None);
+        }
+        let before = self.global_job()?;
+        let now = crate::auth::now() / 1000;
+        // Preserve the running worker and its lease. Only its input watermark
+        // and retry budget change; a newer worker must not be erased on restore.
+        self.db.execute("INSERT INTO jobs (
+            kind,job_key,status,worker_id,ownership_token,started_at,finished_at,
+            lease_until,retry_at,retry_remaining,last_error,input_watermark,last_success_watermark
+        ) VALUES ('memory_consolidate_global','global','pending',NULL,NULL,NULL,NULL,NULL,NULL,3,NULL,?1,0)
+        ON CONFLICT(kind,job_key) DO UPDATE SET
+            status=CASE WHEN jobs.status='running' THEN 'running' ELSE 'pending' END,
+            retry_at=CASE WHEN jobs.status='running' THEN jobs.retry_at ELSE NULL END,
+            retry_remaining=max(jobs.retry_remaining,excluded.retry_remaining),
+            input_watermark=CASE WHEN excluded.input_watermark>COALESCE(jobs.input_watermark,0)
+                THEN excluded.input_watermark ELSE COALESCE(jobs.input_watermark,0)+1 END",[now]).map_err(failure)?;
+        let after = self.global_job()?;
+        // Refuse overflow/coercion rather than persisting an imprecise watermark.
+        let watermark = after
+            .columns
+            .iter()
+            .position(|s| s == "input_watermark")
+            .ok_or(FAILED)?;
+        if !matches!(
+            after.rows.first().and_then(|r| r.get(watermark)),
+            Some(Cell::Integer(_))
+        ) {
+            return Err(FAILED);
+        }
+        Ok(Some(ConsolidationChange { before, after }))
+    }
+    /// Returns false when a newer job is deliberately retained. Other per-thread
+    /// rows can still be restored; this is not permission to overwrite that job.
+    pub fn restore_consolidation(&mut self, change: &ConsolidationChange) -> Result<bool> {
+        let result = self.restore_consolidation_inner(change);
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+    fn restore_consolidation_inner(&self, change: &ConsolidationChange) -> Result<bool> {
+        if !self.active || self.kind != Kind::Memories {
+            return Err(FAILED);
+        }
+        for rows in [&change.before, &change.after] {
+            if rows.table != Table::Jobs || rows.len() > 1 {
+                return Err(FAILED);
+            }
+            self.validate(rows)?;
+            let kind = rows
+                .columns
+                .iter()
+                .position(|s| s == "kind")
+                .ok_or(FAILED)?;
+            let key = rows
+                .columns
+                .iter()
+                .position(|s| s == "job_key")
+                .ok_or(FAILED)?;
+            for row in &rows.rows {
+                if row[kind] != Cell::Text("memory_consolidate_global".into())
+                    || row[key] != Cell::Text("global".into())
+                {
+                    return Err(FAILED);
+                }
+            }
+        }
+        if change.after.len() != 1 {
+            return Err(FAILED);
+        }
+        let current = self.global_job()?;
+        if current.rows == change.before.rows {
+            return Ok(true);
+        }
+        if current.rows != change.after.rows {
+            return Ok(false);
+        }
+        self.delete_inner(&change.after)?;
+        self.restore_inner(&change.before)?;
+        Ok(true)
+    }
     fn validate(&self, backup: &Rows) -> Result<Vec<usize>> {
         let Some((columns, keys)) = self.schema(backup.table)? else {
             return Err(FAILED);
@@ -708,11 +872,38 @@ impl<'a> Database<'a> {
             self.delete_inner(backup)
         };
         if result.is_err() {
-            let _ = self.db.progress_handler(0, None::<fn() -> bool>);
-            let _ = self.db.execute_batch("ROLLBACK");
-            self.active = false;
+            self.abort();
         }
         result
+    }
+    pub(crate) fn binding(&self) -> Result<Binding> {
+        Ok(Binding {
+            kind: self.kind,
+            filename: self
+                .path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or(FAILED)?
+                .to_owned(),
+            identity: self.identity.clone(),
+        })
+    }
+    pub(crate) fn check_restore(&self, backup: &Rows) -> Result<()> {
+        let keys = self.validate(backup)?;
+        for row in &backup.rows {
+            if self
+                .current(backup, row, &keys)?
+                .is_some_and(|current| current != *row)
+            {
+                return Err("storage_restore_conflict");
+            }
+        }
+        Ok(())
+    }
+    fn abort(&mut self) {
+        let _ = self.db.progress_handler(0, None::<fn() -> bool>);
+        let _ = self.db.execute_batch("ROLLBACK");
+        self.active = false;
     }
     pub fn commit(mut self) -> Result<()> {
         self.lease.check().map_err(|_| FAILED)?;

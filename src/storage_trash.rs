@@ -118,7 +118,33 @@ pub(crate) fn list(home: &Path) -> Result<Value, &'static str> {
                 }
             }
         }
-        if count == 0 && raw.is_none() {
+        let native = match bytes(&path.join("native-stage.json"), 8 * 1024 * 1024) {
+            Ok(raw) => Some(serde_json::from_slice::<Value>(&raw).map_err(|_| ERROR)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(ERROR),
+        };
+        if count == 0 && manifest.is_none() {
+            if let Some(journal) = &native {
+                if journal["version"] != 1 {
+                    return Err(ERROR);
+                }
+                let files = journal["files"]
+                    .as_array()
+                    .filter(|f| f.len() <= 10_000)
+                    .ok_or(ERROR)?;
+                for file in files {
+                    let relative = file["relative"].as_str().ok_or(ERROR)?;
+                    if crate::storage_preview::archived(relative).is_none() {
+                        return Err(ERROR);
+                    }
+                    count += 1;
+                    size = size
+                        .checked_add(file["bytes"].as_u64().ok_or(ERROR)?)
+                        .ok_or(ERROR)?;
+                }
+            }
+        }
+        if count == 0 && raw.is_none() && native.is_none() {
             continue;
         }
         if size > 9_007_199_254_740_991 {

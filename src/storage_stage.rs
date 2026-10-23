@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -245,6 +245,7 @@ impl Lease {
                 home: self.home_id.clone(),
                 phase: Phase::Prepared,
                 files,
+                records: BTreeMap::new(),
             },
         };
         if let Err(e) = s.save() {
@@ -279,6 +280,14 @@ impl Lease {
                 || f.bytes > MAX_FILE
                 || f.sha256.len() != 64
                 || !f.sha256.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(invalid());
+            }
+        }
+        for (name, record) in &journal.records {
+            if record.bytes > Stage::auxiliary_limit(name)?
+                || record.sha256.len() != 64
+                || !record.sha256.bytes().all(|b| b.is_ascii_hexdigit())
             {
                 return Err(invalid());
             }
@@ -367,6 +376,13 @@ enum Phase {
     Reconciled,
     Restoring,
     Restored,
+    RowsRestored,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Record {
+    bytes: u64,
+    sha256: String,
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -375,6 +391,8 @@ struct Journal {
     home: Identity,
     phase: Phase,
     files: Vec<Fingerprint>,
+    #[serde(default)]
+    records: BTreeMap<String, Record>,
 }
 pub struct Stage<'a> {
     lease: &'a Lease,
@@ -389,6 +407,92 @@ impl Stage<'_> {
     }
     pub fn directory(&self) -> &Path {
         &self.path
+    }
+    pub(crate) fn relatives(&self) -> Vec<String> {
+        self.journal
+            .files
+            .iter()
+            .map(|f| f.relative.clone())
+            .collect()
+    }
+    pub(crate) fn rows_restored(&mut self) -> io::Result<()> {
+        if !matches!(self.journal.phase, Phase::Restored | Phase::RowsRestored) {
+            return Err(invalid());
+        }
+        self.journal.phase = Phase::RowsRestored;
+        self.save()
+    }
+    pub(crate) fn restoration_complete(&self) -> bool {
+        self.journal.phase == Phase::RowsRestored
+    }
+    fn auxiliary_limit(name: &str) -> io::Result<u64> {
+        match name {
+            "manifest.json" => Ok(1024 * 1024),
+            "native-rows.json" => Ok(16 * 1024 * 1024),
+            _ => Err(invalid()),
+        }
+    }
+    pub(crate) fn read_record(&self, name: &str) -> io::Result<Vec<u8>> {
+        self.check()?;
+        let record = self.journal.records.get(name).ok_or_else(invalid)?;
+        let bytes =
+            crate::profile_snapshot::bytes(&self.path.join(name), Self::auxiliary_limit(name)?)?;
+        if bytes.len() as u64 != record.bytes
+            || format!("{:x}", Sha256::digest(&bytes)) != record.sha256
+        {
+            return Err(invalid());
+        }
+        Ok(bytes)
+    }
+    pub(crate) fn bytes(&self) -> u64 {
+        self.journal.files.iter().map(|f| f.bytes).sum()
+    }
+    pub(crate) fn uncommitted(&self) -> bool {
+        self.journal.phase == Phase::Prepared
+    }
+
+    pub(crate) fn write_record(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        self.check()?;
+        if self.journal.phase != Phase::Prepared
+            || self.journal.records.contains_key(name)
+            || bytes.len() as u64 > Self::auxiliary_limit(name)?
+        {
+            return Err(invalid());
+        }
+        let temporary = self
+            .path
+            .join(format!("record-{}.tmp", uuid::Uuid::new_v4()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let result = (|| {
+            let mut file = options.open(&temporary)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            // Records are immutable. A resumed operation must read and validate
+            // the original rather than replace it with a newer snapshot.
+            fs::hard_link(&temporary, self.path.join(name))?;
+            sync_directory(&self.path)?;
+            fs::remove_file(&temporary)?;
+            sync_directory(&self.path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result?;
+        self.journal.records.insert(
+            name.to_owned(),
+            Record {
+                bytes: bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            },
+        );
+        self.save()
     }
     fn check(&self) -> io::Result<()> {
         self.lease.check()?;
@@ -503,7 +607,7 @@ impl Stage<'_> {
     /// Called only after both files and rows have been restored. Unknown entries
     /// (including database backups) must first be reconciled by their owner.
     pub fn finish_restore(self) -> io::Result<()> {
-        if self.journal.phase != Phase::Restored {
+        if !matches!(self.journal.phase, Phase::Restored | Phase::RowsRestored) {
             return Err(invalid());
         }
         self.check()?;
@@ -512,8 +616,38 @@ impl Stage<'_> {
             f.matches(&self.lease.home.join(&f.relative), deadline)?;
         }
         let entries = fs::read_dir(&self.path)?.collect::<io::Result<Vec<_>>>()?;
-        if entries.len() != 1 || entries[0].file_name() != JOURNAL {
-            return Err(io::ErrorKind::DirectoryNotEmpty.into());
+        let complete = self.restoration_complete();
+        for e in &entries {
+            let name = e.file_name();
+            if name == JOURNAL {
+                continue;
+            }
+            let owned_temp = name.to_str().is_some_and(|s| {
+                s.strip_suffix(".tmp")
+                    .and_then(|s| {
+                        s.strip_prefix("journal-")
+                            .or_else(|| s.strip_prefix("record-"))
+                    })
+                    .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
+            });
+            if !complete
+                || (!owned_temp
+                    && !matches!(name.to_str(), Some("manifest.json" | "native-rows.json")))
+            {
+                return Err(io::ErrorKind::DirectoryNotEmpty.into());
+            }
+            ordinary(&e.path(), false)?;
+        }
+        // RowsRestored is durable before any backup is removed. A retry can
+        // finish this phase even after a crash between the metadata removals.
+        for entry in &entries {
+            if complete && entry.file_name() != JOURNAL {
+                match fs::remove_file(entry.path()) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
         }
         fs::remove_file(self.path.join(JOURNAL))?;
         fs::remove_dir(&self.path)?;

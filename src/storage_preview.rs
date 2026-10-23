@@ -98,7 +98,14 @@ fn restoring(home: &Path, budget: &mut Budget) -> Result<BTreeSet<String>> {
                 if value["version"] != 1
                     || !matches!(
                         value["phase"].as_str(),
-                        Some("prepared" | "files_staged" | "reconciled" | "restoring" | "restored")
+                        Some(
+                            "prepared"
+                                | "files_staged"
+                                | "reconciled"
+                                | "restoring"
+                                | "restored"
+                                | "rows_restored"
+                        )
                     )
                 {
                     return Err(FAILED);
