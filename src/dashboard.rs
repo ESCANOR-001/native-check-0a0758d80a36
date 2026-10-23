@@ -201,6 +201,8 @@ pub(crate) fn routes(app: App) -> Router<App> {
         .route("/api/system/memory", get(memory))
         .route("/api/diagnostics/desktop-log", get(diagnostics))
         .route("/api/stop", post(stop))
+        .route("/api/restart", post(restart))
+        .route("/api/system/restart", post(restart))
         .route("/api/android-remote", get(status))
         .route(
             "/api/android-remote/claude-code",
@@ -245,12 +247,74 @@ async fn stop(State(app): State<App>, headers: HeaderMap) -> Response {
             );
         }
     }
-    // This experiment has no service supervisor. Stop only this process through
-    // the same durable cleanup as an OS signal; never locate or stop a service.
+    if let Some(restart) = &app.restart {
+        restart.store(false, std::sync::atomic::Ordering::Release);
+    }
+    // Stop only this process through the same durable cleanup as an OS signal.
+    // The optional supervisor also exits; never locate or stop another service.
     let already_stopping = app.stopping.send_replace(true);
     response(
         StatusCode::OK,
         json!({"success":true,"message":"Stopping this bridge","alreadyStopping":already_stopping}),
+    )
+}
+async fn restart(State(app): State<App>, headers: HeaderMap) -> Response {
+    if let Some(raw) = headers.get("x-opencodex-expected-pid") {
+        let Some(pid) = raw
+            .to_str()
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|p| *p > 0)
+        else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "Invalid expected bridge process ID",
+            );
+        };
+        if pid != std::process::id() {
+            return error(
+                StatusCode::CONFLICT,
+                "The bridge process changed; refresh the dashboard",
+            );
+        }
+    }
+    let Some(restart) = &app.restart else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Restart requires starting this isolated candidate with --supervise",
+        );
+    };
+    if *app.stopping.borrow() {
+        return if restart.load(std::sync::atomic::Ordering::Acquire) {
+            response(
+                StatusCode::ACCEPTED,
+                json!({"success":true,"alreadyDraining":true,"activeTurnCount":0,"drainTimeoutMs":0,"restartPolicy":"idle-only"}),
+            )
+        } else {
+            error(StatusCode::CONFLICT, "Bridge is already stopping")
+        };
+    }
+    let reservation = if let Some(chats) = &app.chats {
+        match chats.prepare_restart().await {
+            Ok(reservation) => Some(reservation),
+            Err(e) => return error(StatusCode::CONFLICT, &e),
+        }
+    } else {
+        None
+    };
+    // No await between committing intent and stopping admission. A concurrent
+    // Stop can override restart, including while graceful cleanup is running.
+    if *app.stopping.borrow() {
+        return error(StatusCode::CONFLICT, "Bridge is already stopping");
+    }
+    restart.store(true, std::sync::atomic::Ordering::Release);
+    app.stopping.send_replace(true);
+    if let Some(reservation) = reservation {
+        reservation.commit();
+    }
+    response(
+        StatusCode::ACCEPTED,
+        json!({"success":true,"message":"Restarting this idle bridge through its native supervisor","activeTurnCount":0,"drainTimeoutMs":0,"alreadyDraining":false,"restartPolicy":"idle-only"}),
     )
 }
 async fn activity(State(app): State<App>) -> Response {
@@ -267,7 +331,24 @@ async fn activity(State(app): State<App>) -> Response {
 }
 async fn memory(State(app): State<App>) -> Response {
     match app.metrics.read() {
-        Some(value) => response(StatusCode::OK, value),
+        Some(mut value) => {
+            if app.restart.is_some() {
+                let idle = if let Some(chats) = &app.chats {
+                    matches!(chats.call(crate::chat::AgentKind::Codex,"local","native.restartStatus",json!({})).await, Ok(v) if v["ready"]==true)
+                } else {
+                    true
+                };
+                // Existing UI treats this field as a restart capability. Until
+                // active-task draining is supported, offer it only when idle;
+                // the POST still rechecks and atomically reserves admission.
+                value["restartPolicy"] = json!("idle-only");
+                if idle {
+                    value["activeTurnCount"] = json!(0);
+                    value["isDraining"] = json!(false);
+                }
+            }
+            response(StatusCode::OK, value)
+        }
         None => error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Process memory is unavailable",
@@ -338,7 +419,12 @@ async fn guard(State(app): State<App>, req: Request, next: Next) -> Response {
     if !d.allows(&origin, req.headers(), req.method(), auth::now()) {
         return error(StatusCode::UNAUTHORIZED, "Dashboard session required");
     }
-    if *app.stopping.borrow() && req.uri().path() != "/api/stop" {
+    if *app.stopping.borrow()
+        && !matches!(
+            req.uri().path(),
+            "/api/stop" | "/api/restart" | "/api/system/restart"
+        )
+    {
         return error(StatusCode::SERVICE_UNAVAILABLE, "Bridge is stopping");
     }
     secure(next.run(req).await)

@@ -163,6 +163,104 @@ async fn diagnostics_requires_dashboard_authority_and_excludes_request_content()
 }
 
 #[tokio::test]
+async fn restart_requires_supervisor_and_local_csrf_authority_and_stop_overrides_it() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let mut f = setup();
+    let router = f.app.clone().router();
+    let (token, csrf) = session(router.clone()).await;
+    let headers = [
+        ("x-opencodex-api-key", token.as_str()),
+        ("x-opencodex-gui-origin", "http://localhost:18900"),
+        ("origin", "http://localhost:18900"),
+        ("x-opencodex-csrf-token", csrf.as_str()),
+    ];
+    assert_eq!(
+        call(router, "POST", "/api/restart", &headers, json!({}))
+            .await
+            .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(!*f.app.stopping.borrow());
+    let restart = Arc::new(AtomicBool::new(false));
+    f.app.restart = Some(restart.clone());
+    let router = f.app.clone().router();
+    let (code, body) = call(
+        router.clone(),
+        "GET",
+        "/api/system/memory",
+        &headers,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["activeTurnCount"],
+        0
+    );
+    for path in ["/api/restart", "/api/system/restart"] {
+        for extra in [
+            vec![],
+            vec![("authorization", format!("Bearer {}", f.phone))],
+            vec![("x-opencodex-api-key", token.clone())],
+        ] {
+            let extra: Vec<_> = extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            assert_eq!(
+                call(router.clone(), "POST", path, &extra, json!({}))
+                    .await
+                    .0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let mut stale = headers.to_vec();
+        stale.push(("x-opencodex-expected-pid", "0"));
+        assert_eq!(
+            call(router.clone(), "POST", path, &stale, json!({}))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert!(!restart.load(Ordering::Acquire));
+    assert!(!*f.app.stopping.borrow());
+    assert_eq!(
+        call(router.clone(), "POST", "/api/restart", &headers, json!({}))
+            .await
+            .0,
+        StatusCode::ACCEPTED
+    );
+    assert!(restart.load(Ordering::Acquire));
+    let (code, body) = call(
+        router.clone(),
+        "POST",
+        "/api/system/restart",
+        &headers,
+        json!({}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::ACCEPTED);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["alreadyDraining"],
+        true
+    );
+    assert_eq!(
+        call(router.clone(), "POST", "/api/stop", &headers, json!({}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert!(!restart.load(Ordering::Acquire));
+    assert_eq!(
+        call(router, "POST", "/api/restart", &headers, json!({}))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
 async fn process_memory_requires_dashboard_session_and_reports_only_native_counters() {
     let f = setup();
     let router = f.app.router();

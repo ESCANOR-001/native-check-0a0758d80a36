@@ -23,6 +23,10 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot, watch};
@@ -200,8 +204,26 @@ struct Request {
     params: Value,
     reply: oneshot::Sender<Result<Value, String>>,
 }
+pub struct RestartReservation {
+    gate: Arc<AtomicBool>,
+    committed: bool,
+}
+impl RestartReservation {
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+impl Drop for RestartReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.gate.store(false, Ordering::Release);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Chats {
+    restart_gate: Arc<AtomicBool>,
     send: mpsc::Sender<Request>,
     changes: watch::Receiver<u64>,
     setup: crate::agent_setup::ClaudeSetup,
@@ -352,6 +374,7 @@ impl Chats {
                 )
             })
             .collect();
+        let restart_gate = Arc::new(AtomicBool::new(false));
         tokio::spawn(
             Hub {
                 db,
@@ -377,15 +400,35 @@ impl Chats {
                 changes: changes_tx,
                 dirty: false,
             }
-            .run(receive),
+            .run(receive, restart_gate.clone()),
         );
         Ok(Self {
+            restart_gate,
             send,
             changes,
             setup,
             activity,
             storage_report,
         })
+    }
+    /// Reserve an idle hub until the caller commits shutdown or drops the guard.
+    /// The guard also releases admission when a dashboard request is cancelled.
+    pub async fn prepare_restart(&self) -> Result<RestartReservation, String> {
+        self.restart_gate
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "A bridge restart is already being prepared")?;
+        let reservation = RestartReservation {
+            gate: self.restart_gate.clone(),
+            committed: false,
+        };
+        self.send_request(
+            AgentKind::Codex,
+            "local",
+            "native.prepareRestart",
+            json!({}),
+        )
+        .await?;
+        Ok(reservation)
     }
     pub async fn call(
         &self,
@@ -977,7 +1020,7 @@ impl Hub {
         self.dirty = true;
         Ok(())
     }
-    async fn run(mut self, mut receive: mpsc::Receiver<Request>) {
+    async fn run(mut self, mut receive: mpsc::Receiver<Request>, restart_gate: Arc<AtomicBool>) {
         let mut tick = tokio::time::interval(Duration::from_millis(120));
         let mut inspections = tokio::task::JoinSet::new();
         let mut clone_jobs = tokio::task::JoinSet::new();
@@ -1002,6 +1045,7 @@ impl Hub {
         let mut retention_due = Instant::now() + Duration::from_secs(30);
         let mut storage_checked = Instant::now();
         loop {
+            let restart_pending = restart_gate.load(Ordering::Acquire);
             self.shared_watches.retain(|id, (until, _)| {
                 *until > Instant::now()
                     || shared_sends.contains_key(id)
@@ -1018,7 +1062,8 @@ impl Hub {
                 .shared_watches
                 .iter()
                 .filter(|(id, (_, due))| {
-                    *due <= Instant::now()
+                    !restart_pending
+                        && *due <= Instant::now()
                         && !self.active.contains_key(*id)
                         && !shared_reads.contains(*id)
                         && (!self.tool_controls.contains(*id) || shared_sends.contains_key(*id))
@@ -1057,7 +1102,7 @@ impl Hub {
             }
             // Metadata-only and isolated: idle shared connections must not keep
             // a stale catalog (or its alias-to-wire mapping) forever.
-            if discovery.is_empty() && self.busy_count() == 0 {
+            if !restart_pending && discovery.is_empty() && self.busy_count() == 0 {
                 if let Some(agent) = to_discover
                     .pop()
                     .filter(|a| *a != AgentKind::Claude || self.claude_enabled)
@@ -1073,6 +1118,13 @@ impl Hub {
                 request=receive.recv()=>{
                     let Some(r)=request else {break};
                     if r.method=="native.shutdown" {self.shutdown().await; let _=r.reply.send(Ok(json!({})));break;}
+                    if matches!(r.method.as_str(),"native.prepareRestart"|"native.restartStatus") {
+                        let busy=self.busy_count()>0 || !self.tool_controls.is_empty() || !clone_jobs.is_empty() || !worktree_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !tool_jobs.is_empty() || !shared_sends.is_empty() || self.chats.values().any(|c|!c.queue.is_empty() || matches!(s(&c.thread["session"]["status"]),"starting"|"running"|"stopping"));
+                        if r.method=="native.restartStatus" {let _=r.reply.send(Ok(json!({"ready":!busy && !restart_gate.load(Ordering::Acquire),"activeTurnCount":self.busy_count()})));continue;}
+                        let result=if !restart_gate.load(Ordering::Acquire) {Err("Restart reservation is no longer active".into())}else if busy {Err("Finish or stop active tasks and clear queued messages before restarting this bridge".into())}else {Ok(json!({"reserved":true}))};
+                        let _=r.reply.send(result);continue;
+                    }
+                    if restart_gate.load(Ordering::Acquire) {let _=r.reply.send(Err("Bridge is restarting; retry after it reconnects".into()));continue;}
                     if r.method=="native.configureClaude" {
                         // Wait for bounded metadata/jobs rather than racing a configuration
                         // change against a CLI launched with the previous setup.
@@ -1424,6 +1476,7 @@ impl Hub {
                     if let Err(error)=result {self.end(&id,"error",Some(&error)).await;}
                 }
                 _=tick.tick()=>{
+                    if restart_pending {continue;}
                     self.expire_native_controls().await;
                     self.reconnect_claude().await;
                     previews.retain(|_,p|p.created.elapsed()<Duration::from_secs(60));

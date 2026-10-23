@@ -62,3 +62,5 @@ mod subprocess;
 
 mod codex_assets;
 mod shared_history;
+
+pub mod supervisor;

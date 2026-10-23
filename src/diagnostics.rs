@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -69,6 +69,7 @@ pub struct Log {
     dropped: Arc<AtomicU64>,
     failures: Arc<AtomicU64>,
     reads: Arc<tokio::sync::Semaphore>,
+    io_gate: Arc<Mutex<()>>,
 }
 fn single_link(file: &File) -> io::Result<()> {
     #[cfg(unix)]
@@ -150,6 +151,8 @@ impl Log {
         let dropped = Arc::new(AtomicU64::new(0));
         let failures = Arc::new(AtomicU64::new(0));
         let errors = failures.clone();
+        let io_gate = Arc::new(Mutex::new(()));
+        let writer_gate = io_gate.clone();
         let path = directory.join("service.log");
         std::thread::Builder::new()
             .name("connect-log".into())
@@ -163,7 +166,11 @@ impl Log {
                                 errors.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
-                            if append(&path, &event, MAX_LOG).is_err() {
+                            let result = writer_gate
+                                .lock()
+                                .map_err(|_| ())
+                                .and_then(|_guard| append(&path, &event, MAX_LOG).map_err(|_| ()));
+                            if result.is_err() {
                                 errors.fetch_add(1, Ordering::Relaxed);
                                 retry = Instant::now() + Duration::from_secs(5);
                             }
@@ -180,6 +187,7 @@ impl Log {
             dropped,
             failures,
             reads: Arc::new(tokio::sync::Semaphore::new(1)),
+            io_gate,
         })
     }
     pub fn lifecycle(&self, event: Lifecycle) {
@@ -237,12 +245,17 @@ impl Log {
         let directory = self.directory.clone();
         let dropped = self.dropped.load(Ordering::Relaxed);
         let failures = self.failures.load(Ordering::Relaxed);
+        let io_gate = self.io_gate.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            report(&directory, stopping, dropped, failures)
+            // Snapshot validation intentionally rejects a changing file. Hold
+            // the same bounded-I/O lock as our writer across open and read so
+            // ordinary HTTP logging cannot make a diagnostics export disappear.
+            let _guard = io_gate.lock().map_err(|_| "Diagnostics writer stopped")?;
+            Ok(report(&directory, stopping, dropped, failures))
         })
         .await
-        .map_err(|_| "Diagnostics reader stopped")
+        .map_err(|_| "Diagnostics reader stopped")?
     }
 }
 fn tail(directory: &Path, name: &str) -> Value {
@@ -325,6 +338,20 @@ fn report(directory: &Path, stopping: bool, dropped: u64, failures: u64) -> Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn reports_remain_readable_while_http_events_are_written() {
+        let root = tempfile::tempdir().unwrap();
+        let log = Log::new(root.path()).unwrap();
+        log.lifecycle(Lifecycle::Ready);
+        log.flush().await;
+        for _ in 0..256 {
+            log.request("/api/test", 200);
+            let v = log.report(false).await.unwrap();
+            assert!(v["log"].as_str().unwrap().contains("runtime.ready"));
+            assert!(!v["log"].as_str().unwrap().contains("unavailable"));
+            assert_eq!(v["nativeLogWriteFailures"], 0);
+        }
+    }
     #[tokio::test]
     async fn native_log_exports_typed_metadata_and_redacts_unrecognized_bodies() {
         let root = tempfile::tempdir().unwrap();

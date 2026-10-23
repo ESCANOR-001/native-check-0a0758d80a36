@@ -32,6 +32,8 @@ pub struct App {
     pub chats: Option<Chats>,
     pub dashboard: Option<crate::dashboard::Dashboard>,
     pub diagnostics: Option<crate::diagnostics::Log>,
+    /// Present only after an inherited native supervisor pipe is verified.
+    pub restart: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) metrics: crate::runtime_metrics::Metrics,
     pub(crate) online: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     pub stopping: tokio::sync::watch::Sender<bool>,
@@ -51,6 +53,7 @@ impl App {
             chats: None,
             dashboard: None,
             diagnostics: None,
+            restart: None,
             metrics: Default::default(),
             online: Arc::default(),
             stopping: tokio::sync::watch::channel(false).0,

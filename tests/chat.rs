@@ -139,6 +139,51 @@ async fn configure_switches(test: &Test, value: Value) -> Value {
     }
 }
 
+#[tokio::test]
+async fn idle_restart_reservation_rejects_active_or_queued_tasks_and_releases_on_drop() {
+    for a in [AgentKind::Codex, AgentKind::Claude] {
+        let t = Test::new().await;
+        t.create(a, "restart").await;
+        t.call(a, prompt("restart", "hold", "normal"))
+            .await
+            .unwrap();
+        t.wait(a, "restart", "running").await;
+        assert!(t.hub.prepare_restart().await.is_err());
+        // A refused restart must leave admission open, including Stop/Queue.
+        t.call(a, prompt("restart", "queued", "queue"))
+            .await
+            .unwrap();
+        t.call(a,json!({"type":"thread.turn.interrupt","threadId":"restart","commandId":"stop-for-restart"})).await.unwrap();
+        t.wait(a, "restart", "interrupted").await;
+        assert!(
+            t.hub.prepare_restart().await.is_err(),
+            "paused queue must be preserved"
+        );
+        t.call(a,json!({"type":"thread.turn.queue.cancel","threadId":"restart","commandId":"cancel-for-restart","messageId":"message-restart-queued-queue"})).await.unwrap();
+        let before = t.detail(a, "restart").await["messages"].clone();
+        let reservation = t.hub.prepare_restart().await.unwrap();
+        assert!(t.hub.prepare_restart().await.is_err());
+        assert!(t
+            .call(a, prompt("restart", "must-not-send", "normal"))
+            .await
+            .unwrap_err()
+            .contains("restarting"));
+        drop(reservation);
+        assert_eq!(t.detail(a, "restart").await["messages"], before);
+        t.call(a, prompt("restart", "after-cancelled-restart", "normal"))
+            .await
+            .unwrap();
+        let after = t.wait(a, "restart", "ready").await;
+        assert!(!after["messages"].to_string().contains("must-not-send"));
+        t.hub.prepare_restart().await.unwrap().commit();
+        assert!(t
+            .call(a, prompt("restart", "after-commit", "normal"))
+            .await
+            .is_err());
+        t.stop().await; // Internal shutdown must still work behind admission.
+    }
+}
+
 fn alternate_claude(test: &Test) -> PathBuf {
     let folder = test.dir.path().join("CLI with spaces");
     std::fs::create_dir_all(&folder).unwrap();
