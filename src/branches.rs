@@ -19,6 +19,11 @@ pub(crate) struct Fork {
 }
 
 pub(crate) fn transcript(profile: &Path, id: &str) -> Result<PathBuf, String> {
+    transcript_optional(profile, id)?.ok_or_else(|| {
+        "The source native history is unavailable; no empty branch was created".into()
+    })
+}
+pub(crate) fn transcript_optional(profile: &Path, id: &str) -> Result<Option<PathBuf>, String> {
     uuid::Uuid::parse_str(id).map_err(|_| "Invalid native session identity")?;
     let root = profile
         .join("projects")
@@ -47,8 +52,10 @@ pub(crate) fn transcript(profile: &Path, id: &str) -> Result<PathBuf, String> {
             continue;
         }
         let path = entry.path().join(format!("{id}.jsonl"));
-        let Ok(meta) = path.symlink_metadata() else {
-            continue;
+        let meta = match path.symlink_metadata() {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("Cannot inspect the source transcript".into()),
         };
         if !meta.is_file() {
             return Err("The source transcript is not a regular file".into());
@@ -57,11 +64,9 @@ pub(crate) fn transcript(profile: &Path, id: &str) -> Result<PathBuf, String> {
             return Err("The source session has ambiguous history locations".into());
         }
     }
-    found.ok_or_else(|| {
-        "The source native history is unavailable; no empty branch was created".into()
-    })
+    Ok(found)
 }
-fn point(profile: &Path, id: &str) -> Result<String, String> {
+pub(crate) fn point(profile: &Path, id: &str) -> Result<String, String> {
     let path = transcript(profile, id)?;
     let mut file = fs::File::open(path).map_err(|_| "Cannot read the native session")?;
     let end = file

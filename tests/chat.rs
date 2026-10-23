@@ -1003,6 +1003,138 @@ async fn wait_links(test: &Test, count: usize) {
 }
 
 #[tokio::test]
+async fn owned_claude_link_replacement_is_pinned_durable_and_never_replays_a_prompt() {
+    let mut test = Test::hosted().await;
+    let a = AgentKind::Claude;
+    test.create(a, "replace-link").await;
+    test.call(a, prompt("replace-link", "ORIGINAL_KEPT", "normal"))
+        .await
+        .unwrap();
+    let before = test.wait(a, "replace-link", "ready").await;
+    test.stop().await;
+    let saved = test
+        .db
+        .call(|a| a.store.load_chat("replace-link"))
+        .await
+        .unwrap()
+        .unwrap();
+    let original = saved["native_id"].as_str().unwrap().to_owned();
+    let point = uuid::Uuid::new_v4().to_string();
+    let folder = test.dir.path().join("projects/fixture");
+    std::fs::create_dir_all(&folder).unwrap();
+    let source = folder.join(format!("{original}.jsonl"));
+    let bytes = format!(
+        "{}\n",
+        json!({"type":"assistant","parentUuid":null,"uuid":point,"sessionId":original,"message":{"content":"ORIGINAL_KEPT"}})
+    );
+    std::fs::write(&source, &bytes).unwrap();
+    test.db
+        .call(|a| {
+            let mut saved = a.store.load_chat("replace-link").unwrap();
+            saved["remote_identity"]["bridge_session"] = json!("cse_expired_fixture");
+            a.store.save_chat(&saved, None).unwrap();
+        })
+        .await
+        .unwrap();
+    test.hub = Chats::start(test.db.clone(), test.config.clone())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let params = json!({"threadId":"replace-link","mode":"replace","commandId":"replace-once"});
+    let result = test
+        .hub
+        .call(a, "phone", "claude.recoverDesktopSync", params.clone())
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "connected");
+    let prepared = test
+        .db
+        .call(|a| a.store.load_chat("replace-link"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(prepared["native_id"], original);
+    assert_eq!(prepared["sync_replacement"]["session"], original);
+    assert_eq!(prepared["sync_replacement"]["point"], point);
+    assert!(prepared["fork_from"].is_null());
+    assert_eq!(prepared["resumed"], true);
+    assert_eq!(prepared["paused"], true);
+    let alias = json!({"threadId":"replace-link","mode":"replace","commandId":"join-replacement"});
+    assert_eq!(
+        test.hub
+            .call(a, "phone", "claude.recoverDesktopSync", alias.clone())
+            .await
+            .unwrap()["status"],
+        "connected"
+    );
+    let receipt = test
+        .db
+        .call(|a| {
+            a.store
+                .tool_action("claude-recovery:phone:join-replacement")
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.1["nativeSessionId"], prepared["native_id"]);
+    let mut mismatched = alias;
+    mismatched["threadId"] = json!("different-chat");
+    assert!(test
+        .hub
+        .call(a, "phone", "claude.recoverDesktopSync", mismatched)
+        .await
+        .is_err());
+    assert_eq!(
+        test.detail(a, "replace-link").await["messages"],
+        before["messages"]
+    );
+    test.stop().await;
+    test.hub = Chats::start(test.db.clone(), test.config.clone())
+        .await
+        .unwrap();
+    let result = test
+        .hub
+        .call(a, "phone", "claude.recoverDesktopSync", params.clone())
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "connected");
+    let restarted = test
+        .db
+        .call(|a| a.store.load_chat("replace-link"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(prepared["native_id"], restarted["native_id"]);
+    assert_eq!(prepared["remote_identity"], restarted["remote_identity"]);
+    assert_eq!(prepared["fork_from"], restarted["fork_from"]);
+    assert_eq!(
+        std::fs::read_to_string(test.dir.path().join("host-prompts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), bytes);
+    // An incomplete native destination cannot be overwritten by a restart.
+    test.stop().await;
+    let target = restarted["native_id"].as_str().unwrap();
+    let destination = folder.join(format!("{target}.jsonl"));
+    std::fs::write(&destination, b"{\"unfinished\":").unwrap();
+    test.hub = Chats::start(test.db.clone(), test.config.clone())
+        .await
+        .unwrap();
+    assert!(test
+        .hub
+        .call(a, "phone", "claude.recoverDesktopSync", params)
+        .await
+        .is_err());
+    assert_eq!(std::fs::read(&destination).unwrap(), b"{\"unfinished\":");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), bytes);
+    test.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_claude_recovers_process_loss_without_replaying_or_reopening() {
     let test = Test::hosted().await;
     let a = AgentKind::Claude;

@@ -10,6 +10,7 @@ mod chat_projection;
 mod chat_store;
 mod claude_background;
 pub mod claude_cursor;
+mod claude_fork_resume;
 pub mod claude_history;
 pub mod claude_host;
 pub mod claude_link;

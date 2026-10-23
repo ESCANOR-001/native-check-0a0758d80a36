@@ -165,6 +165,10 @@ pub(crate) struct Chat {
     pub native_control: Option<crate::native_control::Intent>,
     #[serde(default)]
     pub fork_from: Option<crate::branches::Fork>,
+    /// An explicit owned-link replacement keeps its pinned fork intent until
+    /// Claude durably creates the new native transcript. Never for observers.
+    #[serde(default)]
+    pub sync_replacement: Option<crate::branches::Fork>,
     #[serde(default)]
     pub queue: Vec<Value>,
     #[serde(default)]
@@ -190,6 +194,7 @@ impl Chat {
         self.external_stop = None;
         self.native_control = None;
         self.fork_from = None;
+        self.sync_replacement = None;
         self.queue.clear();
         self.paused = false;
         self.stream_id.clear();
@@ -1193,7 +1198,7 @@ impl Hub {
                         let _=r.reply.send(Ok(json!({})));continue;
                     }
                     if r.method=="native.retryClaudeSync" {
-                        let result=self.request_sync_retry(r.agent,&r.params).await;
+                        let result=self.request_sync_retry(r.agent,&r.client,&r.params).await;
                         let _=r.reply.send(result);continue;
                     }
                     if r.method=="native.claudeSyncStatus" {
@@ -2608,6 +2613,7 @@ impl Hub {
             external_stop: None,
             native_control: None,
             fork_from: None,
+            sync_replacement: None,
             queue: vec![],
             paused: false,
             disabled_mcp: vec![],
@@ -3333,6 +3339,7 @@ impl Hub {
         if self.chats[id].agent == AgentKind::Claude && !self.claude_enabled {
             return Err("Enable Claude Code in the Remodex dashboard first".into());
         }
+        self.prepare_replacement_resume(id).await?;
         let chat = &self.chats[id];
         if chat.external_claude {
             if !recovering {
@@ -4190,7 +4197,9 @@ impl Hub {
                 return Err("Claude returned an unexpected session identity".into());
             }
             chat.resumed = true;
-            chat.fork_from = None;
+            if chat.sync_replacement.is_none() {
+                chat.fork_from = None;
+            }
             let data = serde_json::to_value(&*chat).unwrap();
             self.db
                 .call(move |a| a.store.save_chat(&data, None))
@@ -4284,6 +4293,12 @@ impl Hub {
         }
         if !codex && response == "remote-commit" && w.stage == "remote-commit" {
             self.claude_recovery.connected(&id, Instant::now());
+            if chat.thread["session"]["lastError"]
+                == "Connecting a replacement Claude link; saved history is retained"
+            {
+                chat.thread["session"]["lastError"] = Value::Null;
+                chat.thread["session"]["statusConfidence"] = json!("confirmed");
+            }
             projection::activity(
                 chat,
                 "claude-native-sync",
@@ -5128,10 +5143,13 @@ fn claude_recoverable(chat: &Chat) -> bool {
     chat.agent == AgentKind::Claude
         && chat.thread["deletedAt"].is_null()
         && chat.thread["archivedAt"].is_null()
-        && chat.fork_from.is_none()
-        && chat.remote_identity.as_ref().is_some_and(|identity| {
-            identity.native_session == chat.native_id && identity.validate().is_ok()
-        })
+        && ((chat.fork_from.is_none()
+            && chat.remote_identity.as_ref().is_some_and(|identity| {
+                identity.native_session == chat.native_id && identity.validate().is_ok()
+            }))
+            || (!chat.external_claude
+                && chat.sync_replacement.is_some()
+                && (chat.fork_from.is_some() || chat.resumed)))
 }
 fn prepare_claude_local(w: &mut Worker, chat: &Chat) -> Result<(), String> {
     w.recovering = false;

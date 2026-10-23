@@ -672,6 +672,7 @@ mod tests {
             external_stop: None,
             native_control: None,
             fork_from: None,
+            sync_replacement: None,
             queue: vec![],
             paused: false,
             disabled_mcp: vec![],

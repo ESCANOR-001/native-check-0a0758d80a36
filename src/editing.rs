@@ -107,6 +107,7 @@ impl Prepared {
         chat.native_control = None;
         chat.remote_identity = None;
         chat.fork_from = self.fork.clone();
+        chat.sync_replacement = None;
         chat.resumed = chat.agent == AgentKind::Codex;
         chat.stream_id.clear();
         chat.stream_model.clear();

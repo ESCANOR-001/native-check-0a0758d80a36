@@ -325,6 +325,12 @@ fn main() {
             }
             if v["request"]["subtype"] == "remote_control" {
                 hosted = true;
+                if v["request"]["reattach_session_id"] == "cse_expired_fixture" {
+                    out(
+                        json!({"type":"control_response","response":{"subtype":"error","request_id":v["request_id"],"error":"Expired fixture link"}}),
+                    );
+                    continue;
+                }
                 if std::path::Path::new("host-attach-fail").exists() {
                     return;
                 }
