@@ -269,6 +269,9 @@ impl Auth {
     pub fn keep_awake(&self) -> rusqlite::Result<bool> {
         self.bool_setting("keep_awake", false)
     }
+    pub fn local_network_enabled(&self) -> rusqlite::Result<bool> {
+        self.bool_setting("local_network_enabled", true)
+    }
     fn bool_setting(&self, key: &str, default: bool) -> rusqlite::Result<bool> {
         use rusqlite::OptionalExtension;
         let value: Option<String> = self
@@ -293,10 +296,19 @@ impl Auth {
         enabled: Option<bool>,
         keep_awake: Option<bool>,
     ) -> rusqlite::Result<()> {
+        self.set_connection_settings(enabled, keep_awake, None)
+    }
+    pub fn set_connection_settings(
+        &mut self,
+        enabled: Option<bool>,
+        keep_awake: Option<bool>,
+        local: Option<bool>,
+    ) -> rusqlite::Result<()> {
         let tx = self.store.db.transaction()?;
         for (key, value) in [
             ("phone_control_enabled", enabled),
             ("keep_awake", keep_awake),
+            ("local_network_enabled", local),
         ] {
             if let Some(value) = value {
                 tx.execute("INSERT INTO metadata(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key, if value {"true"} else {"false"}])?;

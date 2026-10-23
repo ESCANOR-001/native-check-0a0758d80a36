@@ -34,6 +34,7 @@ pub struct App {
     pub diagnostics: Option<crate::diagnostics::Log>,
     /// Present only after an inherited native supervisor pipe is verified.
     pub restart: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) network: crate::network_access::Access,
     pub(crate) metrics: crate::runtime_metrics::Metrics,
     pub(crate) online: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     pub stopping: tokio::sync::watch::Sender<bool>,
@@ -46,6 +47,9 @@ pub struct App {
     assets: Arc<tokio::sync::Mutex<HashMap<String, Asset>>>,
 }
 impl App {
+    pub fn listener(&self, listener: tokio::net::TcpListener) -> crate::network_access::Listener {
+        crate::network_access::Listener::new(listener, self.network.clone())
+    }
     pub fn start_storage_scheduler(&self) {
         if let Some(chats) = &self.chats {
             self.storage_policy
@@ -56,11 +60,13 @@ impl App {
         self.storage_policy.drain().await;
     }
     pub fn new(auth: Auth, label: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let network = crate::network_access::Access::new(auth.local_network_enabled()?);
         let environment_id = auth.store.environment_id()?;
         let auth = AuthService::new(auth)?;
         let storage_policy = crate::storage_policy_job::Runner::new(auth.clone());
         Ok(Self {
             environment_id,
+            network,
             auth,
             storage_policy,
             label: label.to_owned(),
@@ -132,9 +138,37 @@ impl App {
                     }
                 },
             ))
+            .layer(axum::middleware::from_fn_with_state(
+                self.clone(),
+                network_guard,
+            ))
             .layer(DefaultBodyLimit::max(64 * 1024))
             .with_state(self)
     }
+}
+async fn network_guard(
+    State(app): State<App>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|p| p.0);
+    if !app.network.permits(peer) {
+        return failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Local network access is disabled. Re-enable it on the PC to reconnect.",
+        );
+    }
+    let response = next.run(request).await;
+    if !app.network.permits(peer) {
+        return failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Local network access was disabled; reconnect after it is enabled.",
+        );
+    }
+    response
 }
 async fn phone_control_guard(
     State(app): State<App>,
@@ -412,6 +446,7 @@ async fn client_metadata(
 
 async fn upgrade(
     State(app): State<App>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     Query(query): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
@@ -437,15 +472,23 @@ async fn upgrade(
             "Invalid or expired WebSocket ticket",
         );
     };
+    let peer = peer.map(|p| p.0 .0);
     ws.protocols(["opencodex-json-v1"])
         .max_frame_size(1024 * 1024)
         .max_message_size(1024 * 1024)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            serve_socket(socket, app, client, agent).await
+            serve_socket(socket, app, client, agent, peer).await
         })
 }
-async fn serve_socket(mut socket: WebSocket, app: App, client: String, agent: AgentKind) {
+async fn serve_socket(
+    mut socket: WebSocket,
+    app: App,
+    client: String,
+    agent: AgentKind,
+    peer: Option<std::net::SocketAddr>,
+) {
+    let mut network_changes = app.network.changes();
     let _online = crate::dashboard::Online::new(app.online.clone(), client.clone());
     let mut check = tokio::time::interval(Duration::from_secs(1));
     let mut stopping = app.stopping.subscribe();
@@ -457,8 +500,9 @@ async fn serve_socket(mut socket: WebSocket, app: App, client: String, agent: Ag
     loop {
         let incoming = tokio::select! {
             _=stopping.changed()=>{break;}
+            _=network_changes.changed()=>{if !app.network.permits(peer){break;}continue;}
             _=async {match &mut changes {Some(c)=>{let _=c.changed().await;},None=>std::future::pending().await}}=>{
-                if !authorized(&app,&client).await {break;}
+                if !app.network.permits(peer) || !authorized(&app,&client).await {break;}
                 if let Some((id,method,params))=&subscription {
                     let reply=native_reply(&app,agent,&client,id,method,params.clone()).await;
                     if !send(&mut socket,reply).await {break;}
@@ -466,7 +510,7 @@ async fn serve_socket(mut socket: WebSocket, app: App, client: String, agent: Ag
                 continue;
             }
             _=check.tick() => {
-                if !authorized(&app,&client).await {break;}
+                if !app.network.permits(peer) || !authorized(&app,&client).await {break;}
                 if let (Some(chats),Some((_,method,params)))=(&app.chats,&subscription) {
                     if method=="orchestration.subscribeThread" {let _=chats.call(agent,&client,"native.watchShared",params.clone()).await;}
                 }
@@ -481,7 +525,7 @@ async fn serve_socket(mut socket: WebSocket, app: App, client: String, agent: Ag
             }
             continue;
         };
-        if !authorized(&app, &client).await {
+        if !app.network.permits(peer) || !authorized(&app, &client).await {
             break;
         }
         let request: Value = match serde_json::from_str(&text) {

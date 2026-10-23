@@ -1,3 +1,4 @@
+use axum::serve::{Listener as _, ListenerExt as _};
 use remodex_connect_native::invitation_file::InvitationFile;
 use remodex_connect_native::{
     auth::{self, Auth},
@@ -61,7 +62,7 @@ async fn serve(
     let listener = tokio::net::TcpListener::bind(&args[2]).await?;
     let store = Store::open(&directory)?;
     let mut auth = Auth::new(store);
-    let invite = if auth.control_enabled()? {
+    let invite = if auth.control_enabled()? && auth.local_network_enabled()? {
         Some(auth.invite("Rust native foundation", &args[3], auth::now())?)
     } else {
         None
@@ -88,6 +89,7 @@ async fn serve(
         .as_ref()
         .map(|v| InvitationFile::create(&directory, v))
         .transpose()?;
+    let listener = app.listener(listener).tap_io(|_| {});
     let chats = app.chats.clone();
     let shutdown_chats = chats.clone();
     app.start_storage_scheduler();

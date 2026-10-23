@@ -56,14 +56,22 @@ async fn call(
     extra: &[(&str, &str)],
     body: Value,
 ) -> (StatusCode, String) {
+    call_from(router, method, path, extra, body, "127.0.0.1:12345").await
+}
+async fn call_from(
+    router: Router,
+    method: &str,
+    path: &str,
+    extra: &[(&str, &str)],
+    body: Value,
+    peer: &str,
+) -> (StatusCode, String) {
     let mut req = Request::builder()
         .method(method)
         .uri(path)
         .header("host", "localhost:18900")
         .header("content-type", "application/json")
-        .extension(ConnectInfo(
-            "127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap(),
-        ));
+        .extension(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
     for (k, v) in extra {
         req = req.header(*k, *v);
     }
@@ -938,7 +946,7 @@ async fn persisted_disable_revokes_pending_capabilities_without_erasing_paired_p
     for bad in [
         json!({"controlEnabled":false,"keepAwake":true,"connectionChoice":"quick"}),
         json!({"controlEnabled":false,"connectionChoice":"named"}),
-        json!({"controlEnabled":false,"localNetworkEnabled":false}),
+        json!({"controlEnabled":false,"localNetworkEnabled":false,"connectionChoice":"quick"}),
     ] {
         assert_eq!(
             call(
@@ -1277,6 +1285,188 @@ async fn stored_awake_preference_survives_restart_without_changing_phone_control
         serde_json::from_str::<Value>(&reset.1).unwrap()["keepAwake"],
         false
     );
+}
+
+#[tokio::test]
+async fn lan_control_preserves_pairing_admin_and_history_and_rejects_forged_local_headers() {
+    let f = setup();
+    let router = f.app.clone().router();
+    let (token, csrf) = session(router.clone()).await;
+    let h = [
+        ("x-opencodex-api-key", token.as_str()),
+        ("x-opencodex-gui-origin", "http://localhost:18900"),
+        ("origin", "http://localhost:18900"),
+        ("x-opencodex-csrf-token", csrf.as_str()),
+    ];
+    let before = call(
+        router.clone(),
+        "GET",
+        "/api/android-remote",
+        &h,
+        Value::Null,
+    )
+    .await;
+    let before: Value = serde_json::from_str(&before.1).unwrap();
+    let disk =
+        rusqlite::Connection::open(f._root.path().join("state/native-connect.sqlite")).unwrap();
+    disk.execute(
+        "INSERT INTO metadata(key,value) VALUES('history-fixture','preserve')",
+        [],
+    )
+    .unwrap();
+    let changed = call(
+        router.clone(),
+        "PUT",
+        "/api/android-remote/settings",
+        &h,
+        json!({"localNetworkEnabled":false}),
+    )
+    .await;
+    assert_eq!(changed.0, StatusCode::OK);
+    let changed: Value = serde_json::from_str(&changed.1).unwrap();
+    assert_eq!(changed["localNetworkEnabled"], false);
+    assert_eq!(changed["pairingAvailable"], false);
+    assert_eq!(changed["reachableAddresses"], json!([]));
+    assert_eq!(changed["clients"], before["clients"]);
+    assert_eq!(changed["controlEnabled"], true);
+    let remote = call_from(
+        router.clone(),
+        "GET",
+        "/healthz",
+        &[
+            ("x-forwarded-for", "127.0.0.1"),
+            ("forwarded", "for=127.0.0.1"),
+        ],
+        Value::Null,
+        "203.0.113.8:1000",
+    )
+    .await;
+    assert_eq!(remote.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        call(
+            router.clone(),
+            "POST",
+            "/api/android-remote/pairing",
+            &h,
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let reopened = Auth::new(Store::open(&f._root.path().join("state")).unwrap());
+    assert!(!reopened.local_network_enabled().unwrap());
+    assert!(reopened
+        .authenticate(&f.phone, auth::now())
+        .unwrap()
+        .is_some());
+    let restarted = App::new(reopened, "test PC").unwrap().router();
+    assert_eq!(
+        call_from(
+            restarted,
+            "GET",
+            "/healthz",
+            &[],
+            Value::Null,
+            "203.0.113.8:1000"
+        )
+        .await
+        .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        call(
+            router.clone(),
+            "PUT",
+            "/api/android-remote/settings",
+            &h,
+            json!({"localNetworkEnabled":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call_from(
+            router,
+            "GET",
+            "/healthz",
+            &[],
+            Value::Null,
+            "203.0.113.8:1000"
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        disk.query_row(
+            "SELECT value FROM metadata WHERE key='history-fixture'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "preserve"
+    );
+}
+
+#[tokio::test]
+async fn failed_lan_save_rolls_back_other_settings_and_does_not_close_access() {
+    let f = setup();
+    let router = f.app.clone().router();
+    let (token, csrf) = session(router.clone()).await;
+    let h = [
+        ("x-opencodex-api-key", token.as_str()),
+        ("x-opencodex-gui-origin", "http://localhost:18900"),
+        ("origin", "http://localhost:18900"),
+        ("x-opencodex-csrf-token", csrf.as_str()),
+    ];
+    let disk =
+        rusqlite::Connection::open(f._root.path().join("state/native-connect.sqlite")).unwrap();
+    disk.execute_batch("CREATE TRIGGER fail_lan BEFORE INSERT ON metadata WHEN NEW.key='local_network_enabled' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+    assert_eq!(
+        call(
+            router.clone(),
+            "PUT",
+            "/api/android-remote/settings",
+            &h,
+            json!({"controlEnabled":false,"keepAwake":true,"localNetworkEnabled":false})
+        )
+        .await
+        .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        call_from(
+            router,
+            "GET",
+            "/healthz",
+            &[],
+            Value::Null,
+            "203.0.113.8:1000"
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        f.app
+            .auth
+            .call(|a| (
+                a.control_enabled().unwrap(),
+                a.keep_awake().unwrap(),
+                a.local_network_enabled().unwrap()
+            ))
+            .await
+            .unwrap(),
+        (true, false, true)
+    );
+    disk.execute_batch("DROP TRIGGER fail_lan; INSERT INTO metadata(key,value) VALUES('local_network_enabled','invalid');").unwrap();
+    assert!(App::new(
+        Auth::new(Store::open(&f._root.path().join("state")).unwrap()),
+        "test PC"
+    )
+    .is_err());
 }
 
 #[tokio::test]

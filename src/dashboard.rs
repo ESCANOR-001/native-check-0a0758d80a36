@@ -472,16 +472,16 @@ async fn status(State(app): State<App>) -> Response {
         .lock()
         .map(|v| v.keys().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
-    let state = app.auth.call(move |a| -> rusqlite::Result<(bool, bool, Vec<Value>)> {
+    let state = app.auth.call(move |a| -> rusqlite::Result<(bool, bool, bool, Vec<Value>)> {
         // Expired credentials still need a visible repair/revoke action. Never
         // hide the phone precisely when its authorization needs replacement.
         let mut stmt = a.store.db.prepare("SELECT id,label,os,created_at FROM clients ORDER BY created_at DESC LIMIT 128")?;
         let clients = stmt.query_map([], |r| { let id:String=r.get(0)?;let created:i64=r.get(3)?;
             Ok(json!({"id":id,"label":r.get::<_,String>(1)?,"os":r.get::<_,String>(2)?,"deviceType":"mobile", "createdAt":auth::timestamp(created),"scopes":auth::SCOPES.split(' ').collect::<Vec<_>>(),"online":online.contains(&id)}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((a.control_enabled()?, a.keep_awake()?, clients))
+        Ok((a.control_enabled()?, a.keep_awake()?, a.local_network_enabled()?, clients))
     }).await;
-    let Ok(Ok((enabled, keep_awake, clients))) = state else {
+    let Ok(Ok((enabled, keep_awake, local, clients))) = state else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "Pairing store unavailable");
     };
     let d = app.dashboard.as_ref().unwrap();
@@ -494,9 +494,9 @@ async fn status(State(app): State<App>) -> Response {
     };
     response(
         StatusCode::OK,
-        json!({"version":1,"controlEnabled":enabled,"keepAwake":keep_awake,"localNetworkEnabled":true,
-        "connectionChoice":"local","pairingAvailable":enabled,"gateway":{"status":if enabled {"ready"} else {"stopped"},"backgroundServer":"current-process","port":d.port},
-        "reachableAddresses":[d.public_url],"tunnel":{"configuration":{"mode":"quick","hasNamedTunnelToken":false},"runtime":{"mode":"quick","status":"stopped","publicUrl":null,"error":null}},
+        json!({"version":1,"controlEnabled":enabled,"keepAwake":keep_awake,"localNetworkEnabled":local,
+        "connectionChoice":"local","pairingAvailable":enabled && local,"gateway":{"status":if enabled {"ready"} else {"stopped"},"backgroundServer":"current-process","port":d.port},
+        "reachableAddresses":if local {vec![d.public_url.clone()]} else {vec![]},"tunnel":{"configuration":{"mode":"quick","hasNamedTunnelToken":false},"runtime":{"mode":"quick","status":"stopped","publicUrl":null,"error":null}},
         "desktop":{"id":"desktop","label":app.label,"platform":platform,"address":d.public_url,"online":true},"clients":clients}),
     )
 }
@@ -630,6 +630,12 @@ async fn pair(
     if body.as_object().is_none_or(|v| !v.is_empty()) {
         return error(StatusCode::BAD_REQUEST, "Provide an empty pairing request");
     }
+    if !app.network.enabled() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Enable local network access on this PC before pairing a phone",
+        );
+    }
     let url = app.dashboard.as_ref().unwrap().public_url.clone();
     let label = app.label.clone();
     match app
@@ -668,20 +674,28 @@ async fn settings(State(app): State<App>, Json(body): Json<Value>) -> Response {
     }
     // Validate the whole update before persisting anything. Unsupported actions
     // must not appear successful or partially disable a working phone.
-    if body["localNetworkEnabled"] == false
-        || object.get("connectionChoice").is_some_and(|v| v != "local")
-    {
+    if object.get("connectionChoice").is_some_and(|v| v != "local") {
         return error(
             StatusCode::NOT_IMPLEMENTED,
-            "Tunnel and local-network controls are not migrated yet; no settings changed",
+            "Tunnel controls are not migrated yet; no settings changed",
         );
     }
     let enabled = body["controlEnabled"].as_bool();
     let keep_awake = body["keepAwake"].as_bool();
-    if (enabled.is_some() || keep_awake.is_some())
+    let local = body["localNetworkEnabled"].as_bool();
+    let network = app.network.clone();
+    if (enabled.is_some() || keep_awake.is_some() || local.is_some())
         && !matches!(
             app.auth
-                .call(move |a| a.set_control_settings(enabled, keep_awake))
+                .call(move |a| {
+                    a.set_connection_settings(enabled, keep_awake, local)?;
+                    // Commit and live application share the serialized auth
+                    // worker, even if the HTTP caller disconnects midway.
+                    if let Some(local) = local {
+                        network.set(local);
+                    }
+                    Ok::<_, rusqlite::Error>(())
+                })
                 .await,
             Ok(Ok(()))
         )

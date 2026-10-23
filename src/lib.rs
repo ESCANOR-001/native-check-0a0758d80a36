@@ -48,6 +48,7 @@ mod vcs;
 mod worktrees;
 
 pub mod invitation_file;
+pub mod network_access;
 pub mod profile_lock;
 mod profile_snapshot;
 mod repository_clone;
