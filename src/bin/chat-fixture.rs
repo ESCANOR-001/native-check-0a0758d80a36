@@ -643,6 +643,10 @@ This came from another Claude session — not typed by your user, but very likel
                     &serde_json::to_string(&std::env::args().collect::<Vec<_>>()).unwrap(),
                     &last,
                 );
+            } else if text == "approval-session" {
+                out(
+                    json!({"type":"control_request","request_id":"approval-session","request":{"subtype":"can_use_tool","tool_name":"Write","tool_use_id":"approval-tool","input":{"file_path":"fixture.txt","content":"example"},"permission_suggestions":[{"type":"addRules","behavior":"allow","destination":"projectSettings","rules":[{"toolName":"Write","ruleContent":"/fixture/**"}]}]}}),
+                );
             } else if text == "approval" {
                 out(
                     json!({"type":"assistant","message":{"id":"approval-tool-message","content":[{"type":"tool_use","id":"approval-tool","name":"Write","input":{"file_path":"test.txt","content":"example"}}]}}),
@@ -660,7 +664,9 @@ This came from another Claude session — not typed by your user, but very likel
                 complete(false, text, &last);
             }
         } else if v["type"] == "control_response" {
-            if v["response"]["request_id"] == "form-1" {
+            if ["approval-session", "form-1"]
+                .contains(&v["response"]["request_id"].as_str().unwrap_or(""))
+            {
                 complete(false, &v["response"]["response"].to_string(), &last);
             } else if v["response"]["request_id"] == "unknown-1" {
                 assert_eq!(v["response"]["subtype"], "error");

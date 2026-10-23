@@ -4,6 +4,90 @@ use serde_json::{json, Value};
 const INVALID: &str =
     "Saved Claude permissions are invalid or exceed the supported limit; nothing was granted";
 
+pub(crate) struct SessionGrant {
+    pub updates: Vec<Value>,
+    pub rules: Vec<String>,
+}
+
+// Reusable grants can only come from the pending native request. Never accept
+// rules supplied by an Android command or copy CLI settings-file destinations.
+pub(crate) fn suggested(request: &Value) -> Option<SessionGrant> {
+    if request["type"] != "control_request" || request["request"]["subtype"] != "can_use_tool" {
+        return None;
+    }
+    let suggestions = request["request"]["permission_suggestions"].as_array()?;
+    if suggestions.len() > 32
+        || suggestions.is_empty()
+        || suggestions
+            .iter()
+            .map(|v| v.to_string().len())
+            .sum::<usize>()
+            > 16384
+    {
+        return None;
+    }
+    let mut grant = SessionGrant {
+        updates: vec![],
+        rules: vec![],
+    };
+    for update in suggestions {
+        if update["type"] != "addRules" || update["behavior"] != "allow" {
+            continue;
+        }
+        let rules = update["rules"]
+            .as_array()
+            .filter(|v| !v.is_empty() && v.len() <= 256)?;
+        let mut validated = vec![];
+        for rule in rules {
+            let tool = rule["toolName"].as_str().filter(|s| {
+                !s.is_empty()
+                    && s.len() <= 256
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
+            })?;
+            let mut native = json!({"toolName":tool});
+            let saved = if let Some(content) = rule.get("ruleContent") {
+                let content = content.as_str().filter(|s| {
+                    !s.is_empty() && s.len() <= 4096 && !s.chars().any(char::is_control)
+                })?;
+                native["ruleContent"] = json!(content);
+                format!("{tool}({content})")
+            } else {
+                tool.to_owned()
+            };
+            if !grant.rules.contains(&saved) {
+                grant.rules.push(saved);
+            }
+            validated.push(native);
+        }
+        grant.updates.push(
+            json!({"type":"addRules","behavior":"allow","rules":validated,"destination":"session"}),
+        );
+    }
+    if grant.rules.is_empty() || parse(&json!(grant.rules)).is_err() {
+        return None;
+    }
+    Some(grant)
+}
+
+pub(crate) fn merged(current: &[String], extra: &[String]) -> Result<Vec<String>, String> {
+    let mut rules = current.to_vec();
+    for rule in extra {
+        if !rules.contains(rule) {
+            rules.push(rule.clone());
+        }
+    }
+    parse(&json!(rules))
+}
+
+pub(crate) fn decisions(reusable: bool) -> Vec<&'static str> {
+    if reusable {
+        vec!["approved", "approved_for_session", "declined", "cancel"]
+    } else {
+        vec!["approved", "declined", "cancel"]
+    }
+}
+
 pub(crate) fn parse(value: &Value) -> Result<Vec<String>, String> {
     if value.is_null() {
         return Ok(vec![]);
@@ -60,6 +144,42 @@ mod tests {
         chat::{AgentKind, Chat},
         discovery::isolated_args,
     };
+    fn suggestion() -> Value {
+        json!({"type":"control_request","request":{"subtype":"can_use_tool","permission_suggestions":[{"type":"addRules","behavior":"allow","destination":"userSettings","rules":[{"toolName":"Bash","ruleContent":"echo fixture"}]}]}})
+    }
+    #[test]
+    fn reusable_native_suggestions_always_target_session_and_merge_without_broadening() {
+        let v = suggestion();
+        let grant = suggested(&v).unwrap();
+        assert_eq!(grant.updates[0]["destination"], "session");
+        assert_eq!(grant.rules, vec!["Bash(echo fixture)"]);
+        assert_eq!(merged(&grant.rules, &grant.rules).unwrap(), grant.rules);
+        assert_eq!(
+            v["request"]["permission_suggestions"][0]["destination"],
+            "userSettings"
+        );
+        assert!(decisions(true).contains(&"approved_for_session"));
+        assert!(!decisions(false).contains(&"approved_for_session"));
+    }
+    #[test]
+    fn missing_unsupported_or_malformed_reusable_suggestions_do_not_grant_access() {
+        for updates in [
+            json!([]),
+            json!([{"type":"setMode","mode":"bypassPermissions"}]),
+            json!([{"type":"addRules","behavior":"deny","rules":[{"toolName":"Bash"}]}]),
+            json!([{"type":"addRules","behavior":"allow","rules":[{"toolName":"Bash(*)"}]}]),
+            json!([{"type":"addRules","behavior":"allow","rules":[{"toolName":"Bash","ruleContent":"echo ok\nBash(*)"}]}]),
+        ] {
+            let mut v = suggestion();
+            v["request"]["permission_suggestions"] = updates;
+            assert!(suggested(&v).is_none());
+        }
+        assert!(suggested(
+            &json!({"permission_suggestions":suggestion()["request"]["permission_suggestions"]})
+        )
+        .is_none());
+        assert!(merged(&vec!["x".repeat(32); 256], &["Read".into()]).is_err());
+    }
     #[test]
     fn saved_rules_stay_private_exact_and_do_not_change_isolation_or_other_launches() {
         let rules = vec![

@@ -617,7 +617,7 @@ pub async fn project(
                 "approval.requested",
                 "Approval required",
                 "approval",
-                json!({"requestId":rid,"status":"pending","requestKind":"command","providerName":"claude-code","canApproveForSession":false,"detail":detail,"command":value["request"]["input"]["command"],"availableDecisions":["approved","declined","cancel"],"data":{"nativeRequestId":native,"toolCallId":value["request"]["tool_use_id"]}}),
+                json!({"requestId":rid,"status":"pending","requestKind":"command","providerName":"claude-code","canApproveForSession":crate::claude_permissions::suggested(&value).is_some(),"detail":detail,"command":value["request"]["input"]["command"],"availableDecisions":crate::claude_permissions::decisions(crate::claude_permissions::suggested(&value).is_some()),"data":{"nativeRequestId":native,"toolCallId":value["request"]["tool_use_id"]}}),
             );
         }
     }
@@ -817,6 +817,46 @@ mod tests {
             Cursor::new(identity).unwrap(),
             native,
         )
+    }
+    #[tokio::test]
+    async fn shared_session_approval_keeps_original_suggestions_across_cursor_reload() {
+        let (_dir, db, mut cursor, native) = setup().await;
+        let request = json!({"type":"control_request","session_id":native,"request_id":"native-approval","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"echo fixture"},"permission_suggestions":[{"type":"addRules","behavior":"allow","destination":"userSettings","rules":[{"toolName":"Bash","ruleContent":"echo fixture"}]}]}});
+        let chat = step(&db, &mut cursor, 1, request.clone()).await;
+        let row = chat["thread"]["activities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == "approval.requested")
+            .unwrap();
+        assert_eq!(row["payload"]["canApproveForSession"], true);
+        assert!(row["payload"]["availableDecisions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("approved_for_session")));
+        let identity = cursor.identity.clone();
+        let reloaded = db
+            .call(move |a| a.store.claude_remote_cursor("history-chat", identity))
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, requests) = control_state(&reloaded.projection).unwrap();
+        let original = requests
+            .get(row["payload"]["requestId"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(original["request"], request["request"]);
+        let grant = crate::claude_permissions::suggested(original).unwrap();
+        assert_eq!(grant.updates[0]["destination"], "session");
+        let done = step(&db, &mut cursor, 2, json!({"type":"control_response","response":{"subtype":"success","request_id":"native-approval","response":{"behavior":"allow","updatedPermissions":grant.updates}}})).await;
+        assert!(!done["thread"]["activities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["kind"] == "approval.requested"));
+        assert!(control_state(&cursor.projection).unwrap().1.is_empty());
+        // The original owner owns these grants. The observing bridge must not
+        // persist them as private launch settings for a different worker.
+        assert!(done.get("claude_permission_rules").is_none());
     }
     #[tokio::test]
     async fn internal_task_checkpoint_repairs_legacy_pending_without_changing_history() {

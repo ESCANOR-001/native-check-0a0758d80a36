@@ -3687,11 +3687,33 @@ impl Hub {
             return Err("Answer this question using its answer controls".into());
         }
         let decision = s(&c["decision"]);
-        if !["approved", "declined", "accept", "decline", "cancel"].contains(&decision) {
-            return Err("Choose Approve once, Decline or Cancel turn in this experiment".into());
+        let remember = ["approved_for_session", "acceptForSession"].contains(&decision);
+        let grant = if remember {
+            if self.chats[id].agent != AgentKind::Claude {
+                return Err("Choose Approve once, Decline or Cancel turn for this request".into());
+            }
+            Some(crate::claude_permissions::suggested(&original).ok_or(
+                "Claude did not provide a reusable permission for this action. Choose Approve once.",
+            )?)
+        } else {
+            None
+        };
+        if !remember && !["approved", "declined", "accept", "decline", "cancel"].contains(&decision)
+        {
+            return Err("Choose an available approval action".into());
         }
         let cancel = decision == "cancel";
         let background = self.background_tasks(id)?;
+        let before = self.chats[id].clone();
+        if let Some(grant) = &grant {
+            if !before.external_claude {
+                self.chats.get_mut(id).unwrap().claude_permission_rules =
+                    crate::claude_permissions::merged(
+                        &before.claude_permission_rules,
+                        &grant.rules,
+                    )?;
+            }
+        }
         let stop_id = if cancel {
             observer::record_stop(self.chats.get_mut(id).unwrap(), background.stop_targets())
         } else {
@@ -3700,12 +3722,20 @@ impl Hub {
         if cancel {
             self.chats.get_mut(id).unwrap().paused = true;
         }
-        self.save(id, receipt).await?;
-        let allowed = ["approved", "accept"].contains(&decision);
+        if let Err(error) = self.save(id, receipt).await {
+            self.chats.insert(id.into(), before);
+            return Err(error);
+        }
+        let allowed = remember || ["approved", "accept"].contains(&decision);
+        let mut claude_response =
+            json!({"behavior":"allow","updatedInput":original["request"]["input"]});
+        if let Some(grant) = grant {
+            claude_response["updatedPermissions"] = json!(grant.updates);
+        }
         let request = if chat_agent(&self.chats, id) == AgentKind::Codex {
             json!({"id":original["id"],"result":{"decision":if allowed {"accept"}else if cancel {"cancel"}else{"decline"}}})
         } else {
-            json!({"type":"control_response","response":{"subtype":"success","request_id":original["request_id"],"response":if allowed {json!({"behavior":"allow","updatedInput":original["request"]["input"]})}else{json!({"behavior":"deny","message":"User declined this action"})}}})
+            json!({"type":"control_response","response":{"subtype":"success","request_id":original["request_id"],"response":if allowed {claude_response}else{json!({"behavior":"deny","message":"User declined this action"})}}})
         };
         let w = self.active.get_mut(id).unwrap();
         if cancel {
@@ -4691,7 +4721,7 @@ impl Hub {
                     "approval.requested",
                     "Approval required",
                     "approval",
-                    json!({"requestId":rid,"status":"pending","requestKind":kind,"providerName":chat.agent.instance(),"canApproveForSession":false,"detail":projection::approval_detail(&v,codex),"command":detail["command"],"availableDecisions":["approved","declined","cancel"],"data":{"toolCallId":if codex{&v["params"]["itemId"]}else{&v["request"]["tool_use_id"]},"nativeRequestId":if codex{v["id"].clone()}else{Value::Null}}}),
+                    json!({"requestId":rid,"status":"pending","requestKind":kind,"providerName":chat.agent.instance(),"canApproveForSession":!codex && crate::claude_permissions::suggested(&v).is_some(),"detail":projection::approval_detail(&v,codex),"command":detail["command"],"availableDecisions":crate::claude_permissions::decisions(!codex && crate::claude_permissions::suggested(&v).is_some()),"data":{"toolCallId":if codex{&v["params"]["itemId"]}else{&v["request"]["tool_use_id"]},"nativeRequestId":if codex{v["id"].clone()}else{Value::Null}}}),
                 );
             }
         }

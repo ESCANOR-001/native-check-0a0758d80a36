@@ -3741,6 +3741,162 @@ async fn both_agents_queue_steer_and_stop_keep_worker_ownership() {
         t.stop().await;
     }
 }
+async fn pending_approval(t: &Test, agent: AgentKind, id: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let d = t.detail(agent, id).await;
+            if let Some(r) =
+                d["activities"].as_array().unwrap().iter().find(|r| {
+                    r["kind"] == "approval.requested" && r["payload"]["status"] == "pending"
+                })
+            {
+                return r["payload"].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+#[tokio::test]
+async fn claude_session_approval_is_native_scoped_durable_and_idempotent() {
+    for hosted in [false, true] {
+        let mut t = if hosted {
+            Test::hosted().await
+        } else {
+            Test::new().await
+        };
+        let a = AgentKind::Claude;
+        t.create(a, "remember").await;
+        t.call(a, prompt("remember", "approval-session", "normal"))
+            .await
+            .unwrap();
+        let approval = pending_approval(&t, a, "remember").await;
+        assert_eq!(approval["canApproveForSession"], true);
+        assert!(approval["availableDecisions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("approved_for_session")));
+        let command = json!({"type":"thread.approval.respond","threadId":"remember","commandId":"remember-approval","requestId":approval["requestId"],"decision":"approved_for_session","permission_suggestions":[{"type":"setMode","mode":"bypassPermissions"}]});
+        t.call(a, command.clone()).await.unwrap();
+        let done = t.wait(a, "remember", "ready").await;
+        let response: Value = serde_json::from_str(
+            done["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["role"] == "assistant")
+                .unwrap()["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["behavior"], "allow");
+        assert_eq!(response["updatedInput"]["file_path"], "fixture.txt");
+        assert_eq!(
+            response["updatedPermissions"],
+            json!([{"type":"addRules","behavior":"allow","destination":"session","rules":[{"toolName":"Write","ruleContent":"/fixture/**"}]}])
+        );
+        t.call(a, command.clone()).await.unwrap();
+        assert_eq!(t.detail(a, "remember").await["messages"], done["messages"]);
+        t.stop().await;
+        assert_eq!(
+            t.db.call(
+                |a| a.store.load_chat("remember").unwrap()["claude_permission_rules"].clone()
+            )
+            .await
+            .unwrap(),
+            json!(["Write(/fixture/**)"])
+        );
+        t.hub = Chats::start(t.db.clone(), t.config.clone()).await.unwrap();
+        t.call(a, command).await.unwrap();
+        if hosted {
+            t.hub.call(a,"phone","claude.recoverDesktopSync",json!({"threadId":"remember","mode":"retry","commandId":"rejoin-before-permission-test"})).await.unwrap();
+        }
+        t.call(a, prompt("remember", "settings", "normal"))
+            .await
+            .unwrap();
+        let done = t.wait(a, "remember", "ready").await;
+        let text = done["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|r| r["role"] == "assistant")
+            .unwrap()["text"]
+            .as_str()
+            .unwrap();
+        let args: Vec<String> = serde_json::from_str(text).unwrap();
+        let at = args.iter().position(|a| a == "--settings").unwrap();
+        let settings: Value = serde_json::from_str(&args[at + 1]).unwrap();
+        assert_eq!(
+            settings["permissions"]["allow"],
+            json!(["Write(/fixture/**)"])
+        );
+        assert!(!t.dir.path().join("settings.json").exists());
+        t.stop().await;
+    }
+}
+#[tokio::test]
+async fn failed_session_approval_save_does_not_grant_or_remember_and_once_remains_available() {
+    let t = Test::new().await;
+    let a = AgentKind::Claude;
+    t.create(a, "save-fail").await;
+    t.call(a, prompt("save-fail", "approval-session", "normal"))
+        .await
+        .unwrap();
+    let approval = pending_approval(&t, a, "save-fail").await;
+    let db = rusqlite::Connection::open(t.dir.path().join("native-connect.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_grant BEFORE INSERT ON chats WHEN NEW.id='save-fail' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+    let command = json!({"type":"thread.approval.respond","threadId":"save-fail","commandId":"remember-failed","requestId":approval["requestId"],"decision":"approved_for_session"});
+    assert!(t.call(a, command).await.is_err());
+    db.execute_batch("DROP TRIGGER fail_grant;").unwrap();
+    assert_eq!(t.detail(a, "save-fail").await["hasPendingApprovals"], true);
+    t.call(a,json!({"type":"thread.approval.respond","threadId":"save-fail","commandId":"once","requestId":approval["requestId"],"decision":"approved"})).await.unwrap();
+    let done = t.wait(a, "save-fail", "ready").await;
+    let text = done["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["role"] == "assistant")
+        .unwrap()["text"]
+        .as_str()
+        .unwrap();
+    let reply: Value = serde_json::from_str(text).unwrap();
+    assert!(reply.get("updatedPermissions").is_none());
+    assert!(t
+        .db
+        .call(|a| a
+            .store
+            .load_chat("save-fail")
+            .unwrap()
+            .get("claude_permission_rules")
+            .is_none())
+        .await
+        .unwrap());
+    t.stop().await;
+}
+#[tokio::test]
+async fn session_approval_without_native_suggestions_and_codex_are_unchanged() {
+    for a in [AgentKind::Codex, AgentKind::Claude] {
+        let t = Test::new().await;
+        t.create(a, "no-rules").await;
+        t.call(a, prompt("no-rules", "approval", "normal"))
+            .await
+            .unwrap();
+        let approval = pending_approval(&t, a, "no-rules").await;
+        assert_eq!(approval["canApproveForSession"], false);
+        assert_eq!(
+            approval["availableDecisions"],
+            json!(["approved", "declined", "cancel"])
+        );
+        assert!(t.call(a,json!({"type":"thread.approval.respond","threadId":"no-rules","commandId":"invalid-session","requestId":approval["requestId"],"decision":"approved_for_session"})).await.is_err());
+        t.call(a,json!({"type":"thread.approval.respond","threadId":"no-rules","commandId":"once","requestId":approval["requestId"],"decision":"approved"})).await.unwrap();
+        t.wait(a, "no-rules", "ready").await;
+        t.stop().await;
+    }
+}
+
 #[tokio::test]
 async fn approval_and_crash_are_explicit_and_never_replayed() {
     for a in [AgentKind::Codex, AgentKind::Claude] {
