@@ -121,6 +121,42 @@ async fn duplicate_profile_is_rejected_and_crash_releases_lock() {
 }
 
 #[tokio::test]
+async fn help_and_version_do_not_create_profiles_or_start_agents() {
+    use std::{process::Stdio, time::Duration};
+    let dir = tempfile::tempdir().unwrap();
+    for flag in ["--help", "-h", "--version"] {
+        let mut command =
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_remodex-connect-native"));
+        command
+            .arg(flag)
+            .current_dir(dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(0x08000000);
+        let out = tokio::time::timeout(Duration::from_secs(5), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(out.stderr.is_empty());
+        if flag == "--version" {
+            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(v["runtime"], "rust");
+            assert_eq!(v["migrationComplete"], false);
+            assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        } else {
+            assert!(String::from_utf8(out.stdout)
+                .unwrap()
+                .contains("ABSOLUTE_ISOLATED_STATE_DIR"));
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+}
+
+#[tokio::test]
 async fn failed_startup_does_not_advertise_an_invitation() {
     use std::{process::Stdio, time::Duration};
     let dir = tempfile::tempdir().unwrap();

@@ -10,6 +10,17 @@ use std::path::PathBuf;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && args[1] == "--version" {
+        println!(
+            "{}",
+            serde_json::json!({"name":"remodex-connect-native","version":env!("CARGO_PKG_VERSION"),"runtime":"rust","migrationComplete":false})
+        );
+        return Ok(());
+    }
+    if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
+        println!("Remodex native backend experiment\nUsage: remodex-connect-native ABSOLUTE_ISOLATED_STATE_DIR BIND_ADDRESS PUBLIC_URL [ISOLATED_CHAT_CONFIG_JSON [GUI_DIST_DIRECTORY]]\nUse only an isolated state directory and test agent profiles.\nThis candidate does not install a service or migrate normal data. migrationComplete=false");
+        return Ok(());
+    }
     if !(4..=6).contains(&args.len()) {
         return Err("Usage: remodex-connect-native ABSOLUTE_ISOLATED_STATE_DIR BIND_ADDRESS PUBLIC_URL [ISOLATED_CHAT_CONFIG_JSON [GUI_DIST_DIRECTORY]]\nExperimental: native pairing and bounded chat orchestration; not a production replacement.".into());
     }
