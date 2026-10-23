@@ -1216,6 +1216,41 @@ mod tests {
         f.idle().await;
         assert_eq!(controls(&f.log()).len(), 2);
         assert_eq!(prompts(&f.log()), 2);
+        // Completed controls stay as durable receipts. They must not block
+        // an otherwise idle bridge setting change (caught on the real phone).
+        let before_disable = f.thread().await;
+        let start = Instant::now();
+        loop {
+            match f
+                .hub
+                .send_request(
+                    AgentKind::Claude,
+                    "dashboard",
+                    "native.configureClaude",
+                    json!({"enabled":false}),
+                )
+                .await
+            {
+                Ok(_) => break,
+                Err(e)
+                    if e.starts_with("Wait for agent setup")
+                        && start.elapsed() < Duration::from_secs(5) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(30)).await
+                }
+                Err(e) => panic!("completed receipt blocked setup: {e}"),
+            }
+        }
+        assert_eq!(f.thread().await["messages"], before_disable["messages"]);
+        assert_eq!(
+            prompts(&f.log()),
+            2,
+            "disabling must not send a prompt or interrupt the owner"
+        );
+        assert!(!f
+            .log()
+            .iter()
+            .any(|v| v["type"] == "remodex_observer_interrupt"));
         f.stop().await;
     }
 

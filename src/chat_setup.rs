@@ -70,7 +70,9 @@ impl Hub {
                         s(&c.thread["session"]["status"]),
                         "running" | "starting" | "stopping"
                     )
-                    || c.native_control.is_some()
+                    || c.native_control
+                        .as_ref()
+                        .is_some_and(|i| i.result.is_none())
                     || c.external_stop.is_some())
         }) {
             return Err("Finish Claude tasks, queued messages and pending controls before changing bridge setup".into());
