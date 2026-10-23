@@ -26,6 +26,7 @@ mod legacy_claude;
 mod legacy_claude_assets;
 mod legacy_codex;
 pub mod legacy_connection;
+mod legacy_preferences;
 pub mod migration_snapshot;
 pub mod restart_drain;
 pub mod server;

@@ -43,7 +43,7 @@ fn array<'a>(root: &'a Value, key: &str, limit: usize) -> Result<&'a [Value], St
         .ok_or_else(|| INVALID.into())
 }
 // Normalize the two historical forms without guessing conflicting aliases.
-fn options(value: &Value) -> Result<Vec<Value>, String> {
+pub(crate) fn options(value: &Value) -> Result<Vec<Value>, String> {
     let entries: Vec<(&str, &Value)> = if value.is_null() {
         vec![]
     } else if let Some(rows) = value.as_array() {

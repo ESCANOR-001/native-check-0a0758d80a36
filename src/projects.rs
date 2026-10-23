@@ -142,7 +142,7 @@ pub fn change(base: &Path, projects: &Value, c: &Value) -> Result<Value, String>
     Ok(json!(next))
 }
 
-fn validate_scripts(value: &Value) -> Result<Value, String> {
+pub(crate) fn validate_scripts(value: &Value) -> Result<Value, String> {
     let rows = value.as_array().ok_or("Project scripts must be a list")?;
     if rows.len() > 16 {
         return Err("At most 16 project scripts are supported".into());

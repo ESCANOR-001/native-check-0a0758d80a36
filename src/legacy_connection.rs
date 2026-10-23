@@ -342,7 +342,10 @@ fn has_chats(db: &rusqlite::Connection) -> Result<bool, String> {
     for name in tables {
         if matches!(
             name.as_str(),
-            "legacy_claude_import" | "legacy_claude_assets" | "legacy_codex_import"
+            "legacy_claude_import"
+                | "legacy_claude_assets"
+                | "legacy_codex_import"
+                | "legacy_preferences_import"
         ) {
             let active: bool = db.query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM {name} WHERE COALESCE(phase,'')<>'rolled-back')"), [], |r|r.get(0)
