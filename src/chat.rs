@@ -6,8 +6,6 @@ mod metadata;
 mod native_control;
 #[path = "chat_observer.rs"]
 mod observer;
-#[path = "chat_revert.rs"]
-mod revert;
 #[path = "chat_setup.rs"]
 mod setup;
 #[path = "chat_sync_recovery.rs"]
@@ -377,12 +375,6 @@ impl Chats {
                 )
             })
             .collect();
-        let pending_reverts: HashSet<String> = db
-            .call(|a| a.store.pending_reverts())
-            .await?
-            .map_err(|_| "Cannot read pending conversation reverts")?
-            .into_iter()
-            .collect();
         let restart_gate = Arc::new(AtomicU8::new(0));
         tokio::spawn(
             Hub {
@@ -401,8 +393,7 @@ impl Chats {
                 active: HashMap::new(),
                 claude_recovery,
                 shared_watches,
-                tool_controls: pending_reverts.clone(),
-                pending_reverts,
+                tool_controls: HashSet::new(),
                 confirmed_settings: None,
                 prepared_edits: HashMap::new(),
                 prepared_bootstraps: HashMap::new(),
@@ -623,7 +614,6 @@ struct PreparedBootstrap {
     target: crate::worktrees::Target,
 }
 struct Hub {
-    pending_reverts: HashSet<String>,
     tool_controls: HashSet<String>,
     /// Chat whose model/effort the shared worker has just acknowledged for
     /// the command now being dispatched (set only around that dispatch).
@@ -1079,8 +1069,6 @@ impl Hub {
         let mut worktree_jobs = tokio::task::JoinSet::new();
         let mut file_jobs = tokio::task::JoinSet::new();
         let mut edit_jobs = tokio::task::JoinSet::new();
-        let mut revert_jobs = tokio::task::JoinSet::new();
-        let mut reverting = HashSet::new();
         let mut bootstrap_jobs = tokio::task::JoinSet::new();
         let mut shared_jobs = tokio::task::JoinSet::new();
         let mut shared_reads = HashSet::new();
@@ -1214,22 +1202,6 @@ impl Hub {
                     }
                     // Check native receipts before any bootstrap/edit/job can
                     // create side effects under a reused dispatch command ID.
-                    if r.method=="orchestration.dispatchCommand" && r.params["type"]=="thread.checkpoint.revert" {
-                        let id=s(&r.params["threadId"]).to_owned();
-                        if reverting.contains(&id) || revert_jobs.len()>=2 {let _=r.reply.send(Err("Conversation revert is already being checked; retry shortly".into()));continue;}
-                        match self.prepare_revert(&r).await {
-                            Ok(crate::revert::Preparation::Complete)=>{let _=r.reply.send(Ok(json!({"sequence":self.seq})));},
-                            Ok(crate::revert::Preparation::Run(intent,deliver))=>{
-                                let intent=*intent;
-                                self.tool_controls.insert(id.clone());self.pending_reverts.insert(id.clone());reverting.insert(id.clone());
-                                let config=self.config.codex.clone();let chat=self.chats[&id].clone();let db=self.db.clone();
-                                revert_jobs.spawn(async move {let outcome=crate::revert::run(config,chat,intent.clone(),deliver,db.clone()).await;let result=crate::revert::finish(db,intent,outcome).await;(r,result)});
-                            },
-                            Err(e)=>{let _=r.reply.send(Err(e));},
-                        }
-                        continue;
-                    }
-                    if r.method=="orchestration.dispatchCommand" && self.pending_reverts.contains(s(&r.params["threadId"])) {let _=r.reply.send(Err(crate::revert::PENDING.into()));continue;}
                     if r.method=="orchestration.dispatchCommand" && r.agent==AgentKind::Claude {
                         match self.cached_native_dispatch(&r).await {
                             Ok(Some(value))=>{let _=r.reply.send(Ok(value));continue;},
@@ -1463,18 +1435,6 @@ impl Hub {
                         self.prepared_bootstraps.remove(&id);let _=r.reply.send(result);
                     }
                 },
-                Some(result)=revert_jobs.join_next(), if !revert_jobs.is_empty()=>{
-                    if let Ok((r,result))=result {
-                        let id=s(&r.params["threadId"]).to_owned();reverting.remove(&id);
-                        let pending=self.db.call(|a|a.store.pending_reverts()).await;
-                        if let Ok(Ok(pending))=pending {if !pending.contains(&id) {self.pending_reverts.remove(&id);self.tool_controls.remove(&id);}}
-                        let result=match result {
-                            Ok(chat)=>{self.chats.insert(id.clone(),chat);self.shared_watches.insert(id,(Instant::now()+Duration::from_secs(60),Instant::now()));self.dirty=true;Ok(json!({"sequence":self.seq}))},
-                            Err(e)=>Err(e),
-                        };
-                        let _=r.reply.send(result);
-                    }
-                }
                 Some(result)=edit_jobs.join_next(), if !edit_jobs.is_empty()=>{
                     if let Ok((r,result))=result {
                         let id=s(&r.params["threadId"]).to_owned();self.tool_controls.remove(&id);
@@ -1627,8 +1587,6 @@ impl Hub {
         while worktree_jobs.join_next().await.is_some() {}
         bootstrap_jobs.abort_all();
         while bootstrap_jobs.join_next().await.is_some() {}
-        revert_jobs.abort_all();
-        while revert_jobs.join_next().await.is_some() {}
         edit_jobs.abort_all();
         while edit_jobs.join_next().await.is_some() {}
         file_jobs.abort_all();
@@ -2084,10 +2042,21 @@ impl Hub {
         {
             return Err("Select a prompt with a valid history position".into());
         }
+        let latest_only = r.agent == AgentKind::Codex;
+        if latest_only && chat.thread["latestTurn"]["turnId"] != target {
+            return Err(
+                "Only the latest Codex prompt can be edited. History was not changed.".into(),
+            );
+        }
         let id = id.to_owned();
         let target = target.to_owned();
         self.db
-            .call(move |a| a.store.edit_target(&id, &target))
+            .call(move |a| {
+                if latest_only {
+                    a.store.require_latest_editable_prompt(&id, &target)?;
+                }
+                a.store.edit_target(&id, &target)
+            })
             .await?
             .map(Some)
     }
@@ -2201,7 +2170,7 @@ impl Hub {
         json!({"cwd":self.config.workspace,"keybindingsConfigPath":"","keybindings":[],"issues":[],"availableEditors":[],
         "providers":[{"instanceId":agent.instance(),"driver":agent.driver(),"displayName":title,"enabled":enabled,"installed":true,"status":if !enabled{"disabled"}else if error.is_some(){"error"}else if known{"ready"}else{"unknown"},"version":null,"auth":{"status":"unknown"},"checkedAt":now(),"availability":if enabled{"available"}else{"unavailable"},"showInteractionModeToggle":true,"message":error.map(String::as_str).unwrap_or(if known {"Model list loaded. Account access is checked when a request is sent."}else{"Checking the isolated CLI's available models..."}),"models":self.models.get(agent.instance()).cloned().unwrap_or_else(||crate::models::fallback(&p.model)),"skills":[],"plugins":[],"slashCommands":[]}],
         "settings":{"addProjectBaseDirectory":self.config.workspace,"providerInstances":{agent.instance():{"driver":agent.driver(),"displayName":title,"enabled":enabled}},"providers":{agent.driver():{"enabled":enabled}}},
-        "environment":{"capabilities":{"androidRemoteAtomicPromptEdit":true,"androidRemoteOptimisticPromptAcknowledgement":true,"androidRemoteConversationOnlyRevert":agent == AgentKind::Codex}},
+        "environment":{"capabilities":{"androidRemoteAtomicPromptEdit":true,"androidRemoteOptimisticPromptAcknowledgement":true,"androidRemoteLatestPromptEditOnly":agent==AgentKind::Codex}},
         "observability":{"logsDirectoryPath":"","localTracingEnabled":false,"otlpTracesEnabled":false,"otlpMetricsEnabled":false}})
     }
     fn shell(&self, agent: AgentKind) -> Value {
@@ -2797,6 +2766,9 @@ impl Hub {
             self.checked(agent, &id)?;
             let own = self.busy(&id);
             match s(&c["type"]) {
+                "thread.checkpoint.revert" if agent == AgentKind::Codex => {
+                    return Err("Codex supports editing the latest prompt; Revert is not available.".into());
+                }
                 "thread.turn.start" => {
                     if c["deliveryMode"]
                         .as_str()

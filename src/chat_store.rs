@@ -20,7 +20,6 @@ impl Store {
         self.db.query_row("SELECT EXISTS(SELECT 1 FROM chats c WHERE id=?1 AND agent='codex' AND json_extract(data,'$.native_id')=?2 AND json_extract(data,'$.thread.latestTurn.startedAt') IS NULL AND json_extract(data,'$.thread.session.status') IN ('error','interrupted') AND NOT EXISTS(SELECT 1 FROM native_turns WHERE chat=c.id) AND NOT EXISTS(SELECT 1 FROM chat_rows WHERE chat=c.id AND NOT (kind='activities' AND id='empty-session-recovered') AND (kind<>'messages' OR COALESCE(json_extract(data,'$.role'),'')<>'user')))",params![id,native],|r|r.get(0))
     }
     pub fn init_chats(&mut self) -> rusqlite::Result<()> {
-        self.init_reverts()?;
         self.init_claude_outbox()?;
         self.db.execute_batch("CREATE TABLE IF NOT EXISTS chats (id TEXT PRIMARY KEY, agent TEXT NOT NULL, data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS chat_commands (id TEXT PRIMARY KEY, digest TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS chat_rows (seq INTEGER PRIMARY KEY AUTOINCREMENT, chat TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL, turn TEXT, data TEXT NOT NULL, UNIQUE(chat,kind,id));

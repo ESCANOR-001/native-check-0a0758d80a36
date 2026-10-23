@@ -15,334 +15,6 @@ struct Test {
     config: Config,
     hub: Chats,
 }
-
-async fn revert_fixture() -> (Test, Value, Value) {
-    let t = Test::new().await;
-    t.create(AgentKind::Codex, "revert").await;
-    let mut turns = Vec::new();
-    for text in ["retain-first", "remove-second", "remove-third"] {
-        t.call(AgentKind::Codex, prompt("revert", text, "normal"))
-            .await
-            .unwrap();
-        let detail = t.wait(AgentKind::Codex, "revert", "ready").await;
-        turns.push(detail["latestTurn"]["turnId"].as_str().unwrap().to_owned());
-    }
-    let db = rusqlite::Connection::open(t.dir.path().join("native-connect.sqlite")).unwrap();
-    for (i, public) in turns.iter().enumerate() {
-        db.execute(
-            "UPDATE native_turns SET native=?2 WHERE chat='revert' AND turn=?1",
-            rusqlite::params![public, format!("native-{i}")],
-        )
-        .unwrap();
-    }
-    let native = json!([{"id":"native-0","status":"completed"},{"id":"native-1","status":"completed"},{"id":"native-2","status":"completed"}]);
-    std::fs::write(
-        t.dir.path().join("revert-fixture-turns.json"),
-        native.to_string(),
-    )
-    .unwrap();
-    let before = t.detail(AgentKind::Codex, "revert").await;
-    let command = json!({"type":"thread.checkpoint.revert","threadId":"revert","commandId":"revert-command","turnCount":1,"targetTurnId":turns[1]});
-    (t, command, before)
-}
-
-fn revert_calls(t: &Test) -> usize {
-    std::fs::read_to_string(t.dir.path().join("revert-fixture-calls.jsonl"))
-        .unwrap_or_default()
-        .lines()
-        .count()
-}
-
-#[tokio::test]
-async fn conversation_revert_verifies_a_large_retained_prefix_without_collecting_it() {
-    let (t, command, _) = revert_fixture().await;
-    // Only the suffix needs a bounded ID plan. Verifying absence must also
-    // succeed when the retained native prefix is larger than that plan limit.
-    let mut turns: Vec<Value> = (0..16400)
-        .map(|i| json!({"id":format!("retained-{i}"),"status":"completed"}))
-        .collect();
-    turns.extend([
-        json!({"id":"native-0"}),
-        json!({"id":"native-1"}),
-        json!({"id":"native-2"}),
-    ]);
-    std::fs::write(
-        t.dir.path().join("revert-fixture-turns.json"),
-        serde_json::to_vec(&turns).unwrap(),
-    )
-    .unwrap();
-    t.call(AgentKind::Codex, command).await.unwrap();
-    assert_eq!(revert_calls(&t), 1);
-    let native: Vec<Value> = serde_json::from_slice(
-        &std::fs::read(t.dir.path().join("revert-fixture-turns.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(native.len(), 16401);
-    assert_eq!(native, turns[..16401]);
-    let after = t.detail(AgentKind::Codex, "revert").await;
-    assert!(after["messages"].to_string().contains("retain-first"));
-    assert!(!after["messages"].to_string().contains("remove-second"));
-    t.stop().await;
-}
-
-#[tokio::test]
-async fn conversation_revert_keeps_earlier_turns_that_were_backfilled_late() {
-    let (t, command, _) = revert_fixture().await;
-    let db = rusqlite::Connection::open(t.dir.path().join("native-connect.sqlite")).unwrap();
-    let first: String = db
-        .query_row(
-            "SELECT turn FROM native_turns WHERE chat='revert' AND native='native-0'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let row = json!({"id":"late-earlier-message","turnId":first,"role":"assistant","text":"EARLIER_DESKTOP_REPLY","createdAt":"2026-01-01T00:00:00Z","streaming":false});
-    db.execute("INSERT INTO chat_rows(chat,kind,id,turn,data) VALUES('revert','messages','late-earlier-message',?1,?2)",rusqlite::params![first,row.to_string()]).unwrap();
-    t.call(AgentKind::Codex, command).await.unwrap();
-    let after = t.detail(AgentKind::Codex, "revert").await;
-    assert!(after["messages"]
-        .to_string()
-        .contains("EARLIER_DESKTOP_REPLY"));
-    assert!(!after["messages"].to_string().contains("remove-second"));
-    assert!(db
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM native_turns WHERE chat='revert' AND native='native-0')",
-            [],
-            |r| r.get::<_, bool>(0)
-        )
-        .unwrap());
-    t.stop().await;
-}
-
-#[tokio::test]
-async fn conversation_revert_preserves_native_identity_revision_prefix_and_idempotence() {
-    let (mut t, command, before) = revert_fixture().await;
-    let db = rusqlite::Connection::open(t.dir.path().join("native-connect.sqlite")).unwrap();
-    let native: String = db
-        .query_row(
-            "SELECT json_extract(data,'$.native_id') FROM chats WHERE id='revert'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    t.call(AgentKind::Codex, command.clone()).await.unwrap();
-    let after = t.detail(AgentKind::Codex, "revert").await;
-    let resumes =
-        std::fs::read_to_string(t.dir.path().join("revert-fixture-resumes.jsonl")).unwrap();
-    let resumes: Vec<Value> = resumes
-        .lines()
-        .map(|v| serde_json::from_str(v).unwrap())
-        .collect();
-    assert_eq!(
-        resumes,
-        vec![json!({"threadId":native,"excludeTurns":true})]
-    );
-    assert!(after["messages"].to_string().contains("retain-first"));
-    assert!(!after["messages"].to_string().contains("remove-second"));
-    assert!(!after["messages"].to_string().contains("remove-third"));
-    let retained: Vec<Value> = before["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|m| m["turnId"] == before["messages"][0]["turnId"])
-        .cloned()
-        .collect();
-    assert_eq!(after["messages"], json!(retained));
-    assert_eq!(
-        db.query_row(
-            "SELECT json_extract(data,'$.native_id') FROM chats WHERE id='revert'",
-            [],
-            |r| r.get::<_, String>(0)
-        )
-        .unwrap(),
-        native
-    );
-    let revision: String = db
-        .query_row(
-            "SELECT id FROM chat_revisions WHERE source='revert'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let saved: Vec<String> = db
-        .prepare("SELECT data FROM chat_rows WHERE chat=?1 AND kind='messages' ORDER BY seq")
-        .unwrap()
-        .query_map([revision], |r| r.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(saved.len(), before["messages"].as_array().unwrap().len());
-    assert!(saved.iter().any(|r| r.contains("remove-third")));
-    t.call(AgentKind::Codex, command.clone()).await.unwrap();
-    t.stop().await;
-    t.hub = Chats::start(t.db.clone(), t.config.clone()).await.unwrap();
-    t.call(AgentKind::Codex, command.clone()).await.unwrap();
-    assert_eq!(revert_calls(&t), 1);
-    let mut reused = command.clone();
-    reused["turnCount"] = json!(0);
-    assert!(t.call(AgentKind::Codex, reused).await.is_err());
-    t.call(AgentKind::Codex, prompt("revert", "after-revert", "normal"))
-        .await
-        .unwrap();
-    let end = t.wait(AgentKind::Codex, "revert", "ready").await;
-    assert!(end["messages"].to_string().contains("after-revert"));
-    assert_eq!(
-        db.query_row(
-            "SELECT json_extract(data,'$.native_id') FROM chats WHERE id='revert'",
-            [],
-            |r| r.get::<_, String>(0)
-        )
-        .unwrap(),
-        native
-    );
-    t.stop().await;
-}
-
-#[tokio::test]
-async fn conversation_revert_lost_reply_or_local_commit_recovers_without_native_replay() {
-    for mode in ["revert-fixture-lose-after", "local-commit-failure"] {
-        let (mut t, command, before) = revert_fixture().await;
-        let db = rusqlite::Connection::open(t.dir.path().join("native-connect.sqlite")).unwrap();
-        if mode == "local-commit-failure" {
-            db.execute_batch("CREATE TRIGGER fail_revert_delete BEFORE DELETE ON chat_rows BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
-        } else {
-            std::fs::write(t.dir.path().join(mode), "").unwrap();
-        }
-        assert!(t.call(AgentKind::Codex, command.clone()).await.is_err());
-        assert_eq!(
-            t.detail(AgentKind::Codex, "revert").await["messages"],
-            before["messages"]
-        );
-        assert!(t
-            .call(
-                AgentKind::Codex,
-                prompt("revert", "must-not-send", "normal")
-            )
-            .await
-            .unwrap_err()
-            .contains("not confirmed"));
-        assert_eq!(revert_calls(&t), 1);
-        t.stop().await;
-        if mode == "local-commit-failure" {
-            db.execute_batch("DROP TRIGGER fail_revert_delete").unwrap();
-        }
-        t.hub = Chats::start(t.db.clone(), t.config.clone()).await.unwrap();
-        assert!(t
-            .call(AgentKind::Codex, prompt("revert", "must-not-send", "queue"))
-            .await
-            .unwrap_err()
-            .contains("not confirmed"));
-        let mut retry = command;
-        retry["commandId"] = json!("check-revert-after-restart");
-        t.call(AgentKind::Codex, retry).await.unwrap();
-        assert_eq!(revert_calls(&t), 1);
-        assert!(!t.detail(AgentKind::Codex, "revert").await["messages"]
-            .to_string()
-            .contains("remove-second"));
-        assert_eq!(
-            db.query_row(
-                "SELECT count(*) FROM chat_revisions WHERE source='revert'",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            1
-        );
-        t.stop().await;
-    }
-}
-
-#[tokio::test]
-async fn conversation_revert_never_replays_an_unconfirmed_request_with_target_still_present() {
-    let (mut t, command, before) = revert_fixture().await;
-    std::fs::write(t.dir.path().join("revert-fixture-lose-before"), "").unwrap();
-    assert!(t
-        .call(AgentKind::Codex, command.clone())
-        .await
-        .unwrap_err()
-        .contains("not confirmed"));
-    t.stop().await;
-    t.hub = Chats::start(t.db.clone(), t.config.clone()).await.unwrap();
-    assert!(t
-        .call(AgentKind::Codex, command)
-        .await
-        .unwrap_err()
-        .contains("not confirmed"));
-    assert_eq!(revert_calls(&t), 1);
-    assert_eq!(
-        t.detail(AgentKind::Codex, "revert").await["messages"],
-        before["messages"]
-    );
-    t.stop().await;
-}
-
-#[tokio::test]
-async fn conversation_revert_refuses_native_busy_unsupported_and_failed_backup_without_history_changes(
-) {
-    for mode in [
-        "revert-fixture-native-busy",
-        "revert-fixture-goal",
-        "reject-fixture-revert",
-        "backup-failure",
-    ] {
-        let (t, command, before) = revert_fixture().await;
-        let db = rusqlite::Connection::open(t.dir.path().join("native-connect.sqlite")).unwrap();
-        if mode == "backup-failure" {
-            db.execute_batch("CREATE TRIGGER fail_revert_backup BEFORE INSERT ON native_reverts BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
-        } else {
-            std::fs::write(t.dir.path().join(mode), "").unwrap();
-        }
-        assert!(t.call(AgentKind::Codex, command.clone()).await.is_err());
-        assert!(t.call(AgentKind::Codex, command).await.is_err());
-        assert_eq!(
-            t.detail(AgentKind::Codex, "revert").await["messages"],
-            before["messages"]
-        );
-        assert_eq!(
-            revert_calls(&t),
-            usize::from(mode == "reject-fixture-revert")
-        );
-        if mode != "reject-fixture-revert" {
-            assert!(!t.dir.path().join("revert-fixture-resumes.jsonl").exists());
-        }
-        assert_eq!(
-            db.query_row(
-                "SELECT count(*) FROM native_reverts WHERE phase='pending'",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            0
-        );
-        t.stop().await;
-    }
-}
-
-#[tokio::test]
-async fn conversation_revert_count_compatibility_noop_receipt_and_agent_scope() {
-    let (t, mut command, _) = revert_fixture().await;
-    command.as_object_mut().unwrap().remove("targetTurnId");
-    command["turnCount"] = json!(3);
-    t.call(AgentKind::Codex, command.clone()).await.unwrap();
-    t.call(AgentKind::Codex, prompt("revert", "must-remain", "normal"))
-        .await
-        .unwrap();
-    t.wait(AgentKind::Codex, "revert", "ready").await;
-    t.call(AgentKind::Codex, command.clone()).await.unwrap();
-    assert_eq!(revert_calls(&t), 0);
-    assert!(t.detail(AgentKind::Codex, "revert").await["messages"]
-        .to_string()
-        .contains("must-remain"));
-    command["commandId"] = json!("revert-count-one");
-    command["turnCount"] = json!(1);
-    assert!(t.call(AgentKind::Claude, command.clone()).await.is_err());
-    t.call(AgentKind::Codex, command).await.unwrap();
-    assert_eq!(revert_calls(&t), 1);
-    let end = t.detail(AgentKind::Codex, "revert").await;
-    assert!(end["messages"].to_string().contains("retain-first"));
-    assert!(!end["messages"].to_string().contains("remove-second"));
-    t.stop().await;
-}
 impl Test {
     async fn hosted() -> Self {
         let mut test = Self::new().await;
@@ -4518,8 +4190,10 @@ async fn prompt_edit_preserves_a_revision_and_retries_without_reediting() {
             .unwrap();
         let second = t.wait(a, "edit", "ready").await;
         let target = second["latestTurn"]["turnId"].clone();
-        t.call(a, prompt("edit", "many", "normal")).await.unwrap();
-        t.wait_bulk_history(a, "edit").await;
+        if a == AgentKind::Claude {
+            t.call(a, prompt("edit", "many", "normal")).await.unwrap();
+            t.wait_bulk_history(a, "edit").await;
+        }
         let db = rusqlite::Connection::open(t.dir.path().join("native-connect.sqlite")).unwrap();
         let raw: String = db
             .query_row("SELECT data FROM chats WHERE id='edit'", [], |r| r.get(0))
@@ -4605,6 +4279,90 @@ async fn prompt_edit_preserves_a_revision_and_retries_without_reediting() {
         t.stop().await;
     }
 }
+#[tokio::test]
+async fn codex_rejects_revert_and_older_prompt_edits_without_changing_history() {
+    let t = Test::new().await;
+    let a = AgentKind::Codex;
+    t.create(a, "latest-edit").await;
+    t.call(a, prompt("latest-edit", "first", "normal"))
+        .await
+        .unwrap();
+    let first = t.wait(a, "latest-edit", "ready").await;
+    t.call(a, prompt("latest-edit", "second", "normal"))
+        .await
+        .unwrap();
+    let before = t.wait(a, "latest-edit", "ready").await;
+    let mut edit = prompt("latest-edit", "replacement", "normal");
+    edit["promptEdit"] = json!({"targetTurnId":first["latestTurn"]["turnId"],"turnCount":0});
+    assert!(t
+        .call(a, edit)
+        .await
+        .unwrap_err()
+        .contains("Only the latest Codex prompt"));
+    assert!(t.call(a,json!({"type":"thread.checkpoint.revert","commandId":"revert","threadId":"latest-edit","turnCount":0})).await.unwrap_err().contains("Revert is not available"));
+    assert_eq!(
+        t.detail(a, "latest-edit").await["messages"],
+        before["messages"]
+    );
+    assert!(!t.dir.path().join("fixture-forks.jsonl").exists());
+    let db = rusqlite::Connection::open(t.dir.path().join("native-connect.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM chat_revisions", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    for agent in [AgentKind::Codex, AgentKind::Claude] {
+        let config = t
+            .hub
+            .call(agent, "phone", "server.getConfig", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            config["environment"]["capabilities"]["androidRemoteLatestPromptEditOnly"],
+            agent == AgentKind::Codex
+        );
+    }
+    t.stop().await;
+}
+
+#[tokio::test]
+async fn codex_edit_refuses_a_newer_native_prompt_before_or_during_preparation() {
+    for marker in ["edit-native-advanced", "edit-advance-during-fork"] {
+        let t = Test::new().await;
+        let a = AgentKind::Codex;
+        t.create(a, "edit-race").await;
+        t.call(a, prompt("edit-race", "first", "normal"))
+            .await
+            .unwrap();
+        let before = t.wait(a, "edit-race", "ready").await;
+        std::fs::write(t.dir.path().join(marker), "").unwrap();
+        let mut edit = prompt("edit-race", "replacement", "normal");
+        edit["promptEdit"] = json!({"targetTurnId":before["latestTurn"]["turnId"],"turnCount":0});
+        assert!(t
+            .call(a, edit)
+            .await
+            .unwrap_err()
+            .contains("conversation changed"));
+        assert_eq!(
+            t.detail(a, "edit-race").await["messages"],
+            before["messages"]
+        );
+        let db = rusqlite::Connection::open(t.dir.path().join("native-connect.sqlite")).unwrap();
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM chat_revisions", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            t.dir.path().join("fixture-forks.jsonl").exists(),
+            marker == "edit-advance-during-fork"
+        );
+        t.stop().await;
+    }
+}
+
 #[tokio::test]
 async fn rejected_or_busy_prompt_edits_leave_history_unchanged() {
     let t = Test::new().await;

@@ -253,39 +253,24 @@ async fn first_pairing_recovers_a_lost_exchange_and_opens_its_first_socket() {
         app.environment_id
     );
     assert_eq!(
-        reply["result"]["environment"]["capabilities"]["androidRemoteConversationOnlyRevert"],
+        reply["result"]["environment"]["capabilities"]["androidRemoteLatestPromptEditOnly"],
         true
     );
-    ws.close(None).await.unwrap();
-    let (_, ticket) = request(
-        app.clone().router(),
-        "/api/auth/websocket-ticket",
-        Some(token),
-        Some(String::new()),
-    )
-    .await;
-    let (mut claude, _) = tokio_tungstenite::connect_async(format!(
-        "ws://{address}/ws?agent=claude-code&wsTicket={}",
-        ticket["ticket"].as_str().unwrap()
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        json!({"id":"subscribe","method":"subscribeServerConfig"})
+            .to_string()
+            .into(),
     ))
     .await
     .unwrap();
-    claude
-        .send(tokio_tungstenite::tungstenite::Message::Text(
-            json!({"id":"claude-config","method":"subscribeServerConfig"})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .unwrap();
-    let reply: Value =
-        serde_json::from_str(claude.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    let event: Value =
+        serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
     assert_eq!(
-        reply["event"]["config"]["environment"]["capabilities"]
-            ["androidRemoteConversationOnlyRevert"],
-        false
+        event["event"]["config"]["environment"]["capabilities"]
+            ["androidRemoteLatestPromptEditOnly"],
+        true
     );
-    claude.close(None).await.unwrap();
+    ws.close(None).await.unwrap();
     server.abort();
     chats
         .call(AgentKind::Codex, "local", "native.shutdown", json!({}))

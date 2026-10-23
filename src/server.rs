@@ -661,7 +661,7 @@ async fn native_reply(
         Ok(mut value) => {
             if method == "server.getConfig" || method == "subscribeServerConfig" {
                 value["environment"] = environment_descriptor(app);
-                value["environment"]["capabilities"]["androidRemoteConversationOnlyRevert"] =
+                value["environment"]["capabilities"]["androidRemoteLatestPromptEditOnly"] =
                     json!(agent == AgentKind::Codex);
                 value["auth"] = descriptor();
                 value["remodexMobileConnection"] = app.connection_state();

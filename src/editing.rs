@@ -25,6 +25,30 @@ pub(crate) struct Prepared {
     pub fork: Option<crate::branches::Fork>,
 }
 impl Store {
+    pub(crate) fn require_latest_editable_prompt(
+        &self,
+        chat: &str,
+        target: &str,
+    ) -> Result<(), String> {
+        // A steer belongs to the same turn but cannot replace its initial prompt.
+        // Use all persisted rows, not only the phone's current history page.
+        let latest: Option<(String, String)> = self.db.query_row(
+            "SELECT turn, COALESCE(json_extract(data,'$.phase'),'') FROM chat_rows WHERE chat=?1 AND kind='messages' AND json_extract(data,'$.role')='user' ORDER BY seq DESC LIMIT 1",
+            [chat], |r| Ok((r.get(0)?, r.get(1)?))
+        ).optional().map_err(|_| "Cannot verify the latest prompt")?;
+        let count: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM chat_rows WHERE chat=?1 AND kind='messages' AND turn=?2 AND json_extract(data,'$.role')='user'",
+            params![chat,target], |r| r.get(0)
+        ).map_err(|_| "Cannot verify the latest prompt")?;
+        if latest
+            .as_ref()
+            .is_none_or(|(turn, phase)| turn != target || phase == "steering")
+            || count != 1
+        {
+            return Err("Only the latest Codex prompt can be edited; steering messages cannot be edited. History was not changed.".into());
+        }
+        Ok(())
+    }
     pub(crate) fn native_turn(&self, chat: &str, turn: &str, native: &str) -> rusqlite::Result<()> {
         if turn.is_empty() || native.is_empty() || native.len() > 128 {
             return Err(rusqlite::Error::InvalidQuery);
@@ -207,6 +231,25 @@ async fn rpc(c: &mut Connection, method: &str, params: Value) -> Result<Value, S
     }
     Err("Edit preparation disconnected; the original history is intact".into())
 }
+async fn verify_codex_head(c: &mut Connection, chat: &str, target: &str) -> Result<(), String> {
+    let page = rpc(
+        c,
+        "thread/turns/list",
+        json!({"threadId":chat,"limit":1,"sortDirection":"desc","itemsView":"notLoaded"}),
+    )
+    .await?;
+    let turn = page["data"]
+        .as_array()
+        .filter(|a| a.len() == 1)
+        .and_then(|a| a.first())
+        .ok_or("Cannot verify the latest native prompt; history was not changed")?;
+    if turn["id"] != target || !["completed", "interrupted", "failed"].contains(&s(&turn["status"]))
+    {
+        return Err("The Codex conversation changed or is still running. Refresh it before editing the latest prompt; history was not changed.".into());
+    }
+    Ok(())
+}
+
 pub(crate) async fn prepare(
     config: AgentConfig,
     chat: Chat,
@@ -244,8 +287,12 @@ pub(crate) async fn prepare(
     let result=tokio::time::timeout(Duration::from_secs(25),async{
         rpc(&mut c,"initialize",json!({"clientInfo":{"name":"remodex_native_edit","version":"0.0.0"},"capabilities":{"experimentalApi":true}})).await?;
         c.send(&json!({"method":"initialized","params":{}})).await.map_err(|_|"Edit preparation disconnected")?;
+        verify_codex_head(&mut c,&chat.native_id,&target.native).await?;
         let value=rpc(&mut c,"thread/fork",json!({"threadId":chat.native_id,"beforeTurnId":target.native,"excludeTurns":true,"deferGoalContinuation":true,"cwd":chat.thread["worktreePath"],"model":chat.thread["modelSelection"]["model"],"approvalPolicy":"on-request","sandbox":"workspace-write"})).await?;
         let native=s(&value["thread"]["id"]);if native.is_empty()||native.len()>128||native==chat.native_id {return Err("CLI did not create a separate editable history".into());}
+        // A remote client may send while the fork is being prepared. Do not
+        // replace the Android history if that moved the source conversation on.
+        verify_codex_head(&mut c,&chat.native_id,&target.native).await?;
         Ok(Prepared{target,native:native.into(),fork:None})
     }).await.unwrap_or_else(|_|Err("Edit preparation timed out; the original history is intact".into()));
     c.close().await;
