@@ -73,7 +73,15 @@ pub(crate) fn verify(db: &rusqlite::Connection, id: &str) -> Result<(), String> 
             |r| r.get(0),
         )
         .map_err(|_| INVALID)?;
-    let wanted = expected(&raw, &hash)?;
+    let mut wanted = expected(&raw, &hash)?;
+    let before: i64 = db
+        .query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM chat_rows WHERE chat=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .map_err(|_| INVALID)?;
+    wanted.projection = crate::claude_history::relink_projection(&Value::Null, before)?;
     let encoded = serde_json::to_string(&wanted).map_err(|_| INVALID)?;
     if encoded != cursor {
         return Err(INVALID.into());
@@ -110,7 +118,16 @@ pub(crate) fn rollback(db: &rusqlite::Connection, id: &str) -> Result<(), String
 impl Store {
     pub fn prepare_legacy_claude_resume(&mut self, id: &str) -> Result<Value, String> {
         let p = self.legacy_claude_prepared(id)?;
-        let source = expected(&p.source, &p.hash)?;
+        let mut source = expected(&p.source, &p.hash)?;
+        let before: i64 = self
+            .db
+            .query_row(
+                "SELECT COALESCE(MAX(seq),0) FROM chat_rows WHERE chat=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(|_| INVALID)?;
+        source.projection = crate::claude_history::relink_projection(&Value::Null, before)?;
         let cursor = serde_json::to_string(&source).map_err(|_| INVALID)?;
         self.check_history(cursor.len() as u64 * 3 + 65536)?;
         self.db.execute_batch("CREATE TABLE IF NOT EXISTS legacy_claude_resume(chat TEXT PRIMARY KEY,source_hash TEXT NOT NULL,cursor TEXT NOT NULL,phase TEXT NOT NULL);").map_err(|_|INVALID)?;

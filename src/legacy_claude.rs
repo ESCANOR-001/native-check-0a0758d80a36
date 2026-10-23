@@ -399,6 +399,7 @@ impl Store {
             verify(&tx, &p, &self.directory)?;
             crate::legacy_claude_assets::rollback(&tx, id)?;
             crate::legacy_claude_resume::rollback(&tx, id)?;
+            crate::legacy_claude_bindings::rollback(&tx, id)?;
             for table in ["chat_rows", "native_checkpoints", "tool_images"] {
                 tx.execute(&format!("DELETE FROM {table} WHERE chat=?1"), [id])
                     .map_err(|_| INVALID)?;
@@ -440,6 +441,7 @@ impl Store {
 }
 fn verify_inactive(db: &rusqlite::Connection, id: &str) -> Result<(), String> {
     crate::legacy_claude_resume::verify(db, id)?;
+    crate::legacy_claude_bindings::verify(db, id)?;
     for table in ["native_turns", "claude_outbox"] {
         let present: bool = db
             .query_row(

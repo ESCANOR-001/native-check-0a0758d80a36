@@ -63,6 +63,20 @@ impl Store {
             }
             return Ok(false);
         }
+        if crate::legacy_claude_bindings::reserved(
+            &tx,
+            chat,
+            session,
+            &input.native,
+            &input.message,
+        )
+        .map_err(|_| "Legacy prompt mappings unavailable")?
+        {
+            return Err(
+                "This input belongs to the previous bridge history; it was not offered again"
+                    .into(),
+            );
+        }
         let pending:i64=tx.query_row("SELECT count(*) FROM claude_outbox WHERE chat=?1 AND session=?2 AND state IN ('offered','consumed')",params![chat,session],|r|r.get(0)).map_err(|_|"Prompt store unavailable")?;
         if pending >= 64 {
             return Err(
@@ -80,7 +94,11 @@ impl Store {
         session: &str,
         native: &str,
     ) -> rusqlite::Result<Option<Record>> {
-        self.db.query_row("SELECT message,turn,steer,state FROM claude_outbox WHERE chat=?1 AND session=?2 AND native=?3",params![chat,session,native],|r|Ok(Record{input:Input{native:native.into(),message:r.get(0)?,public_turn:r.get(1)?,local:true,steer:r.get(2)?},state:r.get(3)?})).optional()
+        let native_record = self.db.query_row("SELECT message,turn,steer,state FROM claude_outbox WHERE chat=?1 AND session=?2 AND native=?3",params![chat,session,native],|r|Ok(Record{input:Input{native:native.into(),message:r.get(0)?,public_turn:r.get(1)?,local:true,steer:r.get(2)?},state:r.get(3)?})).optional()?;
+        if native_record.is_some() {
+            return Ok(native_record);
+        }
+        crate::legacy_claude_bindings::lookup(&self.db, chat, session, native)
     }
     /// Only call on a verified worker frame, never another observer's claims.
     pub fn acknowledge_claude_input(

@@ -345,6 +345,8 @@ fn has_chats(db: &rusqlite::Connection) -> Result<bool, String> {
             "legacy_claude_import"
                 | "legacy_claude_assets"
                 | "legacy_claude_resume"
+                | "legacy_claude_bindings"
+                | "legacy_claude_binding_import"
                 | "legacy_codex_import"
                 | "legacy_preferences_import"
         ) {
