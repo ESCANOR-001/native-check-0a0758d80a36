@@ -115,11 +115,21 @@ fn main() {
             match v["method"].as_str().unwrap_or("") {
                 "initialize" => out(json!({"id":v["id"],"result":{}})),
                 "model/list" => out(
-                    json!({"id":v["id"],"result":{"data":[{"model":"test","displayName":"Test model","supportedReasoningEfforts":[{"reasoningEffort":"high"},{"reasoningEffort":"low"}]}]}}),
+                    json!({"id":v["id"],"result":{"data":[{"model":"test","displayName":"Test model","supportedReasoningEfforts":[{"reasoningEffort":"high"},{"reasoningEffort":"low"}],"serviceTiers":[{"id":"priority","name":"Fast","description":"Fixture speed"}]}]}}),
                 ),
-                "thread/start" | "thread/resume" => out(
-                    json!({"id":v["id"],"result":{"thread":{"id":v["params"]["threadId"].as_str().filter(|s|!s.is_empty()).unwrap_or("native-fixture-thread")}}}),
-                ),
+                "thread/start" | "thread/resume" => {
+                    if std::path::Path::new("service-tier-log-enabled").exists() {
+                        let mut log = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("fixture-tier-requests.jsonl")
+                            .unwrap();
+                        writeln!(log, "{v}").unwrap();
+                    }
+                    out(
+                        json!({"id":v["id"],"result":{"thread":{"id":v["params"]["threadId"].as_str().filter(|s|!s.is_empty()).unwrap_or("native-fixture-thread")}}}),
+                    );
+                }
                 "thread/turns/list" => {
                     assert_eq!(v["params"]["sortDirection"], "desc");
                     assert_eq!(v["params"]["limit"], 1);

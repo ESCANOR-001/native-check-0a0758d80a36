@@ -3977,11 +3977,13 @@ impl Hub {
                         chat.thread["hasPendingUserInput"] = json!(false);
                     }
                 }
-                if let Some(model) = result["model"]
+                if result["model"]
                     .as_str()
                     .filter(|s| !s.is_empty() && s.len() < 256)
+                    .is_some()
                 {
-                    chat.thread["modelSelection"] = json!({"instanceId":"codex","model":model,"options":result["reasoningEffort"].as_str().map(|effort|vec![json!({"id":"effort","value":effort})]).unwrap_or_default()});
+                    chat.thread["modelSelection"] =
+                        crate::models::codex_ack(&chat.thread["modelSelection"], result);
                 }
                 if let Some(mode) = result["collaborationMode"]["mode"]
                     .as_str()
@@ -4441,11 +4443,14 @@ impl Hub {
                     s(&chat.pending_message["text"]).chars().take(120).collect(),
                 );
             }
-            let request = if codex {
+            let mut request = if codex {
                 json!({"id":"turn","method":"turn/start","params":{"threadId":chat.native_id,"clientUserMessageId":chat.pending_message["messageId"],"input":input,"model":chat.thread["modelSelection"]["model"],"effort":crate::models::effort(&chat.thread["modelSelection"]),"collaborationMode":{"mode":chat.thread["interactionMode"],"settings":{"model":chat.thread["modelSelection"]["model"],"reasoning_effort":crate::models::effort(&chat.thread["modelSelection"]),"developer_instructions":null}}}})
             } else {
                 json!({"type":"user","uuid":w.last_prompt,"session_id":chat.native_id,"parent_tool_use_id":null,"message":{"role":"user","content":input}})
             };
+            if codex {
+                crate::models::codex_tier(&mut request["params"], &chat.thread["modelSelection"]);
+            }
             // Persist the native session identity before offering a prompt.
             let data = serde_json::to_value(&*chat).unwrap();
             self.db
@@ -5175,7 +5180,9 @@ impl Hub {
     }
 }
 fn codex_thread_request(chat: &Chat) -> Value {
-    json!({"id":"thread","method":if chat.native_id.is_empty(){"thread/start"}else{"thread/resume"},"params":{"cwd":chat.thread["worktreePath"],"model":chat.thread["modelSelection"]["model"],"approvalPolicy":if chat.thread["runtimeMode"]=="full-access" {"never"}else{"on-request"},"sandbox":if chat.thread["runtimeMode"]=="full-access" {"danger-full-access"}else{"workspace-write"},"threadId":chat.native_id,"excludeTurns":true}})
+    let mut request = json!({"id":"thread","method":if chat.native_id.is_empty(){"thread/start"}else{"thread/resume"},"params":{"cwd":chat.thread["worktreePath"],"model":chat.thread["modelSelection"]["model"],"approvalPolicy":if chat.thread["runtimeMode"]=="full-access" {"never"}else{"on-request"},"sandbox":if chat.thread["runtimeMode"]=="full-access" {"danger-full-access"}else{"workspace-write"},"threadId":chat.native_id,"excludeTurns":true}});
+    crate::models::codex_tier(&mut request["params"], &chat.thread["modelSelection"]);
+    request
 }
 fn claude_permission(chat: &Chat) -> &'static str {
     match (

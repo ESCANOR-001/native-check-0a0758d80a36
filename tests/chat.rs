@@ -4331,6 +4331,78 @@ async fn chat_settings_are_retained_and_reach_each_cli() {
 }
 
 #[tokio::test]
+async fn codex_service_tier_reaches_start_resume_and_turn_and_survives_restart() {
+    let mut t = Test::new().await;
+    let a = AgentKind::Codex;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let config = t
+                .hub
+                .call(a, "phone", "server.getConfig", json!({}))
+                .await
+                .unwrap();
+            if config["providers"][0]["models"][0]["capabilities"]["optionDescriptors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["id"] == "serviceTier")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let selected = json!({"instanceId":"codex","model":"test","options":[{"id":"effort","value":"high"},{"id":"serviceTier","value":"priority"}]});
+    t.call(a,json!({"type":"thread.create","commandId":"tier-create","threadId":"tier","projectId":"native-test-project","modelSelection":selected})).await.unwrap();
+    let root = PathBuf::from(t.detail(a, "tier").await["worktreePath"].as_str().unwrap());
+    std::fs::write(root.join("service-tier-log-enabled"), b"fixture").unwrap();
+    for (i, tier) in ["priority", "priority", "default"].into_iter().enumerate() {
+        if i == 1 {
+            t.stop().await;
+            t.hub = Chats::start(t.db.clone(), t.config.clone()).await.unwrap();
+            assert_eq!(t.detail(a, "tier").await["modelSelection"], selected);
+        }
+        if i == 2 {
+            t.call(a,json!({"type":"thread.meta.update","commandId":"standard","threadId":"tier","modelSelection":{"model":"test","options":[{"id":"effort","value":"high"},{"id":"serviceTier","value":"standard"}]}})).await.unwrap();
+        }
+        let mut command = prompt("tier", "settings", "normal");
+        command["commandId"] = json!(format!("tier-prompt-{i}"));
+        command["message"]["messageId"] = json!(format!("tier-message-{i}"));
+        t.call(a, command).await.unwrap();
+        let done = t.wait(a, "tier", "ready").await;
+        let last = done["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "assistant")
+            .unwrap();
+        let params: Value = serde_json::from_str(last["text"].as_str().unwrap()).unwrap();
+        assert_eq!(params["serviceTier"], tier);
+        assert_eq!(params["effort"], "high");
+        let log = std::fs::read_to_string(root.join("fixture-tier-requests.jsonl")).unwrap();
+        let requests: Vec<Value> = log
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(requests.len(), i + 1);
+        assert_eq!(requests[i]["params"]["serviceTier"], tier);
+        assert_eq!(
+            requests[i]["method"],
+            if i == 0 {
+                "thread/start"
+            } else {
+                "thread/resume"
+            }
+        );
+        assert_eq!(done["modelSelection"]["options"][1]["value"], tier);
+    }
+    t.stop().await;
+}
+
+#[tokio::test]
 async fn storage_pressure_stops_owned_workers_preserves_queue_and_rejects_new_prompts() {
     use remodex_connect_native::storage::Limits;
     for a in [AgentKind::Codex, AgentKind::Claude] {
