@@ -90,7 +90,7 @@ pub(crate) fn options(value: &Value) -> Result<Vec<Value>, String> {
         .map(|(id, value)| json!({"id":id,"value":value}))
         .collect())
 }
-fn no_effects(db: &rusqlite::Connection, id: &str) -> Result<(), String> {
+fn no_effects(db: &rusqlite::Connection, id: &str, imported_history: bool) -> Result<(), String> {
     for table in [
         "chat_rows",
         "native_turns",
@@ -99,6 +99,9 @@ fn no_effects(db: &rusqlite::Connection, id: &str) -> Result<(), String> {
         "tool_images",
         "claude_outbox",
     ] {
+        if imported_history && matches!(table, "chat_rows" | "native_turns") {
+            continue;
+        }
         let used: bool = db
             .query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE chat=?1)"),
@@ -252,6 +255,7 @@ impl Prepared {
     fn verify(&self, db: &rusqlite::Connection) -> Result<(), String> {
         for state in &self.states {
             let id = state["thread"]["id"].as_str().ok_or(INVALID)?;
+            let (header, imported_history) = crate::legacy_codex_history::verify(db, state)?;
             let found: String = db
                 .query_row(
                     "SELECT data FROM chats WHERE id=?1 AND agent='codex'",
@@ -259,11 +263,11 @@ impl Prepared {
                     |r| r.get(0),
                 )
                 .map_err(|_| CONFLICT)?;
-            let expected = state.to_string();
+            let expected = header.to_string();
             if found != expected {
                 return Err(CONFLICT.into());
             }
-            no_effects(db, id)?;
+            no_effects(db, id, imported_history)?;
         }
         Ok(())
     }
@@ -295,11 +299,33 @@ pub(crate) fn headers_can_rollback(db: &rusqlite::Connection) -> Result<(), Stri
         if occupied {
             return Err(CONFLICT.into());
         }
-        no_effects(db, id)?;
+        no_effects(db, id, false)?;
     }
     Ok(())
 }
 impl Store {
+    pub(crate) fn legacy_codex_base(&self, id: &str) -> Result<Value, String> {
+        let p = Prepared::read(&self.db, false)?;
+        let (digest, data, phase): (String, String, String) = self
+            .db
+            .query_row(
+                "SELECT digest,data,phase FROM legacy_codex_import WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|_| CONFLICT)?;
+        if phase != "prepared"
+            || digest != p.digest
+            || data != serde_json::to_string(&p.states).map_err(|_| INVALID)?
+        {
+            return Err(CONFLICT.into());
+        }
+        p.verify(&self.db)?;
+        p.states
+            .into_iter()
+            .find(|s| s["thread"]["id"] == id)
+            .ok_or(CONFLICT.into())
+    }
     pub fn prepare_legacy_codex(&mut self) -> Result<Value, String> {
         let p = Prepared::read(&self.db, false)?;
         let data = serde_json::to_string(&p.states).map_err(|_| INVALID)?;
@@ -359,6 +385,7 @@ impl Store {
         if phase == "prepared" {
             p.verify(&tx)?;
             for state in &p.states {
+                crate::legacy_codex_history::rollback(&tx, state)?;
                 tx.execute(
                     "DELETE FROM chats WHERE id=?1",
                     [state["thread"]["id"].as_str().ok_or(INVALID)?],
@@ -383,7 +410,7 @@ impl Store {
                 if present {
                     return Err(CONFLICT.into());
                 }
-                no_effects(&tx, id)?;
+                no_effects(&tx, id, false)?;
             }
         } else {
             return Err(CONFLICT.into());

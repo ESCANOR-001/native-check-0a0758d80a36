@@ -30,6 +30,7 @@ mod legacy_claude_native;
 mod legacy_claude_resume;
 mod legacy_codex;
 mod legacy_codex_headers;
+mod legacy_codex_history;
 pub mod legacy_connection;
 mod legacy_preferences;
 pub mod migration_snapshot;

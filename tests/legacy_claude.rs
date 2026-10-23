@@ -1024,6 +1024,15 @@ fn native_bundle_receipt_failure_retries_verified_copy_and_changed_copy_blocks_r
         .is_err());
     assert_eq!(count(&db, "legacy_claude_native"), 0);
     assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+    // An interrupted copy is resumable only with its intact, immutable plan.
+    let staged = std::fs::read_dir(dir.path().join("legacy-native"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::remove_file(staged.join("restored.json")).unwrap();
+    std::fs::remove_file(staged.join("data/unknown-metadata.json")).unwrap();
     db.execute_batch("DROP TRIGGER fail_native").unwrap();
     store
         .prepare_legacy_claude_native(
@@ -1035,6 +1044,10 @@ fn native_bundle_receipt_failure_retries_verified_copy_and_changed_copy_blocks_r
     let bundle: String = db
         .query_row("SELECT bundle FROM legacy_claude_native", [], |r| r.get(0))
         .unwrap();
+    assert_eq!(
+        std::fs::read(staged.join("data/unknown-metadata.json")).unwrap(),
+        b"{\"future\":true}\n"
+    );
     std::fs::write(
         dir.path()
             .join("legacy-native")

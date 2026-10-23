@@ -349,6 +349,7 @@ fn has_chats(db: &rusqlite::Connection) -> Result<bool, String> {
                 | "legacy_claude_binding_import"
                 | "legacy_codex_import"
                 | "legacy_codex_headers"
+                | "legacy_codex_history"
                 | "legacy_preferences_import"
         ) {
             let active: bool = db.query_row(

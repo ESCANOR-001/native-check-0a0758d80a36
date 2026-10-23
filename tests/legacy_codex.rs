@@ -488,3 +488,192 @@ fn staged_headers_can_roll_back_without_conversion_and_cannot_be_added_late() {
         .is_err());
     assert_eq!(count(&db, "chats"), 0);
 }
+
+fn history() -> Value {
+    json!({"version":1,"threadId":"original-android-id","nativeId":NATIVE,"nativeStatus":"idle",
+        "hasPendingApprovals":false,"hasPendingUserInput":false,"hasQueuedPrompts":false,"hasActionableProposedPlan":false,
+        "updatedAt":TIME,"latestUserMessageAt":TIME,"futureField":{"preserved":true},
+        "latestTurn":{"turnId":"old-turn","state":"completed","requestedAt":TIME,"startedAt":TIME,"completedAt":TIME,"assistantMessageId":"old-reply"},
+        "turns":[{"publicId":"old-turn","nativeId":"native-old-turn","status":"completed"}],
+        "messages":[{"id":"old-prompt","turnId":"old-turn","role":"user","text":"Original prompt","streaming":false,"sequence":1,"createdAt":TIME,"updatedAt":TIME},
+            {"id":"old-reply","turnId":"old-turn","role":"assistant","text":"Original reply","streaming":false,"sequence":3,"createdAt":TIME,"updatedAt":TIME}],
+        "activities":[{"id":"old-tool","turnId":"old-turn","kind":"tool.completed","summary":"Read saved file","payload":{"status":"completed","unknown":{"kept":true}},"sequence":2,"createdAt":TIME}],"proposedPlans":[]})
+}
+#[test]
+fn codex_transcript_rows_turns_and_raw_bytes_survive_reopen_retry_and_whole_rollback() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (dir, mut store, db, original) = setup(&source(cwd.path()));
+    store.prepare_legacy_codex().unwrap();
+    let raw = format!("  {}\n", history()).into_bytes();
+    let before = state(&db);
+    let report = store
+        .prepare_legacy_codex_history("original-android-id", &raw)
+        .unwrap();
+    assert_eq!(report["rows"], 3);
+    assert_eq!(report["turns"], 1);
+    assert_eq!(report["migrationComplete"], false);
+    let page = store
+        .history_page("original-android-id", None, None)
+        .unwrap();
+    assert_eq!(page["messages"], history()["messages"]);
+    assert_eq!(page["activities"], history()["activities"]);
+    assert_eq!(
+        state(&db)["thread"]["modelSelection"],
+        before["thread"]["modelSelection"]
+    );
+    assert_eq!(state(&db)["thread"]["latestTurn"], history()["latestTurn"]);
+    assert_eq!(state(&db)["thread"]["session"]["status"], "disconnected");
+    assert_eq!(state(&db)["paused"], true);
+    let mut q = db.prepare("SELECT id FROM chat_rows ORDER BY seq").unwrap();
+    let order: Vec<String> = q
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(order, vec!["old-prompt", "old-tool", "old-reply"]);
+    assert!(store.assert_migration_ready().is_err());
+    assert!(store.rollback_legacy_connection().is_err());
+    drop(store);
+    let mut store = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        store
+            .prepare_legacy_codex_history("original-android-id", &raw)
+            .unwrap(),
+        report
+    );
+    store.prepare_legacy_codex().unwrap();
+    assert_eq!(count(&db, "chat_rows"), 3);
+    assert_eq!(count(&db, "native_sync"), 0);
+    assert_eq!(count(&db, "chat_commands"), 0);
+    store.rollback_legacy_codex().unwrap();
+    store.rollback_legacy_codex().unwrap();
+    store.rollback_legacy_connection().unwrap();
+    for table in ["chats", "chat_rows", "native_turns"] {
+        assert_eq!(count(&db, table), 0);
+    }
+    assert_eq!(
+        db.query_row("SELECT raw FROM legacy_codex_history", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        raw
+    );
+    assert_eq!(
+        db.query_row("SELECT raw FROM legacy_connection_import", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        original
+    );
+}
+#[test]
+fn codex_history_rejects_unsettled_or_conflicting_exports_without_partial_rows() {
+    let cwd = tempfile::tempdir().unwrap();
+    for (path, value) in [
+        ("/threadId", json!("wrong-chat")),
+        ("/nativeId", json!(SECOND)),
+        ("/nativeStatus", json!("active")),
+        ("/hasPendingApprovals", json!(true)),
+        ("/hasPendingUserInput", json!(true)),
+        ("/hasQueuedPrompts", json!(true)),
+        ("/hasActionableProposedPlan", json!(true)),
+        ("/messages/0/turnId", json!("unknown-turn")),
+        ("/messages/0/role", json!("system")),
+        ("/messages/0/streaming", json!(true)),
+        ("/latestTurn/state", json!("running")),
+        ("/latestTurn/assistantMessageId", json!("other-reply")),
+        ("/turns/0/status", json!("running")),
+        ("/activities/0/createdAt", json!("no-date")),
+        ("/updatedAt", json!("2000-01-01T00:00:00Z")),
+    ] {
+        let (_dir, mut store, db, _) = setup(&source(cwd.path()));
+        store.prepare_legacy_codex().unwrap();
+        let before = state(&db);
+        let mut raw = history();
+        *raw.pointer_mut(path).unwrap() = value;
+        assert!(
+            store
+                .prepare_legacy_codex_history("original-android-id", raw.to_string().as_bytes())
+                .is_err(),
+            "{path}"
+        );
+        assert_eq!(state(&db), before);
+        assert_eq!(count(&db, "chat_rows"), 0);
+        assert_eq!(count(&db, "native_turns"), 0);
+    }
+    let (_dir, mut store, db, _) = setup(&source(cwd.path()));
+    store.prepare_legacy_codex().unwrap();
+    let mut raw = history();
+    let dup = raw["messages"][0].clone();
+    raw["messages"].as_array_mut().unwrap().push(dup);
+    assert!(store
+        .prepare_legacy_codex_history("original-android-id", raw.to_string().as_bytes())
+        .is_err());
+    assert_eq!(count(&db, "chat_rows"), 0);
+}
+#[test]
+fn codex_history_write_failure_rolls_back_header_rows_and_turn_mapping() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (_dir, mut store, db, _) = setup(&source(cwd.path()));
+    store.prepare_legacy_codex().unwrap();
+    let before = state(&db);
+    db.execute_batch("CREATE TRIGGER fail_last BEFORE INSERT ON chat_rows WHEN NEW.id='old-reply' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    let raw = history().to_string();
+    assert!(store
+        .prepare_legacy_codex_history("original-android-id", raw.as_bytes())
+        .is_err());
+    assert_eq!(state(&db), before);
+    for table in ["chat_rows", "native_turns", "legacy_codex_history"] {
+        assert_eq!(count(&db, table), 0);
+    }
+    db.execute_batch("DROP TRIGGER fail_last").unwrap();
+    store
+        .prepare_legacy_codex_history("original-android-id", raw.as_bytes())
+        .unwrap();
+    assert_eq!(count(&db, "chat_rows"), 3);
+}
+#[test]
+fn changed_transcript_receipts_rows_or_turns_block_rollback_and_keep_new_data() {
+    let cwd = tempfile::tempdir().unwrap();
+    for sql in [
+        "UPDATE legacy_codex_history SET digest='changed'",
+        "UPDATE legacy_codex_history SET source_hash='changed'",
+        "UPDATE legacy_codex_history SET raw=x'7b7d'",
+        "UPDATE chat_rows SET data=json_set(data,'$.text','changed') WHERE kind='messages'",
+        "UPDATE chat_rows SET turn='different' WHERE id='old-prompt'",
+        "INSERT INTO chat_rows(chat,kind,id,turn,data) VALUES('original-android-id','messages','new','new-turn','{}')",
+        "UPDATE native_turns SET native='different'",
+        "UPDATE chats SET data=json_set(data,'$.thread.title','changed')",
+    ]{
+        let (_dir,mut store,db,_)=setup(&source(cwd.path()));store.prepare_legacy_codex().unwrap();let raw=history().to_string();store.prepare_legacy_codex_history("original-android-id",raw.as_bytes()).unwrap();
+        db.execute_batch(sql).unwrap();assert!(store.prepare_legacy_codex_history("original-android-id",raw.as_bytes()).is_err(),"{sql}");
+        assert!(store.prepare_legacy_codex().is_err(),"{sql}");assert!(store.rollback_legacy_codex().is_err(),"{sql}");assert_eq!(count(&db,"chats"),1);
+    }
+}
+#[test]
+fn desktop_header_transcript_migration_pages_history_and_orders_restarted_sequences() {
+    let cwd = tempfile::tempdir().unwrap();
+    let (_dir, mut store, db, _) = setup(&desktop_source(cwd.path()));
+    store
+        .prepare_legacy_codex_headers(desktop_header(cwd.path()).to_string().as_bytes())
+        .unwrap();
+    store.prepare_legacy_codex().unwrap();
+    let mut raw = history();
+    for n in 0..28 {
+        raw["messages"].as_array_mut().unwrap().push(json!({"id":format!("later-{n}"),"role":"assistant","text":format!("Later reply {n}"),"turnId":"old-turn","sequence":n,"createdAt":"2026-01-01T13:00:00Z","streaming":false}));
+    }
+    raw["updatedAt"] = json!("2026-01-01T13:00:00Z");
+    store
+        .prepare_legacy_codex_history("original-android-id", raw.to_string().as_bytes())
+        .unwrap();
+    let newest = store
+        .history_page("original-android-id", None, None)
+        .unwrap();
+    assert_eq!(newest["messages"].as_array().unwrap().len(), 24);
+    assert_eq!(
+        newest["messages"].as_array().unwrap().last().unwrap()["id"],
+        "later-27"
+    );
+    assert_eq!(count(&db, "chat_rows"), 31);
+    store.rollback_legacy_codex().unwrap();
+    store.rollback_legacy_codex_headers().unwrap();
+    store.rollback_legacy_connection().unwrap();
+}

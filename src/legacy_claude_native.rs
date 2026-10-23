@@ -354,7 +354,24 @@ impl Store {
         open(&parent, true).map_err(|_| INVALID)?;
         let restored = parent.join(&bundle);
         if restored.exists() {
-            migration_snapshot::verify_restored(&restored, &environment).map_err(|_| INVALID)?;
+            if !restored
+                .join("restored.json")
+                .try_exists()
+                .map_err(|_| INVALID)?
+            {
+                let other = staged_bytes(&parent)?
+                    .checked_sub(staged_bytes(&restored)?)
+                    .ok_or(INVALID)?;
+                let requested = other
+                    .saturating_add(summary.bytes)
+                    .saturating_add(MAX_ROW * 3);
+                if requested > 2 * 1024 * 1024 * 1024 {
+                    return Err(INVALID.into());
+                }
+                self.check_history(requested)?;
+            }
+            migration_snapshot::resume_restore(snapshot, &restored, &environment)
+                .map_err(|_| INVALID)?;
         } else {
             let retained = staged_bytes(&parent)?;
             let requested = retained

@@ -15,6 +15,7 @@ use std::{
 
 const MANIFEST: &str = "snapshot.json";
 const RESTORED: &str = "restored.json";
+const RESTORE_PLAN: &str = "restore-plan.json";
 const MAX_MANIFEST: u64 = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 20_000;
 const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -181,7 +182,7 @@ fn inventory(root: &Path, deadline: Instant) -> io::Result<BTreeMap<String, Obse
 }
 
 // The manifest may contain private names. Deliberately no Debug implementation.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Entry {
     name: String,
@@ -189,7 +190,7 @@ struct Entry {
     bytes: u64,
     sha256: Option<String>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
     version: u32,
@@ -455,8 +456,12 @@ fn restore_inner(
         return Err(invalid());
     }
     directory(&destination)?;
+    // This immutable receipt identifies a resumable copy. A pre-existing
+    // unmarked directory is never adopted or cleaned up.
+    commit_manifest(&destination, RESTORE_PLAN, &manifest)?;
     let data = destination.join("data");
     directory(&data)?;
+    directory(&destination.join("copying"))?;
     let deadline = Instant::now() + TIMEOUT;
     // Sorting ensures parent directories exist even for a reordered manifest.
     let mut entries = manifest.entries.clone();
@@ -467,18 +472,7 @@ fn restore_inner(
         if entry.directory {
             directory(&path)?;
         } else {
-            let digest = entry.sha256.as_ref().ok_or_else(invalid)?;
-            let mut out = writer(&path)?;
-            if stream(
-                &snapshot.join("objects").join(digest),
-                entry.bytes,
-                Some(&mut out),
-                deadline,
-            )? != *digest
-            {
-                return Err(invalid());
-            }
-            out.sync_all()?;
+            copy_restored_file(&snapshot, &destination, entry, deadline)?;
         }
     }
     copied()?;
@@ -489,6 +483,204 @@ fn restore_inner(
     sync_directory(&data)?;
     commit_manifest(&destination, RESTORED, &manifest)?;
     verify_restored(&destination, original_environment)
+}
+
+fn copy_restored_file(
+    snapshot: &Path,
+    destination: &Path,
+    entry: &Entry,
+    deadline: Instant,
+) -> io::Result<()> {
+    let digest = entry.sha256.as_ref().ok_or_else(invalid)?;
+    let pending = destination.join("copying").join(format!("{digest}.copy"));
+    let mut out = writer(&pending)?;
+    if stream(
+        &snapshot.join("objects").join(digest),
+        entry.bytes,
+        Some(&mut out),
+        deadline,
+    )? != *digest
+    {
+        return Err(invalid());
+    }
+    out.sync_all()?;
+    drop(out);
+    let target = destination.join("data").join(&entry.name);
+    fs::hard_link(&pending, &target)?;
+    sync_directory(target.parent().ok_or_else(invalid)?)?;
+    fs::remove_file(pending)?;
+    sync_directory(&destination.join("copying"))
+}
+
+/// Retry only a private, explicitly journaled restore from the exact same
+/// verified snapshot. Existing data files must already match completely; only
+/// missing files are copied. Recognized temporary prefixes are safe to discard.
+/// Unknown or changed bytes remain in place and block completion.
+pub fn resume_restore(
+    snapshot: &Path,
+    destination: &Path,
+    original_environment: &str,
+) -> io::Result<Report> {
+    if !destination.is_absolute() {
+        return Err(invalid());
+    }
+    let (manifest, report) = verify_inner(snapshot, original_environment)?;
+    let snapshot = snapshot.canonicalize()?;
+    open(destination, true)?;
+    let destination = destination.canonicalize()?;
+    if destination.starts_with(&snapshot) || snapshot.starts_with(&destination) {
+        return Err(invalid());
+    }
+    if destination.join(RESTORED).try_exists()? {
+        if read_manifest(&destination, RESTORED)? != manifest {
+            return Err(invalid());
+        }
+        return verify_restored(&destination, original_environment);
+    }
+    if read_manifest(&destination, RESTORE_PLAN)? != manifest {
+        return Err(invalid());
+    }
+    let deadline = Instant::now() + TIMEOUT;
+    for e in fs::read_dir(&destination)? {
+        budget(deadline)?;
+        let e = e?;
+        let name = e.file_name();
+        let name = name.to_str().ok_or_else(invalid)?;
+        if ![RESTORE_PLAN, "data", "copying", "manifest.pending"].contains(&name) {
+            return Err(invalid());
+        }
+        open(&e.path(), matches!(name, "data" | "copying"))?;
+    }
+    let data = destination.join("data");
+    let found = if data.try_exists()? {
+        inventory(&data, deadline)?
+    } else {
+        BTreeMap::new()
+    };
+    let expected: BTreeMap<_, _> = manifest
+        .entries
+        .iter()
+        .map(|e| (e.name.as_str(), e))
+        .collect();
+    for (name, observed) in &found {
+        let entry = expected.get(name.as_str()).ok_or_else(invalid)?;
+        if observed.directory != entry.directory || observed.bytes != entry.bytes {
+            return Err(invalid());
+        }
+        if let Some(hash) = &entry.sha256 {
+            if stream(&data.join(name), entry.bytes, None, deadline)? != *hash {
+                return Err(invalid());
+            }
+        }
+    }
+    let copying = destination.join("copying");
+    let objects: BTreeMap<_, _> = manifest
+        .entries
+        .iter()
+        .filter_map(|e| e.sha256.as_deref().map(|s| (s, e.bytes)))
+        .collect();
+    let mut temporary = vec![];
+    if copying.try_exists()? {
+        open(&copying, true)?;
+        for e in fs::read_dir(&copying)? {
+            budget(deadline)?;
+            let e = e?;
+            let name = e.file_name();
+            let name = name
+                .to_str()
+                .and_then(|s| s.strip_suffix(".copy"))
+                .ok_or_else(invalid)?;
+            let length = objects.get(name).ok_or_else(invalid)?;
+            matching_prefix(
+                &e.path(),
+                &snapshot.join("objects").join(name),
+                *length,
+                deadline,
+            )?;
+            temporary.push(e.path());
+            if temporary.len() > MAX_ENTRIES {
+                return Err(invalid());
+            }
+        }
+    }
+    let pending = destination.join("manifest.pending");
+    if pending.try_exists()? {
+        let bytes = crate::profile_snapshot::bytes(&pending, MAX_MANIFEST)?;
+        let expected = serde_json::to_vec(&manifest).map_err(|_| invalid())?;
+        if !expected.starts_with(&bytes) {
+            return Err(invalid());
+        }
+        temporary.push(pending);
+    }
+    // All existing entries were checked before any temporary file is removed.
+    for path in temporary {
+        fs::remove_file(path)?;
+    }
+    if !data.try_exists()? {
+        directory(&data)?;
+    }
+    if !copying.try_exists()? {
+        directory(&copying)?;
+    }
+    let mut entries = manifest.entries.clone();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    for entry in &entries {
+        budget(deadline)?;
+        if found.contains_key(&entry.name) {
+            continue;
+        }
+        if entry.directory {
+            directory(&data.join(&entry.name))?;
+        } else {
+            copy_restored_file(&snapshot, &destination, entry, deadline)?;
+        }
+    }
+    verify_data(&data, &manifest, deadline)?;
+    for entry in entries.iter().rev().filter(|e| e.directory) {
+        sync_directory(&data.join(&entry.name))?;
+    }
+    sync_directory(&data)?;
+    sync_directory(&copying)?;
+    commit_manifest(&destination, RESTORED, &manifest)?;
+    if verify_restored(&destination, original_environment)? != report {
+        return Err(invalid());
+    }
+    Ok(report)
+}
+fn matching_prefix(
+    partial: &Path,
+    source: &Path,
+    maximum: u64,
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut part = open(partial, false)?;
+    let before = part.metadata()?;
+    let ident = identity(&part)?;
+    if before.len() > maximum {
+        return Err(invalid());
+    }
+    let mut src = open(source, false)?;
+    if src.metadata()?.len() != maximum {
+        return Err(invalid());
+    }
+    let mut a = [0u8; 64 * 1024];
+    let mut b = [0u8; 64 * 1024];
+    let mut left = before.len();
+    while left > 0 {
+        budget(deadline)?;
+        let n = left.min(a.len() as u64) as usize;
+        part.read_exact(&mut a[..n])?;
+        src.read_exact(&mut b[..n])?;
+        if a[..n] != b[..n] {
+            return Err(invalid());
+        }
+        left -= n as u64;
+    }
+    let after = open(partial, false)?;
+    if identity(&after)? != ident || after.metadata()?.len() != before.len() {
+        return Err(invalid());
+    }
+    Ok(())
 }
 fn verify_data(data: &Path, manifest: &Manifest, deadline: Instant) -> io::Result<()> {
     let before = inventory(data, deadline)?;
@@ -781,6 +973,149 @@ mod tests {
         let oversized = root.path().join("oversized");
         assert!(capture(&source, &oversized, ENV).is_err());
         assert!(!oversized.exists());
+    }
+    #[test]
+    fn marked_restore_resumes_missing_files_and_verified_partial_temporaries() {
+        let (root, source, snapshot) = fixture();
+        let report = capture(&source, &snapshot, ENV).unwrap();
+        let target = root.path().join("resume");
+        assert!(restore_inner(&snapshot, &target, ENV, || Err(
+            io::ErrorKind::Interrupted.into()
+        ))
+        .is_err());
+        let manifest = read_manifest(&snapshot, MANIFEST).unwrap();
+        let file = manifest
+            .entries
+            .iter()
+            .find(|e| e.name == "sessions/chat.json")
+            .unwrap();
+        let hash = file.sha256.as_ref().unwrap();
+        fs::remove_file(target.join("data").join(&file.name)).unwrap();
+        let object = fs::read(snapshot.join("objects").join(hash)).unwrap();
+        fs::write(
+            target.join("copying").join(format!("{hash}.copy")),
+            &object[..4],
+        )
+        .unwrap();
+        let encoded = serde_json::to_vec(&manifest).unwrap();
+        fs::write(target.join("manifest.pending"), &encoded[..17]).unwrap();
+        assert_eq!(resume_restore(&snapshot, &target, ENV).unwrap(), report);
+        assert_eq!(resume_restore(&snapshot, &target, ENV).unwrap(), report);
+        assert_eq!(
+            fs::read(target.join("data").join(&file.name)).unwrap(),
+            object
+        );
+        assert_eq!(fs::read_dir(target.join("copying")).unwrap().count(), 0);
+        assert!(!target.join("manifest.pending").exists());
+        assert_eq!(fs::read(source.join("sessions/chat.json")).unwrap(), object);
+    }
+    #[test]
+    fn restore_plan_before_data_creation_and_interrupted_hard_link_publish_recover() {
+        let (root, source, snapshot) = fixture();
+        let report = capture(&source, &snapshot, ENV).unwrap();
+        let manifest = read_manifest(&snapshot, MANIFEST).unwrap();
+        let target = root.path().join("resume");
+        directory(&target).unwrap();
+        commit_manifest(&target, RESTORE_PLAN, &manifest).unwrap();
+        assert_eq!(resume_restore(&snapshot, &target, ENV).unwrap(), report);
+        let target = root.path().join("publish-interrupted");
+        assert!(restore_inner(&snapshot, &target, ENV, || Err(
+            io::ErrorKind::Interrupted.into()
+        ))
+        .is_err());
+        let entry = manifest.entries.iter().find(|e| !e.directory).unwrap();
+        let file = target.join("data").join(&entry.name);
+        let id = identity(&open(&file, false).unwrap()).unwrap();
+        fs::hard_link(
+            &file,
+            target
+                .join("copying")
+                .join(format!("{}.copy", entry.sha256.as_ref().unwrap())),
+        )
+        .unwrap();
+        resume_restore(&snapshot, &target, ENV).unwrap();
+        assert!(identity(&open(&file, false).unwrap()).unwrap() == id);
+        assert_eq!(fs::read_dir(target.join("copying")).unwrap().count(), 0);
+    }
+    #[test]
+    fn resume_refuses_unknown_or_changed_staged_bytes_before_removing_anything() {
+        for mutation in [
+            "unmarked",
+            "unknown-root",
+            "unknown-data",
+            "unknown-temp",
+            "changed-temp",
+            "changed-data",
+            "changed-pending",
+            "changed-plan",
+        ] {
+            let (root, source, snapshot) = fixture();
+            capture(&source, &snapshot, ENV).unwrap();
+            let target = root.path().join("resume");
+            assert!(restore_inner(&snapshot, &target, ENV, || Err(
+                io::ErrorKind::Interrupted.into()
+            ))
+            .is_err());
+            let manifest = read_manifest(&snapshot, MANIFEST).unwrap();
+            let entry = manifest
+                .entries
+                .iter()
+                .find(|e| e.name == "sessions/chat.json")
+                .unwrap();
+            let hash = entry.sha256.as_ref().unwrap();
+            let temp = target.join("copying").join(format!("{hash}.copy"));
+            fs::write(&temp, b"EX").unwrap();
+            match mutation {
+                "unmarked" => {
+                    fs::remove_file(target.join(RESTORE_PLAN)).unwrap();
+                }
+                "unknown-root" => fs::write(target.join("keep-user-file"), b"KEEP").unwrap(),
+                "unknown-data" => fs::write(target.join("data/keep-user-file"), b"KEEP").unwrap(),
+                "unknown-temp" => fs::write(target.join("copying/unknown.copy"), b"KEEP").unwrap(),
+                "changed-temp" => fs::write(&temp, b"wrong").unwrap(),
+                "changed-data" => {
+                    fs::write(target.join("data/sessions/chat.json"), b"new user data").unwrap()
+                }
+                "changed-pending" => {
+                    fs::write(target.join("manifest.pending"), b"unknown").unwrap()
+                }
+                "changed-plan" => fs::write(target.join(RESTORE_PLAN), b"{}").unwrap(),
+                _ => unreachable!(),
+            }
+            let before = inventory(&target, Instant::now() + TIMEOUT).unwrap();
+            let saved = fs::read(&temp).unwrap();
+            assert!(
+                resume_restore(&snapshot, &target, ENV).is_err(),
+                "{mutation}"
+            );
+            assert!(
+                before == inventory(&target, Instant::now() + TIMEOUT).unwrap(),
+                "{mutation}"
+            );
+            assert_eq!(fs::read(temp).unwrap(), saved);
+            assert!(!target.join(RESTORED).exists());
+        }
+    }
+    #[test]
+    fn a_different_snapshot_or_modified_completed_restore_is_never_repaired_over_data() {
+        let (root, source, snapshot) = fixture();
+        capture(&source, &snapshot, ENV).unwrap();
+        let target = root.path().join("restore");
+        restore(&snapshot, &target, ENV).unwrap();
+        fs::write(source.join("attachment.bin"), b"updated export").unwrap();
+        let other = root.path().join("other-snapshot");
+        capture(&source, &other, ENV).unwrap();
+        assert!(resume_restore(&other, &target, ENV).is_err());
+        assert_eq!(
+            fs::read(target.join("data/attachment.bin")).unwrap(),
+            [0, 1, 2, 0, 255]
+        );
+        fs::write(target.join("data/attachment.bin"), b"user change").unwrap();
+        assert!(resume_restore(&snapshot, &target, ENV).is_err());
+        assert_eq!(
+            fs::read(target.join("data/attachment.bin")).unwrap(),
+            b"user change"
+        );
     }
     #[cfg(any(unix, windows))]
     #[test]
