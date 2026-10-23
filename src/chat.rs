@@ -200,10 +200,13 @@ struct Request {
 pub struct Chats {
     send: mpsc::Sender<Request>,
     changes: watch::Receiver<u64>,
+    setup: crate::agent_setup::ClaudeSetup,
 }
 impl Chats {
     pub async fn start(db: AuthService, config: Config) -> Result<Self, String> {
         config.validate()?;
+        let setup =
+            crate::agent_setup::ClaudeSetup::new(config.claude.clone(), config.workspace.clone())?;
         let limits = config.storage.clone();
         db.call(move |a| a.store.configure_storage(limits))
             .await??;
@@ -356,9 +359,64 @@ impl Chats {
             }
             .run(receive),
         );
-        Ok(Self { send, changes })
+        Ok(Self {
+            send,
+            changes,
+            setup,
+        })
     }
     pub async fn call(
+        &self,
+        agent: AgentKind,
+        client: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, String> {
+        if matches!(method, "claude.getSyncSettings" | "claude.setAutoConnect") {
+            if agent != AgentKind::Claude {
+                return Err("Select Claude Code before changing its settings".into());
+            }
+            let enabled = if method == "claude.setAutoConnect" {
+                Some(
+                    params
+                        .as_object()
+                        .filter(|o| o.len() == 1)
+                        .and_then(|o| o.get("enabled"))
+                        .and_then(Value::as_bool)
+                        .ok_or("Provide only the automatic sync enabled boolean")?,
+                )
+            } else {
+                None
+            };
+            let mut state = self
+                .send_request(agent, client, "native.claudeSetupSnapshot", json!({}))
+                .await?;
+            state["autoConnect"] = self.setup.preference(enabled).await?;
+            return Ok(state);
+        }
+        self.send_request(agent, client, method, params).await
+    }
+    pub(crate) async fn claude_setup(&self, refresh: bool) -> Result<Value, String> {
+        let mut state = self
+            .call(
+                AgentKind::Claude,
+                "dashboard",
+                "claude.getSyncSettings",
+                json!({}),
+            )
+            .await?;
+        let account = self.setup.account(refresh).await;
+        state["ready"] = json!(account["ready"] == true && state["catalogReady"] == true);
+        state["account"] = account["account"].clone();
+        if account["error"].is_string() {
+            state["error"] = account["error"].clone();
+        }
+        if let Some(o) = state.as_object_mut() {
+            o.remove("catalogReady");
+        }
+        Ok(state)
+    }
+    async fn send_request(
         &self,
         agent: AgentKind,
         client: &str,
@@ -1977,6 +2035,58 @@ impl Hub {
         p: Value,
     ) -> Result<Value, String> {
         match method {
+            "native.claudeSetupSnapshot" => {
+                let connected = self
+                    .active
+                    .iter()
+                    .filter(|(id, w)| {
+                        self.chats.get(*id).is_some_and(|c| {
+                            c.agent == AgentKind::Claude
+                                && c.thread["deletedAt"].is_null()
+                                && c.thread["archivedAt"].is_null()
+                        }) && (w.claude_router.is_some() || w.observer.is_some())
+                            && w.metadata_ready()
+                    })
+                    .count();
+                let active = self
+                    .active
+                    .iter()
+                    .filter(|(id, w)| {
+                        self.chats
+                            .get(*id)
+                            .is_some_and(|c| c.agent == AgentKind::Claude)
+                            && w.stage != "idle"
+                    })
+                    .count();
+                let known = self.models.contains_key(AgentKind::Claude.instance());
+                let error = self.discovery_errors.get(AgentKind::Claude.instance());
+                let ids: Vec<_> = self
+                    .chats
+                    .iter()
+                    .filter(|(_, c)| {
+                        c.agent == AgentKind::Claude
+                            && c.thread["deletedAt"].is_null()
+                            && c.thread["archivedAt"].is_null()
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                let (verification_count, mut issue) = self.db.call(move |a| -> rusqlite::Result<(usize, Option<&'static str>)> {
+                    use rusqlite::OptionalExtension;
+                    let mut statement = a.store.db.prepare("SELECT substr(json_extract(data,'$.payload.detail'),1,2048) FROM chat_rows WHERE chat=?1 AND kind='activities' AND id='claude-native-sync' AND json_extract(data,'$.payload.status')!='connected'")?;
+                    let mut count = 0;let mut issue = None;
+                    for id in ids {
+                        let detail: Option<Option<String>> = statement.query_row([id], |r| r.get(0)).optional()?;
+                        if let Some(found) = detail.flatten().as_deref().and_then(crate::agent_setup::verification_issue) { count += 1; if issue != Some("device-verification") {issue = Some(found);} }
+                    }
+                    Ok((count, issue))
+                }).await?.map_err(|_| "Claude connection status is unavailable")?;
+                if issue.is_none() {
+                    issue = error.and_then(|e| crate::agent_setup::verification_issue(e));
+                }
+                Ok(
+                    json!({"enabled":true,"desktopSync":self.config.claude.remote_control,"installed":self.config.claude.executable.is_file(),"catalogReady":known && error.is_none(),"ready":false,"error":error,"account":{},"binary":self.config.claude.executable,"activeSessions":active,"connectedSessions":connected,"connection":{"connectedSessions":connected,"verificationRequiredSessions":verification_count,"verificationIssue":issue,"desktopVerification":"unconfirmed"},"models":self.models.get(AgentKind::Claude.instance()).cloned().unwrap_or_else(||json!([]))}),
+                )
+            }
             "server.getConfig" | "subscribeServerConfig" => Ok(self.config(agent)),
             "orchestration.getArchivedShellSnapshot" => Ok(self.shell_archive(agent, true)),
             "server.getStorageStatus" => self.db.call(|a| a.store.storage_status()).await?,

@@ -195,6 +195,10 @@ fn secure(mut r: Response) -> Response {
 pub(crate) fn routes(app: App) -> Router<App> {
     Router::new()
         .route("/api/android-remote", get(status))
+        .route(
+            "/api/android-remote/claude-code",
+            get(claude_status).put(claude_settings),
+        )
         .route("/api/android-remote/pairing", post(pair))
         .route("/api/android-remote/settings", put(settings))
         .route("/api/android-remote/clients/{id}", delete(revoke))
@@ -273,6 +277,70 @@ async fn status(State(app): State<App>) -> Response {
         "reachableAddresses":[d.public_url],"tunnel":{"configuration":{"mode":"quick","hasNamedTunnelToken":false},"runtime":{"mode":"quick","status":"stopped","publicUrl":null,"error":null}},
         "desktop":{"id":"desktop","label":app.label,"platform":platform,"address":d.public_url,"online":true},"clients":clients}),
     )
+}
+async fn claude_status(
+    State(app): State<App>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(chats) = app.chats else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Select the isolated agent configuration first",
+        );
+    };
+    match chats
+        .claude_setup(query.get("refresh").is_some_and(|v| v == "1"))
+        .await
+    {
+        Ok(v) => response(StatusCode::OK, v),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    }
+}
+async fn claude_settings(State(app): State<App>, Json(body): Json<Value>) -> Response {
+    let Some(object) = body.as_object().filter(|o| !o.is_empty()) else {
+        return error(StatusCode::BAD_REQUEST, "Provide Claude setup settings");
+    };
+    if object.keys().any(|k| {
+        !matches!(
+            k.as_str(),
+            "enabled" | "binary" | "desktopSync" | "autoConnectNewSessions"
+        )
+    }) {
+        return error(StatusCode::BAD_REQUEST, "Unknown Claude setup setting");
+    }
+    if object.len() != 1 || !object.contains_key("autoConnectNewSessions") {
+        return error(StatusCode::NOT_IMPLEMENTED, "Bridge agent enablement, executable and transport changes are not migrated yet; no settings changed");
+    }
+    let Some(enabled) = body["autoConnectNewSessions"].as_bool() else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Automatic connection must be true or false",
+        );
+    };
+    let Some(chats) = app.chats else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Select the isolated agent configuration first",
+        );
+    };
+    match chats
+        .call(
+            crate::chat::AgentKind::Claude,
+            "dashboard",
+            "claude.setAutoConnect",
+            json!({"enabled":enabled}),
+        )
+        .await
+    {
+        Ok(_) => match chats.claude_setup(false).await {
+            Ok(v) => response(StatusCode::OK, v),
+            Err(_) => error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Claude preference was saved, but status could not refresh",
+            ),
+        },
+        Err(e) => error(StatusCode::CONFLICT, &e),
+    }
 }
 async fn pair(
     State(app): State<App>,

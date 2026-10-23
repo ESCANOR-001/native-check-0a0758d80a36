@@ -122,7 +122,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for cancel in [false, true] {
             let path = dir.path().join(if cancel { "cancel" } else { "timeout" });
-            let mut c = shell("sleep 30 & echo $! > \"$1\"; wait");
+            // Publish readiness only after the PID is fully written. Checking
+            // existence of the redirected file raced its write on macOS CI,
+            // so cancellation could read an empty PID instead of testing cleanup.
+            let mut c = shell("sleep 30 & echo $! > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; wait");
             c.arg("fixture").arg(&path);
             let task = tokio::spawn(run(
                 c,

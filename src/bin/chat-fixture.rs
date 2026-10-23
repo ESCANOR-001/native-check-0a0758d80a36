@@ -79,6 +79,19 @@ fn unknown(codex: bool) {
     }
 }
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("auth") {
+        let profile = std::path::PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").unwrap());
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(profile.join("setup-auth-probes.log"))
+            .unwrap();
+        writeln!(log, "probe").unwrap();
+        out(
+            json!({"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"pro","email":"PRIVATE_FIXTURE_EMAIL","orgId":"PRIVATE_FIXTURE_ORG","configDirectory":"PRIVATE_FIXTURE_PATH"}),
+        );
+        return;
+    }
     let codex = std::env::args().nth(1).as_deref() == Some("app-server");
     let mut last = String::new();
     let mut context_unsupported = false;

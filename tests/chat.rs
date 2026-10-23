@@ -124,6 +124,89 @@ impl Test {
 }
 
 #[tokio::test]
+async fn native_claude_setup_preferences_do_not_disconnect_hosts_or_change_codex() {
+    let test = Test::hosted().await;
+    let a = AgentKind::Claude;
+    test.create(a, "setup-host").await;
+    test.call(a, prompt("setup-host", "first", "normal"))
+        .await
+        .unwrap();
+    test.wait(a, "setup-host", "ready").await;
+    let before = test.detail(a, "setup-host").await;
+    let codex = test
+        .hub
+        .call(AgentKind::Codex, "phone", "server.getConfig", json!({}))
+        .await
+        .unwrap();
+    for enabled in [true, false, true] {
+        let value = test
+            .hub
+            .call(
+                a,
+                "phone",
+                "claude.setAutoConnect",
+                json!({"enabled":enabled}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(value["autoConnect"]["preference"], enabled);
+        assert_eq!(value["connection"]["connectedSessions"], 1);
+        assert_eq!(value["autoConnect"]["desktopPreference"], "unknown");
+        assert_eq!(value["desktopSync"], true);
+        assert_eq!(
+            test.detail(a, "setup-host").await["messages"],
+            before["messages"]
+        );
+    }
+    let after = test
+        .hub
+        .call(AgentKind::Codex, "phone", "server.getConfig", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(after["settings"], codex["settings"]);
+    assert!(test
+        .hub
+        .call(
+            AgentKind::Codex,
+            "phone",
+            "claude.setAutoConnect",
+            json!({"enabled":false})
+        )
+        .await
+        .is_err());
+    assert!(test
+        .hub
+        .call(
+            a,
+            "phone",
+            "claude.setAutoConnect",
+            json!({"enabled":false,"extra":true})
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        std::fs::read_to_string(test.dir.path().join("host-remote-links.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    test.stop().await;
+    let hub = Chats::start(test.db.clone(), test.config.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        hub.call(a, "phone", "claude.getSyncSettings", json!({}))
+            .await
+            .unwrap()["autoConnect"]["preference"],
+        true
+    );
+    hub.call(AgentKind::Codex, "local", "native.shutdown", json!({}))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn external_claude_restart_keeps_owner_history_without_launching_another_cli() {
     let mut test = Test::new().await;
     let a = AgentKind::Claude;

@@ -94,6 +94,125 @@ async fn session(router: Router) -> (String, String) {
 }
 
 #[tokio::test]
+async fn agents_dashboard_uses_real_profile_status_and_isolated_preferences() {
+    use remodex_connect_native::chat::{AgentConfig, Chats, Config};
+    let mut f = setup();
+    let agent = AgentConfig {
+        executable: env!("CARGO_BIN_EXE_chat-fixture").into(),
+        profile: f._root.path().into(),
+        model: "test".into(),
+        tools: Default::default(),
+        shared_server: None,
+        remote_control: false,
+    };
+    let mut claude = agent.clone();
+    claude.remote_control = true;
+    let config = Config {
+        storage: Default::default(),
+        max_active_chats: 1,
+        workspace: f._root.path().into(),
+        codex: agent,
+        claude,
+    };
+    let hub = Chats::start(f.app.auth.clone(), config).await.unwrap();
+    f.app.chats = Some(hub.clone());
+    let router = f.app.clone().router();
+    let (token, csrf) = session(router.clone()).await;
+    let good = [
+        ("x-opencodex-api-key", token.as_str()),
+        ("x-opencodex-gui-origin", "http://localhost:18900"),
+        ("origin", "http://localhost:18900"),
+        ("x-opencodex-csrf-token", csrf.as_str()),
+    ];
+    let path = "/api/android-remote/claude-code";
+    assert_eq!(
+        call(router.clone(), "GET", path, &[], Value::Null).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let started = std::time::Instant::now();
+    loop {
+        let (code, body) = call(router.clone(), "GET", path, &good, Value::Null).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(!body.contains("PRIVATE_FIXTURE"));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        if v["ready"] == true {
+            assert_eq!(v["account"]["subscriptionType"], "pro");
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(8));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (code, body) = call(
+        router.clone(),
+        "PUT",
+        path,
+        &good,
+        json!({"autoConnectNewSessions":true}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["autoConnect"]["preference"],
+        true
+    );
+    let settings = f._root.path().join("settings.json");
+    let before = std::fs::read(&settings).unwrap();
+    assert_eq!(
+        call(
+            router.clone(),
+            "PUT",
+            path,
+            &good,
+            json!({"autoConnectNewSessions":false,"enabled":false})
+        )
+        .await
+        .0,
+        StatusCode::NOT_IMPLEMENTED
+    );
+    assert_eq!(std::fs::read(&settings).unwrap(), before);
+    assert_eq!(
+        call(
+            router.clone(),
+            "PUT",
+            path,
+            &good,
+            json!({"autoConnectNewSessions":"true"})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(
+            router,
+            "PUT",
+            path,
+            &good[..2],
+            json!({"autoConnectNewSessions":false})
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        std::fs::read_to_string(f._root.path().join("setup-auth-probes.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "status requests must reuse the bounded cache"
+    );
+    hub.call(
+        remodex_connect_native::chat::AgentKind::Codex,
+        "local",
+        "native.shutdown",
+        json!({}),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn expired_phone_remains_visible_and_can_be_repaired_without_deleting_history() {
     let f = setup();
     let db =
