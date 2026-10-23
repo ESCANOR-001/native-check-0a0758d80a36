@@ -839,10 +839,326 @@ async fn first_native_event_after_upgrade_advances_anchor_and_preserves_old_prom
 }
 
 const INPUT_NATIVE: &str = "00000000-0000-4000-8000-000000000025";
+struct NativeExport {
+    root: tempfile::TempDir,
+    snapshot: std::path::PathBuf,
+    transcript: String,
+    original: Vec<u8>,
+}
+fn native_export(change: impl FnOnce(&mut Vec<Value>, &std::path::Path)) -> NativeExport {
+    let root = tempfile::tempdir().unwrap();
+    let export = root.path().join("export");
+    let transcript = format!("projects/fixture/{NATIVE}.jsonl");
+    std::fs::create_dir_all(export.join("projects/fixture")).unwrap();
+    let backup = export.join("file-history").join(NATIVE);
+    std::fs::create_dir_all(&backup).unwrap();
+    std::fs::write(backup.join("saved@v1"), b"original file before edit\n").unwrap();
+    std::fs::write(export.join("unknown-metadata.json"), b"{\"future\":true}\n").unwrap();
+    let mut rows = vec![
+        json!({"type":"user","uuid":INPUT_NATIVE,"parentUuid":null,"sessionId":NATIVE,"message":{"role":"user","content":"Original prompt"}}),
+        json!({"type":"assistant","uuid":"00000000-0000-4000-8000-000000000028","parentUuid":INPUT_NATIVE,"sessionId":NATIVE,"message":{"id":"assistant-message","role":"assistant","content":[{"type":"text","text":"Original reply"}]}}),
+        json!({"type":"file-history-snapshot","messageId":"old-file-point","snapshot":{"trackedFileBackups":{"/old/project/file.txt":{"backupFileName":"saved@v1","version":1}}}}),
+        json!({"type":"unknown-future-row","data":{"preserve":true}}),
+    ];
+    change(&mut rows, &export);
+    let original = rows
+        .iter()
+        .map(|v| format!("{v}\n"))
+        .collect::<String>()
+        .into_bytes();
+    std::fs::write(export.join(&transcript), &original).unwrap();
+    let snapshot = root.path().join("snapshot");
+    remodex_connect_native::migration_snapshot::capture(&export, &snapshot, ENV).unwrap();
+    NativeExport {
+        root,
+        snapshot,
+        transcript,
+        original,
+    }
+}
+#[test]
+fn owned_native_export_preserves_bytes_checkpoints_unknown_files_retry_reopen_and_rollback() {
+    let (dir, mut store, db) = setup();
+    let export = native_export(|_, _| {});
+    let bytes = raw(&bound_source(dir.path()));
+    store.prepare_legacy_claude(&bytes).unwrap();
+    store
+        .prepare_legacy_claude_bindings("original-android-chat")
+        .unwrap();
+    let before = store.load_chat("original-android-chat").unwrap();
+    let report = store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        )
+        .unwrap();
+    assert_eq!(report["prompts"], 1);
+    assert_eq!(report["replies"], 1);
+    assert_eq!(report["fileCheckpoints"], 1);
+    assert_eq!(report["migrationComplete"], false);
+    let bundle: String = db
+        .query_row("SELECT bundle FROM legacy_claude_native", [], |r| r.get(0))
+        .unwrap();
+    let data = dir.path().join("legacy-native").join(&bundle).join("data");
+    assert_eq!(
+        std::fs::read(data.join(&export.transcript)).unwrap(),
+        export.original
+    );
+    assert_eq!(
+        std::fs::read(data.join("file-history").join(NATIVE).join("saved@v1")).unwrap(),
+        b"original file before edit\n"
+    );
+    assert_eq!(
+        std::fs::read(data.join("unknown-metadata.json")).unwrap(),
+        b"{\"future\":true}\n"
+    );
+    assert_eq!(
+        std::fs::read(export.root.path().join("export").join(&export.transcript)).unwrap(),
+        export.original
+    );
+    assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+    assert!(store.assert_migration_ready().is_err());
+    drop(store);
+    let mut store = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        store
+            .prepare_legacy_claude_native(
+                "original-android-chat",
+                &export.snapshot,
+                &export.transcript
+            )
+            .unwrap(),
+        report
+    );
+    store.prepare_legacy_claude(&bytes).unwrap();
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    store.rollback_legacy_connection().unwrap();
+    store.rollback_legacy_connection().unwrap();
+    assert_eq!(
+        std::fs::read(data.join(&export.transcript)).unwrap(),
+        export.original
+    );
+    assert_eq!(count(&db, "legacy_claude_bindings"), 0);
+    assert_eq!(
+        db.query_row("SELECT phase FROM legacy_claude_native", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "rolled-back"
+    );
+    assert!(store.assert_migration_ready().is_err());
+}
+#[test]
+fn incomplete_wrong_session_or_missing_native_backups_never_activate_or_change_messages() {
+    for case in 0..6 {
+        let (dir, mut store, db) = setup();
+        let export = native_export(|rows, export| match case {
+            0 => {
+                rows.remove(0);
+            }
+            1 => {
+                rows.remove(1);
+            }
+            2 => rows[0]["sessionId"] = json!("00000000-0000-4000-8000-000000000029"),
+            3 => {
+                std::fs::remove_file(export.join("file-history").join(NATIVE).join("saved@v1"))
+                    .unwrap();
+            }
+            4 => {
+                rows[2]["snapshot"]["trackedFileBackups"]["/old/project/file.txt"]
+                    ["backupFileName"] = json!("../outside")
+            }
+            _ => {
+                rows[2]["snapshot"]["trackedFileBackups"]["/old/project/file.txt"] =
+                    json!({"version":1});
+            }
+        });
+        store
+            .prepare_legacy_claude(&raw(&bound_source(dir.path())))
+            .unwrap();
+        let before = store.load_chat("original-android-chat").unwrap();
+        assert!(
+            store
+                .prepare_legacy_claude_native(
+                    "original-android-chat",
+                    &export.snapshot,
+                    &export.transcript
+                )
+                .is_err(),
+            "case {case}"
+        );
+        assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+        assert!(store.assert_migration_ready().is_err());
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='legacy_claude_native'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            std::fs::read(export.root.path().join("export").join(&export.transcript)).unwrap(),
+            export.original
+        );
+    }
+}
+#[test]
+fn native_bundle_receipt_failure_retries_verified_copy_and_changed_copy_blocks_rollback() {
+    let (dir, mut store, db) = setup();
+    let export = native_export(|_, _| {});
+    store
+        .prepare_legacy_claude(&raw(&bound_source(dir.path())))
+        .unwrap();
+    db.execute_batch("CREATE TABLE legacy_claude_native(chat TEXT PRIMARY KEY,source_hash TEXT NOT NULL,bundle TEXT NOT NULL,transcript TEXT NOT NULL,report TEXT NOT NULL,phase TEXT NOT NULL);CREATE TRIGGER fail_native BEFORE INSERT ON legacy_claude_native BEGIN SELECT RAISE(ABORT,'fixture full'); END;").unwrap();
+    let before = store.load_chat("original-android-chat").unwrap();
+    assert!(store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript
+        )
+        .is_err());
+    assert_eq!(count(&db, "legacy_claude_native"), 0);
+    assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+    db.execute_batch("DROP TRIGGER fail_native").unwrap();
+    store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        )
+        .unwrap();
+    let bundle: String = db
+        .query_row("SELECT bundle FROM legacy_claude_native", [], |r| r.get(0))
+        .unwrap();
+    std::fs::write(
+        dir.path()
+            .join("legacy-native")
+            .join(bundle)
+            .join("data")
+            .join(&export.transcript),
+        b"changed\n",
+    )
+    .unwrap();
+    assert!(store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript
+        )
+        .is_err());
+    assert!(store
+        .rollback_legacy_claude("original-android-chat")
+        .is_err());
+    assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+    assert_eq!(
+        std::fs::read(export.root.path().join("export").join(&export.transcript)).unwrap(),
+        export.original
+    );
+}
+#[test]
+fn partial_native_copy_and_ambiguous_prompt_identity_refuse_without_overwrite() {
+    for partial in [true, false] {
+        let (dir, mut store, _) = setup();
+        let export = native_export(|_, _| {});
+        let value = if partial {
+            bound_source(dir.path())
+        } else {
+            source(dir.path())
+        };
+        store.prepare_legacy_claude(&raw(&value)).unwrap();
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(export.snapshot.join("snapshot.json")).unwrap())
+                .unwrap();
+        let path = dir
+            .path()
+            .join("legacy-native")
+            .join(remodex_connect_native::auth::digest(&manifest.to_string()));
+        if partial {
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("interrupted-copy"), b"keep").unwrap();
+        }
+        assert!(store
+            .prepare_legacy_claude_native(
+                "original-android-chat",
+                &export.snapshot,
+                &export.transcript
+            )
+            .is_err());
+        if partial {
+            assert_eq!(
+                std::fs::read(path.join("interrupted-copy")).unwrap(),
+                b"keep"
+            );
+        }
+        assert!(store.assert_migration_ready().is_err());
+        assert!(store
+            .prepare_legacy_claude_native(
+                "original-android-chat",
+                &export.snapshot,
+                "projects/../foreign.jsonl"
+            )
+            .is_err());
+    }
+}
 fn bound_source(dir: &std::path::Path) -> Value {
     let mut value = source(dir);
     value["deliveries"] = json!([{"uuid":INPUT_NATIVE,"messageId":"user-message","turnId":"old-turn","state":"consumed","steer":false}]);
     value
+}
+#[test]
+fn native_history_rejects_truncated_and_oversized_lines_before_any_native_receipt() {
+    use std::io::Write;
+    for oversized in [false, true] {
+        let (dir, mut store, db) = setup();
+        let export = native_export(|_, _| {});
+        let source_path = export.root.path().join("export").join(&export.transcript);
+        let mut out = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source_path)
+            .unwrap();
+        if oversized {
+            out.write_all(b"{\"type\":\"extra\",\"content\":\"")
+                .unwrap();
+            let chunk = [b'x'; 64 * 1024];
+            for _ in 0..128 {
+                out.write_all(&chunk).unwrap();
+            }
+            out.write_all(b"\"}\n").unwrap();
+        } else {
+            out.write_all(b"{\"type\":\"partial").unwrap();
+        }
+        drop(out);
+        let fresh = export.root.path().join("second-snapshot");
+        remodex_connect_native::migration_snapshot::capture(
+            &export.root.path().join("export"),
+            &fresh,
+            ENV,
+        )
+        .unwrap();
+        store
+            .prepare_legacy_claude(&raw(&bound_source(dir.path())))
+            .unwrap();
+        let before = store.load_chat("original-android-chat").unwrap();
+        assert!(store
+            .prepare_legacy_claude_native("original-android-chat", &fresh, &export.transcript)
+            .is_err());
+        assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='legacy_claude_native'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert!(store.assert_migration_ready().is_err());
+    }
 }
 #[test]
 fn legacy_prompt_bindings_preserve_aliases_without_fabricating_delivery_receipts() {

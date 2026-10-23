@@ -400,6 +400,7 @@ impl Store {
             crate::legacy_claude_assets::rollback(&tx, id)?;
             crate::legacy_claude_resume::rollback(&tx, id)?;
             crate::legacy_claude_bindings::rollback(&tx, id)?;
+            crate::legacy_claude_native::rollback(&tx, &self.directory, id)?;
             for table in ["chat_rows", "native_checkpoints", "tool_images"] {
                 tx.execute(&format!("DELETE FROM {table} WHERE chat=?1"), [id])
                     .map_err(|_| INVALID)?;
@@ -466,6 +467,7 @@ fn verify(
     directory: &std::path::Path,
 ) -> Result<(), String> {
     let id = p.state["thread"]["id"].as_str().unwrap();
+    crate::legacy_claude_native::verify(db, directory, id)?;
     let state = crate::legacy_claude_assets::project(db, directory, &p.state)?;
     let mut header = state.clone();
     let mut total = 0;

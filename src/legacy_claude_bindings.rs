@@ -79,6 +79,9 @@ fn expected(raw: &[u8]) -> Result<(String, Vec<Binding>), String> {
     }
     Ok((session, by_native.into_values().collect()))
 }
+pub(crate) fn validate(raw: &[u8]) -> Result<(), String> {
+    expected(raw).map(|_| ())
+}
 fn table(db: &rusqlite::Connection) -> Result<bool, String> {
     db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='legacy_claude_bindings')",[],|r|r.get(0)).map_err(|_|INVALID.into())
 }
