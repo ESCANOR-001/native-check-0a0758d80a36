@@ -200,6 +200,11 @@ pub(crate) fn routes(app: App) -> Router<App> {
         .route("/api/storage", get(storage_report))
         .route("/api/storage/cleanup/preview", post(storage_preview))
         .route("/api/storage/trash", get(storage_trash))
+        .route(
+            "/api/storage/cleanup-policy",
+            get(storage::policy_read).put(storage::policy_save),
+        )
+        .route("/api/storage/cleanup-policy/run", post(storage::policy_run))
         .route("/api/storage/cleanup", post(storage::cleanup))
         .route("/api/storage/trash/restore", post(storage::restore))
         .route(

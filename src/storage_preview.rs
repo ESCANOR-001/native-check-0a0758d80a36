@@ -227,6 +227,7 @@ pub(crate) struct Candidate {
     physical: Vec<(String, u64, f64)>,
 }
 pub(crate) struct Selection {
+    pub archived_bytes: u64,
     pub percent: u64,
     pub bytes: u64,
     pub digest: String,
@@ -241,6 +242,18 @@ pub(crate) fn preview(home: &Path, percent: f64) -> Result<Value> {
     Ok(select(home, percent)?.response())
 }
 pub(crate) fn select(home: &Path, percent: f64) -> Result<Selection> {
+    select_target(home, Target::Percent(percent))
+}
+#[derive(Clone, Copy)]
+pub(crate) enum Target {
+    Percent(f64),
+    ReduceTo(u64),
+}
+pub(crate) fn select_target(home: &Path, target: Target) -> Result<Selection> {
+    let percent = match target {
+        Target::Percent(n) => n,
+        Target::ReduceTo(_) => 0.0,
+    };
     if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
         return Err("invalid_percent");
     }
@@ -291,6 +304,10 @@ pub(crate) fn select(home: &Path, percent: f64) -> Result<Selection> {
         c.physical_rel_paths.push(rel.clone());
         c.physical.push((rel, meta.len(), mtime));
     }
+    let archived_bytes = groups
+        .values()
+        .try_fold(0u64, |sum, c| sum.checked_add(c.bytes))
+        .ok_or(LIMITED)?;
     let mut all: Vec<_> = groups
         .into_values()
         .filter(|c| !pins.contains(&c.rel_path))
@@ -310,11 +327,19 @@ pub(crate) fn select(home: &Path, percent: f64) -> Result<Selection> {
     } else {
         (all.len() * percent as usize / 100).max(1)
     };
-    let selected: Vec<_> = all
-        .into_iter()
-        .filter(|c| !pending.contains(&c.rel_path))
-        .take(count)
-        .collect();
+    let mut selected = Vec::new();
+    let mut freed = 0u64;
+    for c in all.into_iter().filter(|c| !pending.contains(&c.rel_path)) {
+        let done = match target {
+            Target::Percent(_) => selected.len() >= count,
+            Target::ReduceTo(bytes) => archived_bytes.saturating_sub(freed) <= bytes,
+        };
+        if done {
+            break;
+        }
+        freed = freed.checked_add(c.bytes).ok_or(LIMITED)?;
+        selected.push(c);
+    }
     let mut lines: Vec<_> = selected
         .iter()
         .map(|c| {
@@ -342,6 +367,7 @@ pub(crate) fn select(home: &Path, percent: f64) -> Result<Selection> {
         .try_fold(0u64, |sum, c| sum.checked_add(c.bytes))
         .ok_or(LIMITED)?;
     Ok(Selection {
+        archived_bytes,
         percent,
         bytes,
         digest,

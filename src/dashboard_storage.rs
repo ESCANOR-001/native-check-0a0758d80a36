@@ -2,6 +2,45 @@
 use super::*;
 use crate::{storage_cleanup::Failure, storage_report::Mutation};
 type Body = Result<Json<Value>, axum::extract::rejection::JsonRejection>;
+pub(super) async fn policy_read(State(app): State<App>) -> Response {
+    match app.storage_policy.read().await {
+        Ok(v) => response(StatusCode::OK, v),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    }
+}
+pub(super) async fn policy_save(State(app): State<App>, body: Body) -> Response {
+    let Ok(Json(body)) = body else {
+        return failed("invalid_json".into());
+    };
+    if *app.stopping.borrow() {
+        return error(StatusCode::CONFLICT, "Bridge is stopping");
+    }
+    match app.storage_policy.save(body).await {
+        Ok(v) => response(StatusCode::OK, v),
+        Err(e) => error(StatusCode::BAD_REQUEST, &e),
+    }
+}
+pub(super) async fn policy_run(State(app): State<App>) -> Response {
+    let Some(chats) = app.chats else {
+        return failed("storage_unavailable".into());
+    };
+    match app
+        .storage_policy
+        .launch(chats, app.stopping, crate::storage_policy::Reason::Manual)
+        .await
+    {
+        Ok(Some(v)) => response(StatusCode::OK, v),
+        Ok(None) => error(StatusCode::SERVICE_UNAVAILABLE, "Cleanup did not start"),
+        Err(e) => error(
+            if matches!(e.as_str(), "already_running" | "stopping") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            },
+            &e,
+        ),
+    }
+}
 
 pub(super) async fn cleanup(State(app): State<App>, body: Body) -> Response {
     let Ok(Json(body)) = body else {

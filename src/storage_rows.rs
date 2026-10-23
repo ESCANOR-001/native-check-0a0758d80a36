@@ -53,6 +53,9 @@ pub enum Table {
     Threads,
     DynamicTools,
     SpawnEdges,
+    Attachments,
+    GuardianFeedback,
+    ReadReceipts,
     Logs,
     Stage1,
     Jobs,
@@ -65,6 +68,9 @@ impl Table {
             Self::Threads => "threads",
             Self::DynamicTools => "thread_dynamic_tools",
             Self::SpawnEdges => "thread_spawn_edges",
+            Self::Attachments => "thread_attachments",
+            Self::GuardianFeedback => "guardian_review_feedback",
+            Self::ReadReceipts => "thread_read_receipts",
             Self::Logs => "logs",
             Self::Stage1 => "stage1_outputs",
             Self::Jobs => "jobs",
@@ -74,7 +80,12 @@ impl Table {
     }
     fn kind(self) -> Kind {
         match self {
-            Self::Threads | Self::DynamicTools | Self::SpawnEdges => Kind::State,
+            Self::Threads
+            | Self::DynamicTools
+            | Self::SpawnEdges
+            | Self::Attachments
+            | Self::GuardianFeedback
+            | Self::ReadReceipts => Kind::State,
             Self::Logs => Kind::Logs,
             Self::Stage1 | Self::Jobs => Kind::Memories,
             Self::Goals | Self::Deferrals => Kind::Goals,
@@ -185,6 +196,24 @@ pub struct Database<'a> {
 fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
+fn known_timestamp_trigger(sql: &str) -> bool {
+    let normalize = |s: &str| {
+        s.split_ascii_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim_end_matches(';')
+            .to_ascii_lowercase()
+    };
+    let actual = normalize(sql);
+    for column in ["created_at", "updated_at"] {
+        let insert = format!("CREATE TRIGGER threads_{column}_ms_after_insert AFTER INSERT ON threads WHEN NEW.{column}_ms IS NULL BEGIN UPDATE threads SET {column}_ms = NEW.{column} * 1000 WHERE id = NEW.id; END");
+        let update = format!("CREATE TRIGGER threads_{column}_ms_after_update AFTER UPDATE OF {column} ON threads WHEN NEW.{column} != OLD.{column} AND NEW.{column}_ms IS OLD.{column}_ms BEGIN UPDATE threads SET {column}_ms = NEW.{column} * 1000 WHERE id = NEW.id; END");
+        if actual == normalize(&insert) || actual == normalize(&update) {
+            return true;
+        }
+    }
+    actual == normalize("CREATE TRIGGER threads_recency_at_after_insert AFTER INSERT ON threads WHEN NEW.recency_at_ms = 0 BEGIN UPDATE threads SET recency_at = NEW.updated_at, recency_at_ms = COALESCE(NEW.updated_at_ms, NEW.updated_at * 1000) WHERE id = NEW.id; END")
+}
 impl<'a> Database<'a> {
     pub fn open(lease: &'a Lease, kind: Kind) -> Result<Option<Self>> {
         lease.check().map_err(|_| FAILED)?;
@@ -246,6 +275,14 @@ impl<'a> Database<'a> {
         }
         db.busy_timeout(Duration::from_millis(100))
             .map_err(failure)?;
+        // Restoring an exact row must not regenerate its timestamps. This flag
+        // belongs only to this connection: CLI connections keep their triggers.
+        // Schema validation below still rejects every unrecognized trigger.
+        db.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
+            false,
+        )
+        .map_err(failure)?;
         // Limit SQLite's own allocation before reading cells, not just our Vec.
         db.set_limit(
             rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
@@ -286,16 +323,18 @@ impl<'a> Database<'a> {
         if sql.to_ascii_uppercase().contains("VIRTUAL") {
             return Err(FAILED);
         }
-        let triggers: i64 = self
+        let mut triggers = self
             .db
-            .query_row(
-                "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND tbl_name=?1",
-                [table.name()],
-                |r| r.get(0),
-            )
+            .prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND tbl_name=?1 LIMIT 17")
             .map_err(failure)?;
-        if triggers != 0 {
-            return Err("storage_schema_not_supported");
+        let mut rows = triggers.query([table.name()]).map_err(failure)?;
+        let mut count = 0;
+        while let Some(row) = rows.next().map_err(failure)? {
+            count += 1;
+            let sql: String = row.get(0).map_err(failure)?;
+            if count > 16 || table != Table::Threads || !known_timestamp_trigger(&sql) {
+                return Err("storage_schema_not_supported");
+            }
         }
         let mut q = self
             .db
@@ -853,6 +892,9 @@ impl<'a> Database<'a> {
             self.db
                 .execute(&sql, params_from_iter(values))
                 .map_err(failure)?;
+            if self.current(backup, row, &keys)?.as_ref() != Some(row) {
+                return Err("storage_restore_conflict");
+            }
         }
         Ok(())
     }

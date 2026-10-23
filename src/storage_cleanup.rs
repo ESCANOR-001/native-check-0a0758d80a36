@@ -70,6 +70,21 @@ fn lock(lease: &Lease) -> Result<Vec<Database<'_>>> {
     }
     Ok(out)
 }
+fn tables(kind: Kind) -> &'static [Table] {
+    match kind {
+        Kind::State => &[
+            Table::Threads,
+            Table::DynamicTools,
+            Table::SpawnEdges,
+            Table::Attachments,
+            Table::GuardianFeedback,
+            Table::ReadReceipts,
+        ],
+        Kind::Logs => &[Table::Logs],
+        Kind::Memories => &[Table::Stage1, Table::Jobs],
+        Kind::Goals => &[Table::Goals, Table::Deferrals],
+    }
+}
 fn snapshot<'a>(
     mut databases: Vec<Database<'a>>,
     paths: &[String],
@@ -93,12 +108,7 @@ fn snapshot<'a>(
     let mut budget = 0;
     for mut db in databases.drain(..) {
         let binding = db.binding()?;
-        let tables: &[Table] = match binding.kind {
-            Kind::State => &[Table::Threads, Table::DynamicTools, Table::SpawnEdges],
-            Kind::Logs => &[Table::Logs],
-            Kind::Memories => &[Table::Stage1, Table::Jobs],
-            Kind::Goals => &[Table::Goals, Table::Deferrals],
-        };
+        let tables = tables(binding.kind);
         let mut rows = Vec::new();
         let mut consolidation = None;
         for table in tables {
@@ -179,18 +189,60 @@ fn cleanup_inner(
     protected: &[String],
     hook: &dyn Fn(Point) -> Result<()>,
 ) -> std::result::Result<Value, Failure> {
-    if !matches!(mode, "quarantine" | "permanent") {
-        return Err("invalid_mode".into());
-    }
     if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("invalid_digest".into());
     }
+    cleanup_selected(
+        home,
+        mode,
+        protected,
+        &|home| {
+            let selected = storage_preview::select(home, percent)?;
+            if !selected.digest.eq_ignore_ascii_case(digest) {
+                return Err("stale_preview");
+            }
+            Ok(selected)
+        },
+        hook,
+    )
+}
+pub(crate) fn policy_cleanup(
+    home: &Path,
+    target: storage_preview::Target,
+    threshold: u64,
+    mode: &str,
+    protected: &[String],
+) -> std::result::Result<Value, Failure> {
+    cleanup_selected(
+        home,
+        mode,
+        protected,
+        &|home| {
+            let selected = storage_preview::select_target(home, target)?;
+            if selected.archived_bytes <= threshold {
+                return Err("under_threshold");
+            }
+            if selected.candidates.is_empty() {
+                return Err("nothing_selected");
+            }
+            Ok(selected)
+        },
+        &|_| Ok(()),
+    )
+}
+fn cleanup_selected(
+    home: &Path,
+    mode: &str,
+    protected: &[String],
+    select: &dyn Fn(&Path) -> Result<storage_preview::Selection>,
+    hook: &dyn Fn(Point) -> Result<()>,
+) -> std::result::Result<Value, Failure> {
+    if !matches!(mode, "quarantine" | "permanent") {
+        return Err("invalid_mode".into());
+    }
     let lease = acquire(home)?;
     let databases = lock(&lease)?;
-    let selected = storage_preview::select(lease.home(), percent)?;
-    if !selected.digest.eq_ignore_ascii_case(digest) {
-        return Err("stale_preview".into());
-    }
+    let selected = select(lease.home())?;
     let logical: Vec<_> = selected
         .candidates
         .iter()
@@ -409,12 +461,7 @@ fn validate_backup(stage: &Stage<'_>, backup: &Backup) -> Result<()> {
         if !kinds.insert(section.binding.kind as u8) {
             return Err("db_reconcile_failed");
         }
-        let expected: &[Table] = match section.binding.kind {
-            Kind::State => &[Table::Threads, Table::DynamicTools, Table::SpawnEdges],
-            Kind::Logs => &[Table::Logs],
-            Kind::Memories => &[Table::Stage1, Table::Jobs],
-            Kind::Goals => &[Table::Goals, Table::Deferrals],
-        };
+        let expected = tables(section.binding.kind);
         let mut last = None;
         for rows in &section.rows {
             let index = expected
@@ -438,6 +485,58 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
     use std::fs;
+    #[test]
+    fn policy_reduces_to_exact_bytes_and_threshold_skips_without_changes() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir(home.path().join("archived_sessions")).unwrap();
+        let db = Connection::open(home.path().join("state_1.sqlite")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,archived INTEGER)",
+        )
+        .unwrap();
+        for i in 0..203 {
+            let name = format!("{i:04}");
+            let path = format!("archived_sessions/{name}.jsonl");
+            fs::write(home.path().join(&path), [b'x'; 10]).unwrap();
+            db.execute("INSERT INTO threads VALUES(?1,?2,1)", [name, path])
+                .unwrap();
+        }
+        assert_eq!(
+            policy_cleanup(
+                home.path(),
+                storage_preview::Target::ReduceTo(2020),
+                2030,
+                "quarantine",
+                &[]
+            )
+            .unwrap_err()
+            .error,
+            "under_threshold"
+        );
+        assert_eq!(
+            fs::read_dir(home.path().join("archived_sessions"))
+                .unwrap()
+                .count(),
+            203
+        );
+        let result = policy_cleanup(
+            home.path(),
+            storage_preview::Target::ReduceTo(2010),
+            0,
+            "quarantine",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(result["count"], 2);
+        assert_eq!(result["bytes"], 20);
+        restore(home.path(), result["trashDir"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            fs::read_dir(home.path().join("archived_sessions"))
+                .unwrap()
+                .count(),
+            203
+        );
+    }
     fn fixture() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         let home = root.path();

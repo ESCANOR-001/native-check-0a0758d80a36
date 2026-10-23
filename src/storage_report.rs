@@ -426,12 +426,14 @@ pub(crate) enum Mutation {
     },
     Restore(String),
     ResumePurge(String),
+    Policy(crate::storage_policy::Policy),
 }
 #[derive(Clone)]
 pub(crate) struct Reader {
     home: PathBuf,
     cache: Arc<Mutex<Option<(Instant, Value)>>>,
     gate: Arc<tokio::sync::Semaphore>,
+    waiting: Arc<tokio::sync::Semaphore>,
 }
 impl Reader {
     pub fn new(home: PathBuf) -> Self {
@@ -439,6 +441,7 @@ impl Reader {
             home,
             cache: Arc::default(),
             gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            waiting: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
     pub async fn mutate(
@@ -457,6 +460,13 @@ impl Reader {
             }
             Mutation::Restore(id) => crate::storage_cleanup::restore(home, &id),
             Mutation::ResumePurge(id) => crate::storage_cleanup::resume_purge(home, &id),
+            Mutation::Policy(policy) => crate::storage_cleanup::policy_cleanup(
+                home,
+                policy.selection(),
+                policy.trigger.archived_bytes_over,
+                policy.mode(),
+                &protected,
+            ),
         })
         .await
     }
@@ -492,11 +502,7 @@ impl Reader {
         .map_err(|_| crate::storage_cleanup::Failure::from("storage_worker_failed"))?
     }
     pub async fn read(&self) -> Result<Value, String> {
-        let permit = self
-            .gate
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| "Storage scan is busy; retry shortly")?;
+        let permit = self.read_permit().await?;
         let home = self.home.clone();
         let cache = self.cache.clone();
         tokio::task::spawn_blocking(move || {
@@ -515,11 +521,7 @@ impl Reader {
         .map_err(|_| "Storage scanner stopped".to_owned())?
     }
     pub async fn preview(&self, percent: f64) -> Result<Value, String> {
-        let permit = self
-            .gate
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| "Storage scan is busy; retry shortly")?;
+        let permit = self.read_permit().await?;
         let home = self.home.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -529,11 +531,7 @@ impl Reader {
         .map_err(|_| "Storage scanner stopped".to_owned())?
     }
     pub async fn trash(&self) -> Result<Value, String> {
-        let permit = self
-            .gate
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| "Storage scan is busy; retry shortly")?;
+        let permit = self.read_permit().await?;
         let home = self.home.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -541,6 +539,19 @@ impl Reader {
         })
         .await
         .map_err(|_| "Storage scanner stopped".to_owned())?
+    }
+    async fn read_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        // The unchanged dashboard refreshes usage and quarantine together.
+        // Serialize a small bounded group instead of making one refresh fail.
+        let _waiting = self
+            .waiting
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "Storage scan is busy; retry shortly")?;
+        tokio::time::timeout(Duration::from_secs(5), self.gate.clone().acquire_owned())
+            .await
+            .map_err(|_| "Storage scan is busy; retry shortly")?
+            .map_err(|_| "Storage scanner stopped".into())
     }
 }
 
@@ -578,7 +589,11 @@ mod mutation_tests {
         task.abort();
         let _ = task.await;
         assert!(reserved.load(Ordering::Acquire));
-        assert!(reader.read().await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), reader.read())
+                .await
+                .is_err()
+        );
         assert!(reader.cache.lock().unwrap().is_none());
         release.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -589,5 +604,19 @@ mod mutation_tests {
         .await
         .unwrap();
         reader.read().await.unwrap();
+    }
+    #[tokio::test]
+    async fn concurrent_dashboard_reads_queue_behind_one_scan_with_bounded_waiters() {
+        let root = tempfile::tempdir().unwrap();
+        let reader = Reader::new(root.path().into());
+        let gate = reader.gate.clone().acquire_owned().await.unwrap();
+        let r = reader.clone();
+        let task = tokio::spawn(async move { tokio::join!(r.read(), r.trash(), r.preview(100.0)) });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        drop(gate);
+        let (report, trash, preview) = task.await.unwrap();
+        assert!(report.is_ok() && trash.is_ok() && preview.is_ok());
+        assert_eq!(reader.waiting.available_permits(), 4);
     }
 }

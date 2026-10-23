@@ -37,6 +37,7 @@ pub struct App {
     pub(crate) metrics: crate::runtime_metrics::Metrics,
     pub(crate) online: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     pub stopping: tokio::sync::watch::Sender<bool>,
+    pub(crate) storage_policy: crate::storage_policy_job::Runner,
     connections: Arc<Semaphore>,
     transfers: Arc<Semaphore>,
     preview_requests: Arc<Semaphore>,
@@ -45,10 +46,23 @@ pub struct App {
     assets: Arc<tokio::sync::Mutex<HashMap<String, Asset>>>,
 }
 impl App {
+    pub fn start_storage_scheduler(&self) {
+        if let Some(chats) = &self.chats {
+            self.storage_policy
+                .schedule(chats.clone(), self.stopping.clone());
+        }
+    }
+    pub async fn drain_storage_policy(&self) {
+        self.storage_policy.drain().await;
+    }
     pub fn new(auth: Auth, label: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let environment_id = auth.store.environment_id()?;
+        let auth = AuthService::new(auth)?;
+        let storage_policy = crate::storage_policy_job::Runner::new(auth.clone());
         Ok(Self {
-            environment_id: auth.store.environment_id()?,
-            auth: AuthService::new(auth)?,
+            environment_id,
+            auth,
+            storage_policy,
             label: label.to_owned(),
             chats: None,
             dashboard: None,

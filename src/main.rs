@@ -90,6 +90,8 @@ async fn serve(
         .transpose()?;
     let chats = app.chats.clone();
     let shutdown_chats = chats.clone();
+    app.start_storage_scheduler();
+    let shutdown_storage = app.clone();
     let shutdown_signal = app.stopping.clone();
     let mut requested_stop = shutdown_signal.subscribe();
     let mut cleanup_stop = shutdown_signal.subscribe();
@@ -121,6 +123,7 @@ async fn serve(
         }
         shutdown_log.lifecycle(remodex_connect_native::diagnostics::Lifecycle::Stopping);
         shutdown_signal.send_replace(true);
+        shutdown_storage.drain_storage_policy().await;
         if let Some(chats) = shutdown_chats {
             let _ = chats
                 .call(

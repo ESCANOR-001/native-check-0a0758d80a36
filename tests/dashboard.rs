@@ -1385,6 +1385,191 @@ async fn storage_fixture() -> (Fixture, remodex_connect_native::chat::Chats) {
     db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,archived INTEGER);INSERT INTO threads VALUES('retired','archived_sessions/retired.jsonl',1);").unwrap();
     (f, hub)
 }
+async fn wait_policy(router: Router, headers: &[(&str, &str)]) -> Value {
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            let (code, text) = call(
+                router.clone(),
+                "GET",
+                "/api/storage/cleanup-policy",
+                headers,
+                json!(null),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "{text}");
+            let v: Value = serde_json::from_str(&text).unwrap();
+            if v["job"]["status"] != "running" {
+                return v;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+#[tokio::test]
+async fn storage_policy_is_opt_in_local_only_and_runs_and_restores_in_existing_ui_contract() {
+    use remodex_connect_native::chat::AgentKind;
+    let (f, hub) = storage_fixture().await;
+    let router = f.app.clone().router();
+    let (token, csrf) = session(router.clone()).await;
+    let good = [
+        ("x-opencodex-api-key", token.as_str()),
+        ("x-opencodex-gui-origin", "http://localhost:18900"),
+        ("origin", "http://localhost:18900"),
+        ("x-opencodex-csrf-token", csrf.as_str()),
+    ];
+    let path = "/api/storage/cleanup-policy";
+    for (method, path) in [
+        ("GET", path),
+        ("PUT", path),
+        ("POST", "/api/storage/cleanup-policy/run"),
+    ] {
+        assert_eq!(
+            call(router.clone(), method, path, &[], json!({"enabled":true}))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        call(
+            router.clone(),
+            "PUT",
+            path,
+            &good,
+            json!({"target":{"reduceToBytes":0,"removeOldestPercent":10}})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let initial = wait_policy(router.clone(), &good).await;
+    assert_eq!(initial["enabled"], false);
+    let (code, text) = call(
+        router.clone(),
+        "POST",
+        "/api/storage/cleanup-policy/run",
+        &good,
+        json!(null),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap()["started"],
+        true
+    );
+    let disabled = wait_policy(router.clone(), &good).await;
+    assert_eq!(disabled["job"]["lastOutcome"]["skipped"], "disabled");
+    assert!(f
+        ._root
+        .path()
+        .join("archived_sessions/retired.jsonl")
+        .exists());
+    assert_eq!(call(router.clone(),"PUT",path,&good,json!({"enabled":true,"trigger":{"archivedBytesOver":0},"target":{"reduceToBytes":0},"schedule":"manual","mode":"quarantine"})).await.0,StatusCode::OK);
+    // Startup discovery can briefly reserve the CLI; only retry an explicit
+    // deferred outcome. Successful mutations are never replayed.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let done = loop {
+        assert_eq!(
+            call(
+                router.clone(),
+                "POST",
+                "/api/storage/cleanup-policy/run",
+                &good,
+                json!(null)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let v = wait_policy(router.clone(), &good).await;
+        if v["job"]["lastOutcome"]["deferred"] != "codex_busy" {
+            break v;
+        }
+        assert!(std::time::Instant::now() < end);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    assert_eq!(done["job"]["lastOutcome"]["ok"], true, "{done}");
+    assert_eq!(done["lastRun"]["removed"], 1);
+    assert!(!f
+        ._root
+        .path()
+        .join("archived_sessions/retired.jsonl")
+        .exists());
+    let (code, v) = storage_idle_call(
+        router.clone(),
+        "/api/storage/trash/restore",
+        &good,
+        json!({"id":done["job"]["lastOutcome"]["trashDir"]}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert!(f
+        ._root
+        .path()
+        .join("archived_sessions/retired.jsonl")
+        .exists());
+    hub.call(AgentKind::Codex, "local", "native.shutdown", json!({}))
+        .await
+        .unwrap();
+}
+#[tokio::test]
+async fn storage_policy_defers_both_agents_and_shutdown_prevents_late_scheduler_work() {
+    use remodex_connect_native::chat::AgentKind;
+    for agent in [AgentKind::Codex, AgentKind::Claude] {
+        let (f, hub) = storage_fixture().await;
+        let router = f.app.clone().router();
+        let (token, csrf) = session(router.clone()).await;
+        let good = [
+            ("x-opencodex-api-key", token.as_str()),
+            ("x-opencodex-gui-origin", "http://localhost:18900"),
+            ("origin", "http://localhost:18900"),
+            ("x-opencodex-csrf-token", csrf.as_str()),
+        ];
+        assert_eq!(call(router.clone(),"PUT","/api/storage/cleanup-policy",&good,json!({"enabled":true,"trigger":{"archivedBytesOver":0},"schedule":"startup","target":{"removeOldestPercent":100}})).await.0,StatusCode::OK);
+        hub.call(agent,"phone","orchestration.dispatchCommand",json!({"type":"thread.create","threadId":"policy-busy","projectId":"native-test-project","commandId":"policy-create"})).await.unwrap();
+        hub.call(agent,"phone","orchestration.dispatchCommand",json!({"type":"thread.turn.start","threadId":"policy-busy","commandId":"policy-hold","message":{"messageId":"hold","text":"hold","attachments":[]}})).await.unwrap();
+        f.app.start_storage_scheduler();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                let v = wait_policy(router.clone(), &good).await;
+                if v["job"]["lastOutcome"].is_object() {
+                    break v;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result["job"]["lastOutcome"]["deferred"], "codex_busy");
+        assert!(
+            result["nextRun"].as_u64().unwrap() > result["job"]["finishedAt"].as_u64().unwrap()
+        );
+        assert!(f
+            ._root
+            .path()
+            .join("archived_sessions/retired.jsonl")
+            .exists());
+        f.app.stopping.send_replace(true);
+        f.app.drain_storage_policy().await;
+        assert_eq!(
+            call(
+                router,
+                "POST",
+                "/api/storage/cleanup-policy/run",
+                &good,
+                json!(null)
+            )
+            .await
+            .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        hub.call(agent, "local", "native.shutdown", json!({}))
+            .await
+            .unwrap();
+    }
+}
 async fn storage_idle_call(
     router: Router,
     path: &str,

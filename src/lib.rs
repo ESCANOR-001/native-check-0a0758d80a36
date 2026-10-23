@@ -54,6 +54,8 @@ mod repository_clone;
 mod runtime_metrics;
 pub mod storage;
 mod storage_disk;
+mod storage_policy;
+mod storage_policy_job;
 mod storage_preview;
 mod storage_report;
 mod storage_trash;
@@ -70,3 +72,6 @@ pub mod storage_stage;
 pub mod storage_rows;
 
 pub mod storage_cleanup;
+
+#[cfg(test)]
+mod storage_native_schema_tests;
