@@ -60,6 +60,25 @@ fn epoch(name: &str) -> bool {
             .iter()
             .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
 }
+fn logical_pin(home: &Path, row: &str) -> Option<String> {
+    let row = row.replace('\\', "/");
+    let path = Path::new(&row);
+    if !path.is_absolute() {
+        return archived(&row);
+    }
+    // The logical .jsonl may have been compressed, so only its .zst sibling
+    // exists. Resolve its parent as well as Windows drive/UNC and macOS aliases.
+    let resolved = path
+        .canonicalize()
+        .ok()
+        .or_else(|| Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?)))?;
+    let relative = resolved
+        .strip_prefix(home)
+        .ok()?
+        .to_str()?
+        .replace('\\', "/");
+    archived(&relative)
+}
 fn restoring(home: &Path, budget: &mut Budget) -> Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
     for path in budget.directory(&home.join(".trash"))? {
@@ -159,20 +178,7 @@ fn pinned(home: &Path, budget: &mut Budget) -> Result<BTreeSet<String>> {
         if i >= 50_000 {
             return Err(LIMITED);
         }
-        let row = row.map_err(|_| FAILED)?.replace('\\', "/");
-        let absolute = Path::new(&row);
-        let resolved = absolute
-            .is_absolute()
-            .then(|| absolute.canonicalize().ok())
-            .flatten();
-        let rel = resolved
-            .as_deref()
-            .unwrap_or(absolute)
-            .strip_prefix(home)
-            .ok()
-            .and_then(|p| p.to_str())
-            .unwrap_or(&row);
-        if let Some(logical) = archived(rel) {
+        if let Some(logical) = logical_pin(home, &row.map_err(|_| FAILED)?) {
             out.insert(logical);
         }
     }
@@ -399,6 +405,36 @@ mod tests {
         assert_eq!(preview(root.path(), 100.0).unwrap()["count"], 2);
         db.execute_batch("UPDATE threads SET is_pinned=0").unwrap();
         assert_eq!(preview(root.path(), 50.0).unwrap()["count"], 2);
+    }
+    #[test]
+    fn pinned_paths_normalize_native_separators_and_missing_compressed_logical_file() {
+        let root = tempfile::tempdir().unwrap();
+        archive(root.path(), "pin.jsonl.zst", 2, 1);
+        archive(root.path(), "safe.jsonl", 3, 2);
+        let db = Connection::open(root.path().join("state_1.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(rollout_path TEXT,is_pinned INTEGER)")
+            .unwrap();
+        let logical = root.path().join("archived_sessions/pin.jsonl");
+        for path in [
+            logical.to_str().unwrap().to_owned(),
+            logical
+                .with_extension("jsonl.zst")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            "archived_sessions/pin.jsonl".to_owned(),
+            "archived_sessions\\pin.jsonl.zst".to_owned(),
+        ] {
+            db.execute("DELETE FROM threads", []).unwrap();
+            db.execute("INSERT INTO threads VALUES(?1,1)", [path])
+                .unwrap();
+            let result = preview(root.path(), 100.0).unwrap();
+            assert_eq!(result["count"], 1);
+            assert_eq!(
+                result["candidates"][0]["relPath"],
+                "archived_sessions/safe.jsonl"
+            );
+        }
     }
     #[test]
     fn preview_fails_closed_on_unknown_pin_or_restore_state_and_limits_wire_rows() {

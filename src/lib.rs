@@ -50,6 +50,7 @@ pub mod invitation_file;
 pub mod profile_lock;
 mod profile_snapshot;
 mod repository_clone;
+mod runtime_metrics;
 pub mod storage;
 mod storage_disk;
 mod storage_preview;

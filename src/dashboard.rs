@@ -198,6 +198,7 @@ pub(crate) fn routes(app: App) -> Router<App> {
         .route("/api/storage", get(storage_report))
         .route("/api/storage/cleanup/preview", post(storage_preview))
         .route("/api/storage/trash", get(storage_trash))
+        .route("/api/system/memory", get(memory))
         .route("/api/android-remote", get(status))
         .route(
             "/api/android-remote/claude-code",
@@ -219,6 +220,15 @@ async fn activity(State(app): State<App>) -> Response {
     match chats.activity.read().await {
         Ok(value) => response(StatusCode::OK, value),
         Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    }
+}
+async fn memory(State(app): State<App>) -> Response {
+    match app.metrics.read() {
+        Some(value) => response(StatusCode::OK, value),
+        None => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Process memory is unavailable",
+        ),
     }
 }
 async fn storage_report(State(app): State<App>) -> Response {

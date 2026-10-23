@@ -94,6 +94,50 @@ async fn session(router: Router) -> (String, String) {
 }
 
 #[tokio::test]
+async fn process_memory_requires_dashboard_session_and_reports_only_native_counters() {
+    let f = setup();
+    let router = f.app.router();
+    let path = "/api/system/memory";
+    assert_eq!(
+        call(router.clone(), "GET", path, &[], Value::Null).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            router.clone(),
+            "GET",
+            path,
+            &[("authorization", &format!("Bearer {}", f.phone))],
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (token, csrf) = session(router.clone()).await;
+    let headers = [
+        ("x-opencodex-api-key", token.as_str()),
+        ("x-opencodex-gui-origin", "http://localhost:18900"),
+        ("origin", "http://localhost:18900"),
+        ("x-opencodex-csrf-token", csrf.as_str()),
+    ];
+    let (code, body) = call(router.clone(), "GET", path, &headers, Value::Null).await;
+    assert_eq!(code, StatusCode::OK);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["runtime"], "rust");
+    assert!(v["rss"].as_u64().unwrap() > 0);
+    assert!(v.get("activeTurnCount").is_none());
+    assert!(v.get("bunVersion").is_none());
+    assert!(!body.contains(&token));
+    assert!(!body.contains(&f.phone));
+    assert!(!body.contains(f._root.path().to_str().unwrap()));
+    assert_eq!(
+        call(router, "POST", path, &headers, json!({})).await.0,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+}
+
+#[tokio::test]
 async fn agents_dashboard_uses_real_profile_status_and_isolated_preferences() {
     use remodex_connect_native::chat::{AgentConfig, Chats, Config};
     let mut f = setup();
