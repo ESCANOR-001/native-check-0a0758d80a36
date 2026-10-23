@@ -106,7 +106,7 @@ impl Store {
         chat: &str,
         session: &str,
     ) -> rusqlite::Result<Vec<String>> {
-        self.db.prepare("SELECT native FROM claude_outbox WHERE chat=?1 AND session=?2 AND state NOT IN ('completed','cancelled') ORDER BY rowid LIMIT 65")?
+        self.db.prepare("SELECT native FROM claude_outbox WHERE chat=?1 AND session=?2 AND state NOT IN ('completed','cancelled','orphaned') ORDER BY rowid LIMIT 65")?
             .query_map(params![chat,session], |r| r.get(0))?.collect()
     }
 }
@@ -129,6 +129,10 @@ pub(crate) fn apply_receipt(
 ) -> rusqlite::Result<()> {
     if receipt.owner_stopped {
         tx.execute("UPDATE claude_outbox SET state=CASE state WHEN 'offered' THEN 'uncertain' ELSE 'consumed-unfinished' END WHERE chat=?1 AND session=?2 AND state IN ('offered','consumed')",params![chat,session])?;
+    }
+    if receipt.owner_replaced {
+        // Terminal: never pending again, never resent, never revived.
+        tx.execute("UPDATE claude_outbox SET state='orphaned' WHERE chat=?1 AND session=?2 AND state IN ('offered','consumed','uncertain','consumed-unfinished')",params![chat,session])?;
     }
     for id in &receipt.consumed {
         tx.execute("UPDATE claude_outbox SET state='consumed' WHERE chat=?1 AND session=?2 AND native=?3 AND state IN ('offered','uncertain','consumed-unfinished')",params![chat,session,id])?;

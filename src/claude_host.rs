@@ -55,6 +55,9 @@ pub struct Receipt {
     pub completed: Vec<String>,
     pub cancelled: Vec<String>,
     pub owner_stopped: bool,
+    /// A different worker process now owns the session: inputs the previous
+    /// process held can never finish and are never resent.
+    pub owner_replaced: bool,
 }
 #[derive(Default)]
 pub struct Ledger {

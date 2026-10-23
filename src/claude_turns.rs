@@ -326,6 +326,12 @@ impl Router {
         *self = next;
         Ok(change)
     }
+    /// The worker process that held the active turn and pending inputs is
+    /// gone without a result: they end exactly as for a graceful shutdown.
+    pub fn owner_gone(&mut self) -> Change {
+        self.apply(&serde_json::json!({"type":"system","subtype":"worker_shutting_down"}))
+            .unwrap_or_default()
+    }
     fn retire(&mut self, id: &str) {
         self.pending.remove(id);
         if !self.retired.iter().any(|v| v == id) {

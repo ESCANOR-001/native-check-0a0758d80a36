@@ -570,6 +570,65 @@ async fn hosted_claude_recovery_keeps_interrupted_queue_paused_and_respects_opt_
 }
 
 #[tokio::test]
+async fn hosted_claude_paused_queue_sends_a_chosen_message_now_and_resumes_the_rest() {
+    let mut test = Test::hosted().await;
+    let a = AgentKind::Claude;
+    test.create(a, "send-now").await;
+    test.call(a, prompt("send-now", "hold", "normal"))
+        .await
+        .unwrap();
+    test.wait(a, "send-now", "running").await;
+    for text in ["FIRST_QUEUED", "SECOND_QUEUED"] {
+        test.call(a, prompt("send-now", text, "queue"))
+            .await
+            .unwrap();
+    }
+    test.stop().await;
+    test.hub = Chats::start(test.db.clone(), test.config.clone())
+        .await
+        .unwrap();
+    wait_links(&test, 2).await;
+    let prompts = |test: &Test| {
+        std::fs::read_to_string(test.dir.path().join("host-prompts.jsonl"))
+            .unwrap()
+            .lines()
+            .count()
+    };
+    assert_eq!(prompts(&test), 1, "a restart never replays the queue");
+    // "Steer instead" on an idle chat sends that message now, as the
+    // TypeScript bridge does; the remaining queue then resumes after it.
+    let send_now = json!({"type":"thread.turn.queue.steer","threadId":"send-now","commandId":"send-second-now","messageId":"message-send-now-SECOND_QUEUED-queue"});
+    test.call(a, send_now.clone()).await.unwrap();
+    let thread = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let thread = test.detail(a, "send-now").await;
+            let texts: Vec<_> = thread["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["role"] == "user" && m["queueStatus"].is_null())
+                .map(|m| m["text"].clone())
+                .collect();
+            if texts.len() == 3 && thread["session"]["status"] == "ready" {
+                return (thread, texts);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the chosen and remaining queued messages did not run");
+    assert_eq!(
+        thread.1,
+        [json!("hold"), json!("SECOND_QUEUED"), json!("FIRST_QUEUED")]
+    );
+    assert_eq!(prompts(&test), 3);
+    // A retry answers from the command receipt; nothing is sent again.
+    test.call(a, send_now).await.unwrap();
+    assert_eq!(prompts(&test), 3);
+    test.stop().await;
+}
+
+#[tokio::test]
 async fn hosted_claude_wrapped_remote_prompt_has_one_bubble_without_internal_wrapper() {
     let test = Test::hosted().await;
     let a = AgentKind::Claude;

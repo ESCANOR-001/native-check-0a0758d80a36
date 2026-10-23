@@ -141,20 +141,10 @@ pub(crate) async fn create(
     let mut chat = source;
     let id = uuid::Uuid::new_v4().to_string();
     let time = now();
-    chat.fork_from = Some(Fork {
-        session: chat.native_id.clone(),
-        point,
-    });
+    let session = chat.native_id.clone();
+    chat.detach_native_session();
+    chat.fork_from = Some(Fork { session, point });
     chat.native_id = uuid::Uuid::new_v4().to_string();
-    chat.remote_identity = None;
-    chat.resumed = false;
-    chat.external_claude = false;
-    chat.native_control = None;
-    chat.queue.clear();
-    chat.paused = false;
-    chat.stream_id.clear();
-    chat.stream_model.clear();
-    chat.pending_message = Value::Null;
     let t = &mut chat.thread;
     t["id"] = json!(id);
     t["title"] = json!(format!(

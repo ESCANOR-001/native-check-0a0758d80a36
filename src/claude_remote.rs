@@ -116,6 +116,41 @@ impl Envelope {
     pub fn needs_commit(&self) -> bool {
         self.sequence.is_some() || self.receipt_checkpoint
     }
+    /// Local, non-durable result of a periodic relay health check. The
+    /// observer consumes it; it is never projected or committed.
+    pub fn worker_status(status: &str) -> Self {
+        Self {
+            sequence: None,
+            event_id: None,
+            created_at: None,
+            source: "local".into(),
+            payload: Some(serde_json::json!({"type":"remodex_worker_status","status":status})),
+            deliveries: vec![],
+            receipt_checkpoint: false,
+            recovery: None,
+        }
+    }
+    pub fn is_worker_status(&self) -> bool {
+        self.source == "local"
+            && self
+                .payload
+                .as_ref()
+                .is_some_and(|p| p["type"] == "remodex_worker_status")
+    }
+    /// Local checkpoint naming the worker process verified by this connection.
+    /// It carries no remote content and never advances the durable cursor.
+    pub fn owner(pid: Option<u64>) -> Self {
+        Self {
+            sequence: None,
+            event_id: None,
+            created_at: None,
+            source: "local".into(),
+            payload: Some(serde_json::json!({"type":"remodex_owner","pid":pid})),
+            deliveries: vec![],
+            receipt_checkpoint: true,
+            recovery: None,
+        }
+    }
     pub fn receipts(deliveries: Vec<DeliveryReceipt>) -> Self {
         Self {
             sequence: None,
@@ -427,6 +462,8 @@ pub struct Remote {
     health_at: tokio::time::Instant,
     backfill: Option<backfill::Gap>,
     recovery_notice: bool,
+    /// Worker status the relay reported at the last metadata check.
+    pub worker_status: String,
 }
 impl Remote {
     #[cfg(test)]
@@ -492,6 +529,7 @@ impl Remote {
         {
             return Err("Claude returned an invalid stream type".into());
         }
+        let worker_status = metadata["worker_status"].as_str().unwrap_or("").into();
         Ok(Self {
             client,
             url,
@@ -505,6 +543,7 @@ impl Remote {
             health_at: tokio::time::Instant::now() + Duration::from_secs(15),
             backfill: None,
             recovery_notice: false,
+            worker_status,
         })
     }
     #[cfg(test)]
@@ -515,7 +554,7 @@ impl Remote {
         self.backfill = Some(backfill::Gap::new(self.last_seen));
         self.recovery_notice = true;
     }
-    async fn verify_worker(&self) -> Result<(), String> {
+    async fn verify_worker(&mut self) -> Result<(), String> {
         let metadata = tokio::time::timeout(Duration::from_secs(12), async {
             let response = self
                 .client
@@ -534,6 +573,12 @@ impl Remote {
                 "The original Claude worker disconnected; saved history is retained".into(),
             );
         }
+        self.worker_status = metadata["response_shape"]["worker_status"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(64)
+            .collect();
         Ok(())
     }
     pub async fn next(&mut self) -> Result<Envelope, String> {
@@ -560,6 +605,7 @@ impl Remote {
             if tokio::time::Instant::now() >= self.health_at {
                 self.health_at = tokio::time::Instant::now() + Duration::from_secs(15);
                 self.verify_worker().await?;
+                return Ok(Envelope::worker_status(&self.worker_status));
             }
             if let Some(frame) = self.buffered.pop_front() {
                 if frame.event == "catch_up_truncated" {
@@ -681,7 +727,10 @@ impl Remote {
     /// Release only a timed-out metadata read. This is local bookkeeping, not
     /// a remote cancellation or permission to repeat a prompt/mutation.
     pub fn forget_read(&mut self, id: &str) -> Result<(), String> {
-        if !(id.starts_with("capabilities-") || id.starts_with("context-")) {
+        if !(id.starts_with("capabilities-")
+            || id.starts_with("context-")
+            || id.starts_with("remodex-owner-check-"))
+        {
             return Err("Only metadata read identities can expire locally".into());
         }
         self.issued.remove(id);
@@ -1006,6 +1055,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remote.next().await.unwrap().sequence, Some(42));
+        // A periodic health check reports the worker status locally; it is
+        // never history and never committed.
+        remote.check_health_now();
+        let status = remote.next().await.unwrap();
+        assert!(status.is_worker_status());
+        assert_eq!(status.payload.as_ref().unwrap()["status"], "idle");
+        assert!(!status.needs_commit());
         assert!(remote
             .send(json!({"type":"user","message":{"role":"user","content":"hello"}}))
             .await

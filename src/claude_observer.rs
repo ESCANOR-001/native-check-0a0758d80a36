@@ -28,6 +28,31 @@ pub struct Observer {
     recovering_history: bool,
     recovery_commit: Option<bool>,
     link_source: Option<(PathBuf, PathBuf)>,
+    /// Process ID the verified original worker reported for this connection.
+    worker_pid: Option<u64>,
+    /// The owner checkpoint for this connection has been committed.
+    owner_checked: bool,
+    owner_pending: bool,
+    /// At most one in-stream metadata check. Lost replies expire locally;
+    /// a later quiet turn must still be checked on this same connection.
+    owner_recheck: Option<(String, std::time::Instant)>,
+    /// A newer worker process reported by that check, awaiting its checkpoint.
+    owner_replacement: Option<u64>,
+    last_event: std::time::Instant,
+}
+
+/// The relay says the worker is idle while a consumed turn has produced
+/// nothing for a while: ask the worker which process it is. Only a different
+/// process proves the turn can never finish; the answer alone changes nothing.
+pub(crate) fn owner_recheck_due(
+    status: &str,
+    projection: &Value,
+    quiet: std::time::Duration,
+) -> bool {
+    status == "idle"
+        && quiet >= std::time::Duration::from_secs(10)
+        && crate::claude_history::control_state(projection)
+            .is_ok_and(|(router, _)| router.active().is_some())
 }
 
 impl Observer {
@@ -77,6 +102,12 @@ impl Observer {
             recovering_history: false,
             recovery_commit: None,
             link_source: None,
+            worker_pid: None,
+            owner_checked: false,
+            owner_pending: false,
+            owner_recheck: None,
+            owner_replacement: None,
+            last_event: std::time::Instant::now(),
         })
     }
     pub fn forget_read(&mut self, id: &str) -> Result<(), String> {
@@ -89,6 +120,7 @@ impl Observer {
         !self.owner_stopped
             && !self.recovering_history
             && self.receipts_checked
+            && self.owner_checked
             && self
                 .verified_at
                 .is_some_and(|seq| self.cursor.sequence >= seq)
@@ -137,8 +169,57 @@ impl Observer {
                 };
                 self.incoming = Some(Envelope::receipts(receipts));
                 self.receipt_recovery_pending = true;
+            } else if let Some(pid) = self.owner_replacement.filter(|_| self.ready()) {
+                self.worker_pid = Some(pid);
+                self.incoming = Some(Envelope::owner(Some(pid)));
+                self.pending_receipt = Some(crate::claude_host::Receipt {
+                    owner_replaced: true,
+                    ..Default::default()
+                });
+                self.owner_pending = true;
+            } else if self.receipts_checked
+                && !self.owner_checked
+                && !self.recovering_history
+                && self
+                    .verified_at
+                    .is_some_and(|seq| self.cursor.sequence >= seq)
+            {
+                // After catch-up, before any send: if another process now owns
+                // the session, the previous process's turn can never finish.
+                let previous = self.cursor.projection["owner_pid"].as_u64();
+                let replaced = matches!((previous, self.worker_pid), (Some(a), Some(b)) if a != b);
+                self.incoming = Some(Envelope::owner(self.worker_pid));
+                self.pending_receipt = Some(crate::claude_host::Receipt {
+                    owner_replaced: replaced,
+                    ..Default::default()
+                });
+                self.owner_pending = true;
             } else {
-                self.incoming = Some(self.remote.next().await?);
+                let envelope = loop {
+                    let envelope = self.remote.next().await?;
+                    if !envelope.is_worker_status() {
+                        break envelope;
+                    }
+                    if self.owner_recheck.as_ref().is_some_and(|(_, sent)| {
+                        sent.elapsed() >= std::time::Duration::from_secs(30)
+                    }) {
+                        let (id, _) = self.owner_recheck.take().unwrap();
+                        self.remote.forget_read(&id)?;
+                    }
+                    if self.ready()
+                        && self.owner_recheck.is_none()
+                        && owner_recheck_due(
+                            &self.remote.worker_status,
+                            &self.cursor.projection,
+                            self.last_event.elapsed(),
+                        )
+                    {
+                        let id = format!("remodex-owner-check-{}", uuid::Uuid::new_v4());
+                        self.owner_recheck = Some((id.clone(), std::time::Instant::now()));
+                        self.remote.send(json!({"type":"control_request","request_id":id,"request":{"subtype":"initialize"}})).await?;
+                    }
+                };
+                self.incoming = Some(envelope);
             }
         }
         let envelope = self.incoming.as_ref().unwrap();
@@ -152,7 +233,23 @@ impl Observer {
         }
         if let Some(sequence) = envelope.sequence {
             if envelope.source == "worker" {
+                self.last_event = std::time::Instant::now();
                 if let Some(frame) = &envelope.payload {
+                    if frame["type"] == "control_response"
+                        && self
+                            .owner_recheck
+                            .as_ref()
+                            .is_some_and(|(id, _)| frame["response"]["request_id"] == id.as_str())
+                    {
+                        self.owner_recheck = None;
+                        if frame["response"]["subtype"] == "success" {
+                            let previous = self.cursor.projection["owner_pid"].as_u64();
+                            let current = frame["response"]["response"]["pid"].as_u64();
+                            if matches!((previous, current), (Some(a), Some(b)) if a != b) {
+                                self.owner_replacement = current;
+                            }
+                        }
+                    }
                     let receipt = crate::claude_host::Ledger::default().observe(frame)?;
                     self.owner_stopped = receipt.owner_stopped;
                     self.pending_receipt = Some(receipt);
@@ -168,6 +265,7 @@ impl Observer {
                             self.init_response = Some(sequence);
                             self.read_receipts =
                                 frame["response"]["response"]["inbound_read_receipts"] == true;
+                            self.worker_pid = frame["response"]["response"]["pid"].as_u64();
                         }
                     }
                     if frame["type"] == "system"
@@ -261,6 +359,7 @@ impl Observer {
                 completed: r.completed.clone(),
                 cancelled: r.cancelled.clone(),
                 owner_stopped: r.owner_stopped,
+                owner_replaced: r.owner_replaced,
             });
         db.call(move |a| {
             a.store
@@ -289,6 +388,11 @@ impl Observer {
         if self.receipt_recovery_pending {
             self.receipts_checked = true;
             self.receipt_recovery_pending = false;
+        }
+        if self.owner_pending {
+            self.owner_checked = true;
+            self.owner_pending = false;
+            self.owner_replacement = None;
         }
         Ok(())
     }
@@ -364,6 +468,37 @@ mod tests {
     };
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
+    #[test]
+    fn owner_recheck_only_for_a_quiet_active_turn_on_an_idle_worker() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut router = crate::claude_turns::Router::default();
+        router
+            .register(Input {
+                native: id.clone(),
+                message: "message".into(),
+                public_turn: "turn".into(),
+                local: true,
+                steer: false,
+            })
+            .unwrap();
+        router
+            .observe(&json!({"type":"assistant","user_message_uuids":[id]}))
+            .unwrap();
+        let active = json!({"router":router,"history_turn":null,"owner_pid":1});
+        let idle = json!({"router":crate::claude_turns::Router::default(),"history_turn":null});
+        let quiet = std::time::Duration::from_secs(11);
+        assert!(owner_recheck_due("idle", &active, quiet));
+        for status in ["running", "requires_action", ""] {
+            assert!(!owner_recheck_due(status, &active, quiet));
+        }
+        assert!(!owner_recheck_due(
+            "idle",
+            &active,
+            std::time::Duration::from_secs(5)
+        ));
+        assert!(!owner_recheck_due("idle", &idle, quiet));
+        assert!(!owner_recheck_due("idle", &Value::Null, quiet));
+    }
     #[derive(Clone)]
     struct Server {
         identity: Identity,
@@ -375,6 +510,8 @@ mod tests {
         release_post: Arc<tokio::sync::Notify>,
         connected: Arc<std::sync::atomic::AtomicBool>,
         history: Arc<Mutex<Vec<Value>>>,
+        pid: Arc<std::sync::atomic::AtomicU64>,
+        lose_init: Arc<std::sync::atomic::AtomicBool>,
     }
     impl Server {
         async fn emit(&self, seq: u64, source: &str, payload: Value) {
@@ -388,7 +525,7 @@ mod tests {
     }
     async fn metadata(State(s): State<Server>) -> Json<Value> {
         Json(
-            json!({"response_shape":{"id":s.identity.bridge_session,"connection_status":if s.connected.load(std::sync::atomic::Ordering::SeqCst) {"connected"} else {"disconnected"}}}),
+            json!({"response_shape":{"id":s.identity.bridge_session,"worker_status":"idle","connection_status":if s.connected.load(std::sync::atomic::Ordering::SeqCst) {"connected"} else {"disconnected"}}}),
         )
     }
     async fn stream(State(s): State<Server>) -> impl IntoResponse {
@@ -404,10 +541,19 @@ mod tests {
         s.posts.lock().unwrap().push(v.clone());
         let p = &v["events"][0]["payload"];
         if p["type"] == "control_request" && p["request"]["subtype"] == "initialize" {
-            let reply = json!({"type":"control_response","response":{"request_id":p["request_id"],"subtype":"success","response":{}}});
-            s.emit(2, "client", reply.clone()).await;
-            s.emit(3, "worker", reply).await;
-            s.emit(4,"worker",json!({"type":"system","subtype":"init","session_id":s.identity.bridge_session,"cwd":s.cwd})).await;
+            if s.lose_init.load(std::sync::atomic::Ordering::SeqCst) {
+                return axum::http::StatusCode::OK;
+            }
+            let seq = s.history.lock().unwrap().last().unwrap()["sequence_num"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                + 1;
+            let reply = json!({"type":"control_response","response":{"request_id":p["request_id"],"subtype":"success","response":{"pid":s.pid.load(std::sync::atomic::Ordering::SeqCst)}}});
+            s.emit(seq, "client", reply.clone()).await;
+            s.emit(seq + 1, "worker", reply).await;
+            s.emit(seq + 2,"worker",json!({"type":"system","subtype":"init","session_id":s.identity.bridge_session,"cwd":s.cwd})).await;
             axum::http::StatusCode::OK
         } else if p["type"] == "control_request" && p["request"]["subtype"] == "interrupt" {
             s.post_started.notify_one();
@@ -445,6 +591,135 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn in_stream_owner_checks_survive_same_owner_lost_reply_and_repeated_replacement() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Identity {
+            native_session: uuid::Uuid::new_v4().to_string(),
+            bridge_session: "cse_observer_test".into(),
+        };
+        let (send, receive) = mpsc::channel(8);
+        let server = Server {
+            identity: identity.clone(),
+            cwd: dir.path().into(),
+            send,
+            receive: Arc::new(Mutex::new(Some(receive))),
+            posts: Default::default(),
+            post_started: Default::default(),
+            release_post: Default::default(),
+            connected: Arc::new(AtomicBool::new(true)),
+            history: Default::default(),
+            pid: Arc::new(AtomicU64::new(777)),
+            lose_init: Default::default(),
+        };
+        server
+            .emit(
+                1,
+                "worker",
+                json!({"type":"system","subtype":"init","cwd":dir.path()}),
+            )
+            .await;
+        let app = Router::new()
+            .route("/cse_observer_test", get(metadata))
+            .route("/cse_observer_test/events/stream", get(stream))
+            .route("/cse_observer_test/events", post(self::send).get(receipts))
+            .with_state(server.clone());
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", socket.local_addr().unwrap());
+        let serving = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+        let remote = Remote::fixture(&base, identity.clone(), 0).await.unwrap();
+        let mut observer = Observer::from_remote(
+            remote,
+            Link {
+                identity: identity.clone(),
+                cwd: dir.path().canonicalize().unwrap(),
+                title: "Test".into(),
+            },
+            Cursor::new(identity.clone()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.init_chats().unwrap();
+        let chat = json!({"agent":"claude","native_id":identity.native_session,"remote_identity":identity,"thread":{"id":"owner-check-chat","messages":[],"activities":[],"proposedPlans":[]}});
+        store.save_chat(&chat, None).unwrap();
+        let db = AuthService::new(Auth::new(store)).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut router = crate::claude_turns::Router::default();
+        router
+            .register(Input {
+                native: id.clone(),
+                message: "message".into(),
+                public_turn: "turn".into(),
+                local: true,
+                steer: false,
+            })
+            .unwrap();
+        router
+            .observe(&json!({"type":"assistant","user_message_uuids":[id]}))
+            .unwrap();
+        let mut projection = json!({"router":router,"owner_pid":777});
+        async fn pump(o: &mut Observer, db: &AuthService, chat: &Value, p: &mut Value) -> bool {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), o.next())
+                .await
+                .unwrap()
+                .unwrap();
+            let replaced = o.pending_receipt.as_ref().is_some_and(|r| r.owner_replaced);
+            if event.source == "local" {
+                p["owner_pid"] = event.payload.unwrap()["pid"].clone();
+            }
+            o.commit(db, chat.clone(), p.clone()).await.unwrap();
+            replaced
+        }
+        while !observer.ready() {
+            assert!(!pump(&mut observer, &db, &chat, &mut projection).await);
+        }
+        // A healthy owner's answer must not disable checks for future crashes.
+        for pid in [777, 888, 999] {
+            server.pid.store(pid, Ordering::SeqCst);
+            observer.last_event = std::time::Instant::now() - std::time::Duration::from_secs(11);
+            observer.remote.check_health_now();
+            let mut replacements = 0;
+            for _ in 0..if pid == 777 { 3 } else { 4 } {
+                replacements += usize::from(pump(&mut observer, &db, &chat, &mut projection).await);
+            }
+            assert_eq!(replacements, usize::from(pid != 777));
+            assert_eq!(projection["owner_pid"], pid);
+            assert!(observer.ready());
+            assert!(observer.owner_recheck.is_none());
+        }
+        // A lost metadata response cannot permanently suppress checks or fill
+        // the pending-control budget. It never permits replaying a mutation.
+        server.lose_init.store(true, Ordering::SeqCst);
+        observer.last_event = std::time::Instant::now() - std::time::Duration::from_secs(11);
+        observer.remote.check_health_now();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), observer.next())
+                .await
+                .is_err()
+        );
+        let (lost, sent) = observer.owner_recheck.as_mut().unwrap();
+        let lost = lost.clone();
+        *sent -= std::time::Duration::from_secs(31);
+        server.lose_init.store(false, Ordering::SeqCst);
+        observer.remote.check_health_now();
+        for _ in 0..3 {
+            assert!(!pump(&mut observer, &db, &chat, &mut projection).await);
+        }
+        assert!(observer.owner_recheck.is_none());
+        assert!(observer.remote.prepare_send(json!({"type":"control_request","request_id":lost,"request":{"subtype":"initialize"}})).is_ok(), "expired read bookkeeping is released");
+        assert_eq!(server.posts.lock().unwrap().len(), 6);
+        assert!(server
+            .posts
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|v| v["events"][0]["payload"]["request"]["subtype"] == "initialize"));
+        assert!(observer.remote.forget_read("mutation-1").is_err());
+        serving.abort();
+    }
+
+    #[tokio::test]
     async fn attachment_requires_fresh_worker_init_and_durable_commit_without_automatic_resend() {
         let dir = tempfile::tempdir().unwrap();
         let identity = Identity {
@@ -462,6 +737,8 @@ mod tests {
             release_post: Default::default(),
             connected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             history: Default::default(),
+            pid: Arc::new(std::sync::atomic::AtomicU64::new(777)),
+            lose_init: Default::default(),
         };
         server.emit(1,"worker",json!({"type":"system","subtype":"init","session_id":identity.bridge_session,"cwd":dir.path()})).await;
         let app = Router::new()
@@ -531,10 +808,33 @@ mod tests {
         );
         assert_eq!(observer.next().await.unwrap().recovery, Some(false));
         assert!(!observer.ready());
+        // History last committed under another worker process.
+        let projection = json!({"router":crate::claude_turns::Router::default(),"history_turn":null,"owner_pid":1});
         observer
-            .commit(&db, chat.clone(), Value::Null)
+            .commit(&db, chat.clone(), projection)
             .await
             .unwrap();
+        assert!(
+            !observer.ready(),
+            "the verified owner process is checkpointed before any send"
+        );
+        // A different process than the last committed owner means any turn
+        // the previous process held can no longer finish.
+        let owner = observer.next().await.unwrap();
+        assert_eq!(owner.source, "local");
+        assert_eq!(owner.sequence, None);
+        assert_eq!(owner.payload.as_ref().unwrap()["pid"], 777);
+        assert!(owner.needs_commit());
+        assert!(observer.pending_receipt.as_ref().unwrap().owner_replaced);
+        let sequence = observer.cursor.sequence;
+        observer
+            .commit(&db, chat.clone(), json!({"owner_pid":777}))
+            .await
+            .unwrap();
+        assert_eq!(
+            observer.cursor.sequence, sequence,
+            "a local checkpoint is not history"
+        );
         assert!(observer.ready());
         let delivery = observer.prepare_control(json!({"type":"control_request","request_id":"slow-stop","request":{"subtype":"interrupt"}})).unwrap();
         let posting = tokio::spawn(delivery.deliver());

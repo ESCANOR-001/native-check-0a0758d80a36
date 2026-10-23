@@ -30,7 +30,11 @@ struct State {
     processed_inputs: Vec<String>,
     #[serde(default)]
     historical_result: Option<String>,
+    /// Worker process verified at the last committed owner checkpoint.
+    #[serde(default)]
+    owner_pid: Option<u64>,
 }
+pub(crate) const OWNER_RESTARTED: &str = "The original Claude session restarted before this task finished. Its saved output is kept; nothing was resent.";
 
 async fn delivery_receipts(
     db: &AuthService,
@@ -258,6 +262,31 @@ pub async fn project(
     chat.stream_model = reduced.stream_model.clone();
     delivery_receipts(db, &mut chat, &mut reduced, event).await?;
     reconcile_stop(db, &mut chat, &mut reduced, event).await?;
+    if event.source == "local" {
+        let pid = event
+            .payload
+            .as_ref()
+            .filter(|p| p["type"] == "remodex_owner")
+            .ok_or("Unknown local Claude checkpoint")?["pid"]
+            .as_u64();
+        if matches!((reduced.owner_pid, pid), (Some(a), Some(b)) if a != b) {
+            // The process that held this turn is gone without a result.
+            reduced.router.owner_gone();
+            reduced.requests.clear();
+            chat.external_stop = None;
+            chat.thread["hasPendingApprovals"] = json!(false);
+            chat.thread["hasPendingUserInput"] = json!(false);
+            if chat.thread["latestTurn"]["state"] == "running" {
+                crate::chat::finish(&mut chat, "interrupted", Some(OWNER_RESTARTED));
+            }
+        }
+        reduced.owner_pid = pid.or(reduced.owner_pid);
+        settle_deliveries(&mut reduced);
+        return Ok((
+            serde_json::to_value(chat).unwrap(),
+            serde_json::to_value(reduced).unwrap(),
+        ));
+    }
     let Some(value) = &event.payload else {
         settle_deliveries(&mut reduced);
         return Ok((

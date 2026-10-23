@@ -265,20 +265,12 @@ async fn plan(base: &Path, source: Chat, spec: Option<&Value>) -> Result<Intent,
     let path = parent.join(&nonce);
     let time = now();
     let mut chat = source;
+    chat.detach_native_session();
     chat.native_id = if chat.agent == crate::chat::AgentKind::Claude {
         uuid::Uuid::new_v4().to_string()
     } else {
         String::new()
     };
-    chat.native_control = None;
-    chat.resumed = false;
-    chat.external_claude = false;
-    chat.fork_from = None;
-    chat.queue.clear();
-    chat.paused = false;
-    chat.stream_id.clear();
-    chat.stream_model.clear();
-    chat.pending_message = Value::Null;
     let t = &mut chat.thread;
     for field in ["messages", "activities", "proposedPlans", "checkpoints"] {
         t[field] = json!([]);

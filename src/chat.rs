@@ -170,6 +170,25 @@ pub(crate) struct Chat {
     #[serde(skip)]
     pub(crate) stream_model: String,
 }
+impl Chat {
+    /// A new chat derived from this one (branch or worktree) owns a fresh
+    /// native session. It must never inherit the source's shared-session
+    /// identity, ownership, pending controls or queued prompts.
+    pub(crate) fn detach_native_session(&mut self) {
+        self.resumed = false;
+        self.claude_plan_access = None;
+        self.remote_identity = None;
+        self.external_claude = false;
+        self.external_stop = None;
+        self.native_control = None;
+        self.fork_from = None;
+        self.queue.clear();
+        self.paused = false;
+        self.stream_id.clear();
+        self.stream_model.clear();
+        self.pending_message = Value::Null;
+    }
+}
 struct Request {
     agent: AgentKind,
     client: String,
@@ -411,8 +430,9 @@ struct PreparedBootstrap {
 }
 struct Hub {
     tool_controls: HashSet<String>,
-    /// (chat, command) whose model/effort the shared worker just confirmed.
-    confirmed_settings: Option<(String, String)>,
+    /// Chat whose model/effort the shared worker has just acknowledged for
+    /// the command now being dispatched (set only around that dispatch).
+    confirmed_settings: Option<String>,
     prepared_edits: HashMap<String, crate::editing::Prepared>,
     prepared_bootstraps: HashMap<String, (Chat, PathBuf)>,
     db: AuthService,
@@ -954,8 +974,16 @@ impl Hub {
                             Ok(None)=>{},
                         }
                     }
-                    if self.chats.get(s(&r.params["threadId"])).is_some_and(|c|c.external_claude) && ((r.method=="claude.sessionAction" && r.params["action"]!="connect" && !native_control::supported(&r.params["action"])) || r.params.get("promptEdit").is_some()) {
-                        let _=r.reply.send(Err("This control for an externally owned session is not migrated yet".into())); continue;
+                    if self.chats.get(s(&r.params["threadId"])).is_some_and(|c|c.external_claude) && ((r.method=="claude.sessionAction" && !["connect","newWorktree"].contains(&s(&r.params["action"])) && !native_control::supported(&r.params["action"])) || r.params.get("promptEdit").is_some()) {
+                        // Same outcomes as the TypeScript bridge for Desktop-owned chats.
+                        let action=if r.method=="claude.sessionAction" {s(&r.params["action"])} else {""};
+                        let _=r.reply.send(match action {
+                            "checkpoints"=>Ok(json!({"points":[],"external":true})),
+                            "branchChat"=>Err("Branching is available for chats started by Remodex. Continue this Desktop-owned chat through its existing connection.".into()),
+                            "previewRestore"|"restoreFiles"=>Err("File restore is available for chats started by Remodex with checkpointing enabled.".into()),
+                            _=>Err("This control is not available for a Desktop-owned Claude chat.".into()),
+                        });
+                        continue;
                     }
                     if r.method=="orchestration.dispatchCommand" && r.params["type"]=="thread.turn.start" && r.params.get("promptEdit").is_none() && r.params.get("bootstrap").is_none() && r.agent==AgentKind::Codex && self.config.codex.shared_server.is_some() {
                         let id=s(&r.params["threadId"]).to_owned();
@@ -983,10 +1011,10 @@ impl Hub {
                     }
                     // A shared session's model/effort is confirmed by its own
                     // worker before the unchanged prompt path may deliver.
-                    if r.method=="orchestration.dispatchCommand" && r.agent==AgentKind::Claude && r.params["type"]=="thread.turn.start"
+                    if r.method=="orchestration.dispatchCommand" && r.agent==AgentKind::Claude && ["thread.turn.start","thread.turn.queue.steer"].contains(&s(&r.params["type"]))
                         && self.chats.get(s(&r.params["threadId"])).is_some_and(|c|c.external_claude) {
                         match self.prepare_shared_settings(&r).await {
-                            Ok(Some(steps))=>{self.start_shared_settings(r,steps).await;continue;},
+                            Ok(Some(plan))=>{self.start_shared_settings(r,plan).await;continue;},
                             Ok(None)=>{},
                             Err(error)=>{let _=r.reply.send(Err(error));continue;},
                         }
@@ -1444,8 +1472,17 @@ impl Hub {
                 Err("Command ID was already used for different content".into())
             };
         }
-        if self.active.contains_key(id) || self.tool_controls.contains(id) || !chat.queue.is_empty()
-        {
+        // A Desktop-owned chat's idle connection is not a task. A new isolated
+        // chat starts from its repository and never touches that session.
+        let busy = if chat.external_claude {
+            self.busy(id)
+                || chat.thread["session"]["status"] == "running"
+                || chat.thread["hasPendingApprovals"] == true
+                || chat.thread["hasPendingUserInput"] == true
+        } else {
+            self.active.contains_key(id)
+        };
+        if busy || self.tool_controls.contains(id) || !chat.queue.is_empty() {
             return Err(
                 "Finish the task and clear queued messages before using this control".into(),
             );
@@ -2512,7 +2549,7 @@ impl Hub {
                         .unwrap_or_else(|| {
                             crate::models::fallback(&self.config.provider(agent).model)
                         });
-                    let selection = if self.confirmed_settings.as_ref().is_some_and(|(chat,cmd)|*chat==id && *cmd==command) {
+                    let selection = if self.confirmed_settings.as_deref() == Some(id.as_str()) {
                         // Acknowledged by the worker, which reports wire IDs for aliases.
                         self.chats[&id].thread["modelSelection"].clone()
                     } else if self.chats[&id].external_claude {
@@ -2642,7 +2679,13 @@ impl Hub {
                             self.save(&id, receipt).await
                         }
                         "thread.turn.queue.steer" => {
-                            if let Some(w) = self.active.get(&id) {
+                            // On an idle shared Claude connection this sends the
+                            // message now as a new turn; the rest of the queue
+                            // resumes after it, as with the TypeScript bridge.
+                            let send_now = |w: &Worker| {
+                                !own && (w.claude_router.is_some() || w.observer.is_some())
+                            };
+                            if let Some(w) = self.active.get(&id).filter(|w| !send_now(w)) {
                                 if !own || w.stage != "running" || w.stopping || w.steers.len() >= 8
                                 {
                                     return Err("Wait for a running turn before steering".into());
@@ -2826,7 +2869,7 @@ impl Hub {
     async fn begin(
         &mut self,
         id: &str,
-        c: Value,
+        mut c: Value,
         receipt: Option<(String, String)>,
     ) -> Result<(), String> {
         if self.tool_controls.contains(id) {
@@ -2848,6 +2891,17 @@ impl Hub {
             return Err("Eight Claude shared connections are open in this experiment. Disconnect an idle test connection before opening another.".into());
         }
         if self.chats[id].external_claude {
+            // Settings just acknowledged for this dispatch, or an alias of the
+            // confirmed wire model, are the confirmed settings. Anything else
+            // is refused below: no prompt runs under unconfirmed settings.
+            if c["modelSelection"].is_object()
+                && (self.confirmed_settings.as_deref() == Some(id)
+                    || self
+                        .shared_actions(id, &c["modelSelection"])
+                        .is_ok_and(|a| a.is_empty()))
+            {
+                c["modelSelection"] = self.chats[id].thread["modelSelection"].clone();
+            }
             self.external_send_ready(id, &c, false)?;
         }
         self.db

@@ -19,10 +19,12 @@ pub(super) struct Settings {
 }
 pub(super) enum Then {
     /// Run the client's original command through the ordinary prompt path.
+    /// `requested` is the selection the prompt was sent with.
     Dispatch {
         agent: AgentKind,
         client: String,
         params: Value,
+        requested: Value,
     },
     /// Start the queued prompt, provided it is still first in the queue.
     Queue { message: String },
@@ -161,7 +163,7 @@ impl Hub {
     pub(super) async fn prepare_shared_settings(
         &self,
         r: &Request,
-    ) -> Result<Option<VecDeque<Step>>, String> {
+    ) -> Result<Option<(VecDeque<Step>, Value)>, String> {
         let id = s(&r.params["threadId"]);
         let command = s(&r.params["commandId"]);
         let Some(chat) = self.chats.get(id).filter(|c| {
@@ -186,12 +188,27 @@ impl Hub {
                 {
                     return Ok(None);
                 }
-                r.params["modelSelection"].clone()
+                &r.params
             }
-            // Queued prompts are started by the queue runner below. An idle
-            // shared chat rejects "send now", so no setting may change for it.
+            // "Send now" on an idle chat starts that queued prompt with its
+            // own saved selection; the queue runner handles the others.
+            "thread.turn.queue.steer" => {
+                match chat
+                    .queue
+                    .iter()
+                    .find(|q| q["message"]["messageId"] == r.params["messageId"])
+                {
+                    Some(entry) => entry,
+                    None => return Ok(None),
+                }
+            }
             _ => return Ok(None),
         };
+        let (requested, runtime, interaction) = (
+            requested["modelSelection"].clone(),
+            requested["runtimeMode"].clone(),
+            requested["interactionMode"].clone(),
+        );
         if !requested.is_object() {
             return Ok(None);
         }
@@ -231,18 +248,22 @@ impl Hub {
             {
                 return Err("Message ID already accepted".into());
             }
-            if r.params["runtimeMode"]
+        }
+        if runtime
+            .as_str()
+            .is_some_and(|v| chat.thread["runtimeMode"] != v)
+            || interaction
                 .as_str()
-                .is_some_and(|v| chat.thread["runtimeMode"] != v)
-                || r.params["interactionMode"]
-                    .as_str()
-                    .is_some_and(|v| chat.thread["interactionMode"] != v)
-            {
-                return Err("Change access with its own control before sending; nothing was changed or sent".into());
-            }
+                .is_some_and(|v| chat.thread["interactionMode"] != v)
+        {
+            return Err(
+                "Change access with its own control before sending; nothing was changed or sent"
+                    .into(),
+            );
         }
         self.shared_settings_ready(id)?;
-        self.shared_steps(id, command, actions).await.map(Some)
+        let steps = self.shared_steps(id, command, actions).await?;
+        Ok(Some((steps, requested)))
     }
 
     fn shared_settings_ready(&self, id: &str) -> Result<(), String> {
@@ -263,7 +284,11 @@ impl Hub {
 
     /// Validates the selection against the CLI's catalog; returns the native
     /// controls, in model-then-effort order, that differ from confirmed state.
-    fn shared_actions(&self, id: &str, requested: &Value) -> Result<Vec<Control>, String> {
+    pub(super) fn shared_actions(
+        &self,
+        id: &str,
+        requested: &Value,
+    ) -> Result<Vec<Control>, String> {
         let catalog = self
             .models
             .get(AgentKind::Claude.instance())
@@ -317,13 +342,18 @@ impl Hub {
         Ok(steps)
     }
 
-    pub(super) async fn start_shared_settings(&mut self, r: Request, steps: VecDeque<Step>) {
+    pub(super) async fn start_shared_settings(
+        &mut self,
+        r: Request,
+        (steps, requested): (VecDeque<Step>, Value),
+    ) {
         let id = s(&r.params["threadId"]).to_owned();
         let settings = Settings {
             then: Then::Dispatch {
                 agent: r.agent,
                 client: r.client,
                 params: r.params,
+                requested,
             },
             steps,
             confirmed: vec![],
@@ -345,12 +375,8 @@ impl Hub {
             return false;
         }
         let planned = match self.shared_actions(id, &requested) {
-            Ok(actions) if actions.is_empty() => {
-                // Equivalent (e.g. an alias of the confirmed wire model).
-                let chat = self.chats.get_mut(id).unwrap();
-                chat.queue[0]["modelSelection"] = chat.thread["modelSelection"].clone();
-                None
-            }
+            // Equivalent (e.g. an alias of the confirmed wire model).
+            Ok(actions) if actions.is_empty() => None,
             Ok(actions) => Some(match self.shared_steps(id, &command, actions).await {
                 Ok(steps) => (steps, self.shared_settings_ready(id)),
                 Err(error) => (VecDeque::new(), Err(error)),
@@ -419,13 +445,13 @@ impl Hub {
                 agent,
                 client,
                 params,
+                requested,
             } => {
                 // The ordinary path validates and delivers the prompt once,
                 // using the settings the worker has just confirmed.
-                let result = match self.shared_settings_confirmed(id, &params["modelSelection"]) {
+                let result = match self.shared_settings_confirmed(id, &requested) {
                     Ok(()) => {
-                        let command = s(&params["commandId"]).to_owned();
-                        self.confirmed_settings = Some((id.to_owned(), command));
+                        self.confirmed_settings = Some(id.to_owned());
                         let result = self.dispatch(agent, &client, params).await;
                         self.confirmed_settings = None;
                         result
@@ -446,15 +472,17 @@ impl Hub {
                 {
                     return;
                 }
-                let mut next = self.chats.get_mut(id).unwrap().queue.remove(0);
+                let next = self.chats.get_mut(id).unwrap().queue.remove(0);
                 if let Err(error) = self.shared_settings_confirmed(id, &next["modelSelection"]) {
                     self.chats.get_mut(id).unwrap().queue.insert(0, next);
                     return self
                         .pause_queue(id, format!("{error} {QUEUE_NOT_SENT}"))
                         .await;
                 }
-                next["modelSelection"] = self.chats[id].thread["modelSelection"].clone();
-                if let Err(error) = self.begin(id, next.clone(), None).await {
+                self.confirmed_settings = Some(id.to_owned());
+                let started = self.begin(id, next.clone(), None).await;
+                self.confirmed_settings = None;
+                if let Err(error) = started {
                     self.chats.get_mut(id).unwrap().queue.insert(0, next);
                     self.pause_queue(id, error).await;
                 }
@@ -747,6 +775,12 @@ mod tests {
         script: Arc<Mutex<VecDeque<Reply>>>,
         /// Wire model the worker reports after switching to an alias.
         wire: Arc<Mutex<HashMap<String, String>>>,
+        /// The worker process dies after consuming the next prompt.
+        crash: Arc<std::sync::atomic::AtomicBool>,
+        /// Process ID of the worker that owns the session on the next connect.
+        pid: Arc<std::sync::atomic::AtomicU64>,
+        /// Durable events the worker produced while the relay was away.
+        resume: Arc<Mutex<Vec<Value>>>,
         /// Holds each scripted acknowledgement and prompt turn until released.
         gate: Arc<tokio::sync::Semaphore>,
         connections: Arc<AtomicUsize>,
@@ -756,6 +790,9 @@ mod tests {
             Self {
                 log: Default::default(),
                 script: Default::default(),
+                crash: Default::default(),
+                pid: Arc::new(std::sync::atomic::AtomicU64::new(4242)),
+                resume: Default::default(),
                 wire: Arc::new(Mutex::new(HashMap::from([
                     ("opus".into(), "claude-wire-opus".into()),
                     ("default".into(), "claude-wire-sonnet".into()),
@@ -788,8 +825,32 @@ mod tests {
     /// relay, writes are answered while earlier events await their commit.
     async fn serve(mut fake: Fake, worker: Worker) {
         let (done, mut replies) = mpsc::unbounded_channel::<Option<Vec<Value>>>();
-        let mut outgoing = VecDeque::new();
+        let mut outgoing: VecDeque<Value> = VecDeque::new();
         let mut pending: observer_fixture::Pending = None;
+        // Catch-up of anything produced while disconnected, then the owner
+        // checkpoint; only then is the session ready, as with the real relay.
+        let resumed: Vec<Value> = std::mem::take(&mut *worker.resume.lock().unwrap());
+        for payload in resumed {
+            if !observer_fixture::emit(&mut fake, &mut pending, payload).await {
+                return;
+            }
+            match fake.input.recv().await {
+                Some(write) => {
+                    observer_fixture::answer(&mut fake, &mut pending, write).await;
+                }
+                None => return,
+            }
+        }
+        let pid = worker.pid.load(Ordering::SeqCst);
+        if !observer_fixture::emit_owner(&mut fake, &mut pending, pid).await {
+            return;
+        }
+        match fake.input.recv().await {
+            Some(write) => {
+                observer_fixture::answer(&mut fake, &mut pending, write).await;
+            }
+            None => return,
+        }
         if fake
             .output
             .send(Event::Message(json!({"type":"remodex_observer_ready"})))
@@ -802,6 +863,9 @@ mod tests {
             // Each durable event is committed before the next is offered.
             if pending.is_none() {
                 if let Some(payload) = outgoing.pop_front() {
+                    if payload["__crash"] == true {
+                        return;
+                    }
                     if !observer_fixture::emit(&mut fake, &mut pending, payload).await {
                         return;
                     }
@@ -842,6 +906,13 @@ mod tests {
                 .unwrap()
                 .unwrap());
             worker.gate.acquire().await.unwrap().forget();
+            if worker.crash.swap(false, Ordering::SeqCst) {
+                // Consumed, then the process is gone: no result, no shutdown notice.
+                return Some(vec![
+                    json!({"type":"user","session_id":NATIVE,"uuid":input.native,"message":value["payload"]["message"]}),
+                    json!({"__crash":true}),
+                ]);
+            }
             return Some(vec![
                 json!({"type":"user","session_id":NATIVE,"uuid":input.native,"message":value["payload"]["message"]}),
                 json!({"type":"assistant","session_id":NATIVE,"user_message_uuid":input.native,"message":{"id":format!("reply-{}",input.native),"content":[{"type":"text","text":"FIXTURE_REPLY"}]}}),
@@ -964,7 +1035,19 @@ mod tests {
             fixture
         }
         async fn restart(&mut self) {
+            self.edit_and_restart(|_| {}).await;
+        }
+        /// Edits the saved shared chat while the bridge is stopped.
+        async fn edit_and_restart(&mut self, edit: impl FnOnce(&mut Value) + Send + 'static) {
             self.stop().await;
+            self.db
+                .call(move |a| {
+                    let mut chat = a.store.load_chat(CHAT).unwrap();
+                    edit(&mut chat);
+                    a.store.save_chat(&chat, None).unwrap();
+                })
+                .await
+                .unwrap();
             let before = self.worker.connections.load(Ordering::SeqCst);
             self.hub = Chats::start(self.db.clone(), self.config.clone())
                 .await
@@ -1386,6 +1469,279 @@ mod tests {
         assert!(error.contains("not sent"), "{error}");
         assert_eq!(prompts(&f.log()), 0);
         assert!(f.thread().await["messages"].as_array().unwrap().is_empty());
+        f.stop().await;
+    }
+
+    #[tokio::test]
+    async fn paused_shared_queue_sends_a_chosen_message_now_after_its_own_settings() {
+        let f = Fixture::start().await;
+        f.send(prompt("running", "running", Value::Null, "normal"))
+            .await
+            .unwrap();
+        f.wait_log(1).await;
+        f.script(&[Reply::Reject]);
+        f.send(prompt("queued-1", "queued-1", opus("high"), "queue"))
+            .await
+            .unwrap();
+        f.send(prompt("queued-2", "queued-2", Value::Null, "queue"))
+            .await
+            .unwrap();
+        f.worker.gate.add_permits(64);
+        let paused = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let thread = f.thread().await;
+                if thread["session"]["lastError"].is_string() {
+                    return thread;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the rejected setting did not pause the queue");
+        assert!(s(&paused["session"]["lastError"]).contains("previous model is retained"));
+        assert_eq!(prompts(&f.log()), 1);
+        // "Steer instead" on the idle chat is an explicit new request: it
+        // applies that message's own settings, sends it, then resumes.
+        let send_now = json!({"type":"thread.turn.queue.steer","threadId":CHAT,"commandId":"send-now","messageId":"queued-1"});
+        f.send(send_now.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while prompts(&f.log()) < 3 || f.thread().await["latestTurn"]["state"] != "completed" {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the queue did not resume after send-now");
+        let order: Vec<_> = f
+            .log()
+            .iter()
+            .map(|v| {
+                if v["type"] == "control_request" {
+                    v["request"].to_string()
+                } else {
+                    s(&v["payload"]["message"]["content"][0]["text"]).to_owned()
+                }
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "PROMPT_running".to_owned(),
+                json!({"subtype":"set_model","model":"opus"}).to_string(),
+                json!({"subtype":"set_model","model":"opus"}).to_string(),
+                json!({"subtype":"apply_flag_settings","settings":{"effortLevel":"high"}})
+                    .to_string(),
+                "PROMPT_queued-1".to_owned(),
+                json!({"subtype":"set_model","model":"claude-wire-sonnet"}).to_string(),
+                json!({"subtype":"apply_flag_settings","settings":{"effortLevel":null}})
+                    .to_string(),
+                "PROMPT_queued-2".to_owned(),
+            ]
+        );
+        let thread = f.thread().await;
+        assert!(thread["session"]["lastError"].is_null());
+        assert_eq!(
+            thread["modelSelection"],
+            json!({"instanceId":"claude-code","model":"claude-wire-sonnet","options":[]})
+        );
+        let users = thread["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .count();
+        assert_eq!(users, 3);
+        f.send(send_now).await.unwrap();
+        assert_eq!(f.log().len(), 8, "a retry is answered from its receipt");
+        f.stop().await;
+    }
+
+    #[tokio::test]
+    async fn desktop_owned_session_actions_match_the_typescript_bridge_and_worktrees_detach() {
+        let mut f = Fixture::start().await;
+        let repo = f._dir.path().join("shared repo");
+        std::fs::create_dir(&repo).unwrap();
+        for args in [
+            &["init", "-b", "main"][..],
+            &["config", "core.autocrlf", "false"],
+            &["config", "user.email", "fixture@example.invalid"],
+            &["config", "user.name", "Fixture"],
+        ] {
+            git(&repo, args);
+        }
+        std::fs::write(repo.join("tracked.txt"), "committed\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        f.send(json!({"type":"project.create","commandId":"repo","projectId":"repo","workspaceRoot":repo,"title":"Repo"}))
+            .await
+            .unwrap();
+        let path = repo.clone();
+        f.edit_and_restart(move |chat| {
+            chat["thread"]["projectId"] = json!("repo");
+            chat["thread"]["worktreePath"] = json!(path);
+        })
+        .await;
+        let action = |action: &str| json!({"threadId":CHAT,"commandId":format!("action-{action}"),"action":action});
+        let call = |params: Value| {
+            let hub = f.hub.clone();
+            async move {
+                hub.call(AgentKind::Claude, "phone", "claude.sessionAction", params)
+                    .await
+            }
+        };
+        assert_eq!(
+            call(action("checkpoints")).await.unwrap(),
+            json!({"points":[],"external":true})
+        );
+        assert!(call(action("branchChat"))
+            .await
+            .unwrap_err()
+            .contains("Branching is available for chats started by Remodex"));
+        for name in ["previewRestore", "restoreFiles"] {
+            assert!(call(action(name))
+                .await
+                .unwrap_err()
+                .contains("File restore is available for chats started by Remodex"));
+        }
+        let mut edit = prompt("edit", "edit", Value::Null, "normal");
+        edit["promptEdit"] = json!({"targetTurnId":"turn","turnCount":1});
+        assert!(f
+            .send(edit)
+            .await
+            .unwrap_err()
+            .contains("not available for a Desktop-owned Claude chat"));
+        // A new isolated chat starts from the shared chat's repository HEAD.
+        let created = call(action("newWorktree")).await.unwrap();
+        let id = s(&created["threadId"]).to_owned();
+        let lookup = id.clone();
+        let saved =
+            f.db.call(move |a| a.store.load_chat(&lookup))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(saved["external_claude"], false);
+        assert!(
+            saved["remote_identity"].is_null(),
+            "no inherited shared identity"
+        );
+        assert_ne!(saved["native_id"], NATIVE);
+        assert!(saved["thread"]["messages"].as_array().unwrap().is_empty());
+        let checkout = PathBuf::from(s(&saved["thread"]["worktreePath"]));
+        assert_ne!(checkout, repo);
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("tracked.txt")).unwrap(),
+            "committed\n"
+        );
+        assert_eq!(call(action("newWorktree")).await.unwrap(), created);
+        // The original Desktop-owned session was never contacted.
+        assert!(f.log().is_empty());
+        assert_eq!(f.thread().await["session"]["statusConfidence"], "confirmed");
+        f.stop().await;
+    }
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let mut c = std::process::Command::new("git");
+        c.current_dir(root)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x08000000);
+        }
+        let out = c.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn crashed_original_worker_turn_is_interrupted_once_and_the_chat_recovers() {
+        let mut f = Fixture::start().await;
+        f.worker.gate.add_permits(64);
+        f.worker.crash.store(true, Ordering::SeqCst);
+        // The owner process dies after consuming the prompt; another process
+        // with the same native/shared IDs takes over the session.
+        f.worker.pid.store(5151, Ordering::SeqCst);
+        f.send(prompt("crash", "crash", Value::Null, "normal"))
+            .await
+            .unwrap();
+        f.connected(2).await;
+        let thread = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let thread = f.thread().await;
+                if thread["latestTurn"]["state"] == "interrupted" {
+                    return thread;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the orphaned turn stayed running");
+        assert!(s(&thread["session"]["lastError"]).contains("restarted before this task finished"));
+        assert_ne!(thread["session"]["status"], "running");
+        let users: Vec<_> = thread["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .map(|m| m["text"].clone())
+            .collect();
+        assert_eq!(users, [json!("PROMPT_crash")], "history is kept");
+        let saved =
+            f.db.call(|a| a.store.load_chat(CHAT))
+                .await
+                .unwrap()
+                .unwrap();
+        let (cid, native) = (CHAT.to_owned(), NATIVE.to_owned());
+        assert!(f
+            .db
+            .call(move |a| a.store.unresolved_claude_inputs(&cid, &native))
+            .await
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        assert!(saved["external_stop"].is_null());
+        // The chat accepts a new prompt; the orphaned one is never resent.
+        f.send(prompt("after", "after", Value::Null, "normal"))
+            .await
+            .unwrap();
+        assert_eq!(f.idle().await["latestTurn"]["state"], "completed");
+        assert_eq!(prompts(&f.log()), 2);
+        // Later reconnects with the same owner change nothing.
+        let before = f.thread().await;
+        f.restart().await;
+        let after = f.thread().await;
+        assert_eq!(after["messages"], before["messages"]);
+        assert_eq!(after["latestTurn"], before["latestTurn"]);
+        assert_eq!(prompts(&f.log()), 2);
+        f.stop().await;
+    }
+
+    #[tokio::test]
+    async fn relay_reconnect_with_the_same_owner_keeps_its_turn_running_until_its_result() {
+        let f = Fixture::start().await;
+        f.worker.gate.add_permits(64);
+        f.worker.crash.store(true, Ordering::SeqCst);
+        f.send(prompt("continues", "continues", Value::Null, "normal"))
+            .await
+            .unwrap();
+        let input = f.log()[0]["input"]["native"].clone();
+        // Only the relay connection dropped; the same worker finished the turn
+        // while the bridge was away. Catch-up must complete it, not cut it off.
+        f.worker.resume.lock().unwrap().extend([
+            json!({"type":"assistant","session_id":NATIVE,"user_message_uuid":input,"message":{"id":"late-reply","content":[{"type":"text","text":"LATE_REPLY"}]}}),
+            json!({"type":"result","session_id":NATIVE,"user_message_uuid":input,"is_error":false}),
+        ]);
+        f.connected(2).await;
+        let done = f.idle().await;
+        assert_eq!(done["latestTurn"]["state"], "completed");
+        assert!(done["session"]["lastError"].is_null());
+        assert!(done["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["text"] == "LATE_REPLY"));
         f.stop().await;
     }
 }

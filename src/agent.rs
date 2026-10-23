@@ -866,6 +866,21 @@ pub(crate) mod observer_fixture {
         ));
         fake.output.send(Event::ClaudeRemote(event)).await.is_ok()
     }
+    /// The checkpoint the real observer offers after catch-up, before ready.
+    pub(crate) async fn emit_owner(fake: &mut Fake, pending: &mut Pending, pid: u64) -> bool {
+        let previous = fake.cursor.projection["owner_pid"].as_u64();
+        let receipt = crate::claude_host::Receipt {
+            owner_replaced: previous.is_some_and(|p| p != pid),
+            ..Default::default()
+        };
+        *pending = Some((fake.cursor.clone(), receipt));
+        fake.output
+            .send(Event::ClaudeRemote(crate::claude_remote::Envelope::owner(
+                Some(pid),
+            )))
+            .await
+            .is_ok()
+    }
     /// Answers one write; a commit saves the pending event with its receipt.
     pub(crate) async fn answer(
         fake: &mut Fake,
