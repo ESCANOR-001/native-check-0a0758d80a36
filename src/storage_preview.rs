@@ -40,11 +40,11 @@ impl Budget {
         Ok(files)
     }
 }
-fn archived(path: &str) -> Option<String> {
+pub(crate) fn archived(path: &str) -> Option<String> {
     let name = path.strip_prefix("archived_sessions/")?;
     if name.is_empty()
         || name.len() > 1024
-        || name.contains(['/', '\\'])
+        || name.contains(['/', '\\', ':'])
         || name.contains("..")
         || name.chars().any(char::is_control)
     {
@@ -60,7 +60,7 @@ fn epoch(name: &str) -> bool {
             .iter()
             .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
 }
-fn logical_pin(home: &Path, row: &str) -> Option<String> {
+pub(crate) fn logical_pin(home: &Path, row: &str) -> Option<String> {
     let row = row.replace('\\', "/");
     let path = Path::new(&row);
     if !path.is_absolute() {
@@ -91,6 +91,29 @@ fn restoring(home: &Path, budget: &mut Budget) -> Result<BTreeSet<String>> {
         let meta = fs::symlink_metadata(&path).map_err(|_| FAILED)?;
         if !regular(&meta) || !meta.is_dir() {
             return Err(FAILED);
+        }
+        match profile_snapshot::bytes(&path.join("native-stage.json"), 8 * 1024 * 1024) {
+            Ok(raw) => {
+                let value: Value = serde_json::from_slice(&raw).map_err(|_| FAILED)?;
+                if value["version"] != 1
+                    || !matches!(
+                        value["phase"].as_str(),
+                        Some("prepared" | "files_staged" | "reconciled" | "restoring" | "restored")
+                    )
+                {
+                    return Err(FAILED);
+                }
+                let files = value["files"].as_array().ok_or(FAILED)?;
+                if files.is_empty() || files.len() > 10_000 {
+                    return Err(FAILED);
+                }
+                for file in files {
+                    budget.tick()?;
+                    out.insert(archived(file["relative"].as_str().ok_or(FAILED)?).ok_or(FAILED)?);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(FAILED),
         }
         let bytes = match profile_snapshot::bytes(&path.join("restore-pending.json"), 1024 * 1024) {
             Ok(bytes) => bytes,
@@ -186,15 +209,29 @@ fn pinned(home: &Path, budget: &mut Budget) -> Result<BTreeSet<String>> {
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Candidate {
-    rel_path: String,
-    bytes: u64,
-    mtime_ms: f64,
-    physical_rel_paths: Vec<String>,
+pub(crate) struct Candidate {
+    pub rel_path: String,
+    pub bytes: u64,
+    pub mtime_ms: f64,
+    pub physical_rel_paths: Vec<String>,
     #[serde(skip)]
     physical: Vec<(String, u64, f64)>,
 }
+pub(crate) struct Selection {
+    pub percent: u64,
+    pub bytes: u64,
+    pub digest: String,
+    pub candidates: Vec<Candidate>,
+}
+impl Selection {
+    fn response(&self) -> Value {
+        json!({"percent":self.percent,"count":self.candidates.len(),"bytes":self.bytes,"digest":self.digest,"candidates":self.candidates.iter().take(50).collect::<Vec<_>>()})
+    }
+}
 pub(crate) fn preview(home: &Path, percent: f64) -> Result<Value> {
+    Ok(select(home, percent)?.response())
+}
+pub(crate) fn select(home: &Path, percent: f64) -> Result<Selection> {
     if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
         return Err("invalid_percent");
     }
@@ -295,9 +332,12 @@ pub(crate) fn preview(home: &Path, percent: f64) -> Result<Value> {
         .iter()
         .try_fold(0u64, |sum, c| sum.checked_add(c.bytes))
         .ok_or(LIMITED)?;
-    Ok(
-        json!({"percent":percent,"count":selected.len(),"bytes":bytes,"digest":digest,"candidates":selected.iter().take(50).collect::<Vec<_>>()}),
-    )
+    Ok(Selection {
+        percent,
+        bytes,
+        digest,
+        candidates: selected,
+    })
 }
 
 #[cfg(test)]
@@ -482,5 +522,40 @@ mod tests {
         fs::remove_dir_all(home.join("archived_sessions")).unwrap();
         symlink(outside.path(), home.join("archived_sessions")).unwrap();
         assert!(preview(&home, 100.0).is_err());
+    }
+    #[test]
+    fn internal_selection_retains_all_rows_while_wire_response_is_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..80 {
+            archive(root.path(), &format!("{i:03}.jsonl"), 1, i + 1);
+        }
+        let selected = select(root.path(), 100.0).unwrap();
+        assert_eq!(selected.candidates.len(), 80);
+        assert_eq!(
+            selected.response()["candidates"].as_array().unwrap().len(),
+            50
+        );
+        assert_eq!(selected.response()["count"], 80);
+    }
+    #[test]
+    fn native_journals_exclude_partial_cleanup_and_restore_files_until_finished() {
+        let root = tempfile::tempdir().unwrap();
+        archive(root.path(), "a.jsonl", 1, 1);
+        archive(root.path(), "b.jsonl", 2, 2);
+        let lease = crate::storage_stage::Lease::acquire(root.path()).unwrap();
+        let mut stage = lease
+            .prepare(&["archived_sessions/a.jsonl".into()])
+            .unwrap();
+        assert_eq!(preview(root.path(), 100.0).unwrap()["count"], 1);
+        stage.stage_files().unwrap();
+        stage.restore_files().unwrap();
+        assert_eq!(preview(root.path(), 100.0).unwrap()["count"], 1);
+        stage.finish_restore().unwrap();
+        assert_eq!(preview(root.path(), 100.0).unwrap()["count"], 2);
+        let stage = lease
+            .prepare(&["archived_sessions/a.jsonl".into()])
+            .unwrap();
+        fs::write(stage.directory().join("native-stage.json"), "{}").unwrap();
+        assert!(preview(root.path(), 100.0).is_err());
     }
 }

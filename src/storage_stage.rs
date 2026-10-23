@@ -226,12 +226,14 @@ impl Lease {
         crate::private_directory::prepare(&trash)?;
         let id = format!(".trash/{}-{}", crate::auth::now(), rand::random::<u64>());
         let path = self.home.join(&id);
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
             builder.mode(0o700);
-        }
+            builder
+        };
         builder.create(&path)?;
         let mut s = Stage {
             lease: self,

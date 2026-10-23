@@ -309,4 +309,173 @@ fn linked_databases_and_sidecars_are_rejected_without_writing_the_target() {
         fs::read(outside.path().join("state_1.sqlite")).unwrap(),
         original
     );
+    fs::remove_file(h.path().join("state_1.sqlite")).unwrap();
+    fs::copy(
+        outside.path().join("state_1.sqlite"),
+        h.path().join("state_1.sqlite"),
+    )
+    .unwrap();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let link = h.path().join(format!("state_1.sqlite{suffix}"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path().join("state_1.sqlite"), &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(outside.path().join("state_1.sqlite"), &link).unwrap();
+        assert!(Database::open(&lease, Kind::State).is_err());
+        fs::remove_file(&link).unwrap();
+        fs::hard_link(outside.path().join("state_1.sqlite"), &link).unwrap();
+        assert!(Database::open(&lease, Kind::State).is_err());
+        fs::remove_file(link).unwrap();
+        assert_eq!(
+            fs::read(outside.path().join("state_1.sqlite")).unwrap(),
+            original
+        );
+        assert_eq!(fs::read(h.path().join("state_1.sqlite")).unwrap(), original);
+    }
+}
+
+const GUARDED_THREADS: &str = "CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT NOT NULL, archived INTEGER,is_pinned INTEGER,history_mode TEXT,forked_from_id TEXT,parent_thread_id TEXT,source_thread_id TEXT);";
+fn guarded(h: &tempfile::TempDir) -> Connection {
+    fs::create_dir(h.path().join("archived_sessions")).unwrap();
+    fs::write(h.path().join("archived_sessions/a.jsonl.zst"), "COMPRESSED").unwrap();
+    fs::write(h.path().join("archived_sessions/b.jsonl"), "B").unwrap();
+    let c = db(h, "state_1.sqlite", GUARDED_THREADS);
+    c.execute_batch("INSERT INTO threads VALUES('a','archived_sessions/a.jsonl',1,0,'linear',NULL,NULL,NULL),('b','archived_sessions/b.jsonl',1,0,'linear',NULL,NULL,NULL),('outside','sessions/out.jsonl',0,0,'linear',NULL,NULL,NULL)").unwrap();
+    c
+}
+fn selected() -> Vec<String> {
+    vec![
+        "archived_sessions/a.jsonl".into(),
+        "archived_sessions/b.jsonl".into(),
+    ]
+}
+#[test]
+fn cleanup_selection_normalizes_compressed_absolute_paths_and_preserves_write_lock() {
+    let h = home();
+    let c = guarded(&h);
+    c.execute(
+        "UPDATE threads SET rollout_path=?1 WHERE id='a'",
+        [h.path().join("archived_sessions/a.jsonl").to_str().unwrap()],
+    )
+    .unwrap();
+    let lease = Lease::acquire(h.path()).unwrap();
+    let d = Database::open(&lease, Kind::State).unwrap().unwrap();
+    assert_eq!(d.cleanup_ids(&selected()).unwrap(), vec!["a", "b"]);
+    c.busy_timeout(std::time::Duration::from_millis(1)).unwrap();
+    assert!(c
+        .execute("UPDATE threads SET is_pinned=1 WHERE id='a'", [])
+        .is_err());
+    assert!(d.cleanup_ids(&["../outside".into()]).is_err());
+    assert!(d
+        .cleanup_ids(&[selected()[0].clone(), selected()[0].clone()])
+        .is_err());
+    assert_eq!(
+        d.capture(Table::Threads, &["a".into(), "b".into()])
+            .unwrap()
+            .unwrap()
+            .len(),
+        2
+    );
+    drop(d);
+    c.execute("UPDATE threads SET is_pinned=1 WHERE id='a'", [])
+        .unwrap();
+}
+#[test]
+fn cleanup_refuses_active_pinned_paginated_and_corrupt_flags_before_any_change() {
+    let h = home();
+    let c = guarded(&h);
+    let lease = Lease::acquire(h.path()).unwrap();
+    for (field, value, error) in [
+        ("archived", "0", "referenced_history"),
+        ("archived", "NULL", "referenced_history"),
+        ("is_pinned", "1", "pinned_thread"),
+        ("history_mode", "'PAGINATED'", "referenced_history"),
+        ("archived", "'unknown'", "db_reconcile_failed"),
+    ] {
+        c.execute_batch("UPDATE threads SET archived=1,is_pinned=0,history_mode='linear'")
+            .unwrap();
+        c.execute_batch(&format!("UPDATE threads SET {field}={value} WHERE id='a'"))
+            .unwrap();
+        let d = Database::open(&lease, Kind::State).unwrap().unwrap();
+        assert_eq!(d.cleanup_ids(&selected()), Err(error));
+    }
+    assert_eq!(
+        c.query_row("SELECT count(*) FROM threads", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        fs::read(h.path().join("archived_sessions/a.jsonl.zst")).unwrap(),
+        b"COMPRESSED"
+    );
+    assert!(!h.path().join(".trash").exists());
+}
+#[test]
+fn cleanup_refuses_incoming_and_outgoing_spawn_edges_but_allows_complete_subtree() {
+    let h = home();
+    let c = guarded(&h);
+    let lease = Lease::acquire(h.path()).unwrap();
+    c.execute_batch("CREATE TABLE thread_spawn_edges(parent_thread_id TEXT,child_thread_id TEXT,PRIMARY KEY(parent_thread_id,child_thread_id));INSERT INTO thread_spawn_edges VALUES('a','b');").unwrap();
+    let d = Database::open(&lease, Kind::State).unwrap().unwrap();
+    assert_eq!(d.cleanup_ids(&selected()).unwrap(), vec!["a", "b"]);
+    drop(d);
+    for edge in [("outside", "a"), ("b", "outside")] {
+        c.execute(
+            "INSERT INTO thread_spawn_edges VALUES(?1,?2)",
+            params![edge.0, edge.1],
+        )
+        .unwrap();
+        let d = Database::open(&lease, Kind::State).unwrap().unwrap();
+        assert_eq!(d.cleanup_ids(&selected()), Err("referenced_history"));
+        drop(d);
+        c.execute(
+            "DELETE FROM thread_spawn_edges WHERE parent_thread_id=?1 AND child_thread_id=?2",
+            params![edge.0, edge.1],
+        )
+        .unwrap();
+    }
+}
+#[test]
+fn cleanup_refuses_external_fork_reference_for_all_supported_schema_columns() {
+    let h = home();
+    let c = guarded(&h);
+    let lease = Lease::acquire(h.path()).unwrap();
+    for column in ["forked_from_id", "parent_thread_id", "source_thread_id"] {
+        c.execute_batch(&format!("UPDATE threads SET {column}='a' WHERE id='b'"))
+            .unwrap();
+        let d = Database::open(&lease, Kind::State).unwrap().unwrap();
+        assert_eq!(d.cleanup_ids(&selected()).unwrap(), vec!["a", "b"]);
+        drop(d);
+        c.execute_batch(&format!(
+            "UPDATE threads SET {column}='a' WHERE id='outside'"
+        ))
+        .unwrap();
+        let d = Database::open(&lease, Kind::State).unwrap().unwrap();
+        assert_eq!(d.cleanup_ids(&selected()), Err("referenced_history"));
+        drop(d);
+        c.execute_batch(&format!("UPDATE threads SET {column}=NULL"))
+            .unwrap();
+    }
+}
+#[test]
+fn cleanup_supports_older_schema_but_refuses_missing_metadata_and_oversized_scan() {
+    let h = home();
+    let c = db(&h, "state_1.sqlite", THREADS);
+    let lease = Lease::acquire(h.path()).unwrap();
+    c.execute(
+        "INSERT INTO threads VALUES('a','archived_sessions/a.jsonl','KEEP')",
+        [],
+    )
+    .unwrap();
+    let d = Database::open(&lease, Kind::State).unwrap().unwrap();
+    assert_eq!(d.cleanup_ids(&selected()).unwrap(), vec!["a"]);
+    drop(d);
+    c.execute_batch("DROP TABLE threads;CREATE TABLE threads(id TEXT PRIMARY KEY)")
+        .unwrap();
+    let d = Database::open(&lease, Kind::State).unwrap().unwrap();
+    assert!(d.cleanup_ids(&selected()).is_err());
+    drop(d);
+    c.execute_batch("DROP TABLE threads;CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT);WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<50001) INSERT INTO threads SELECT CAST(i AS TEXT),'sessions/active' FROM n;").unwrap();
+    let d = Database::open(&lease, Kind::State).unwrap().unwrap();
+    assert_eq!(d.cleanup_ids(&selected()), Err("storage_backup_too_large"));
 }

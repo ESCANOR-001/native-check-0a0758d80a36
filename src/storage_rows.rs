@@ -307,6 +307,141 @@ impl<'a> Database<'a> {
         }
         Ok(Some((cols, pk.into_iter().map(|(_, n)| n).collect())))
     }
+    /// Refuse an archive selection while any selected history is active, pinned,
+    /// paginated or referenced across the deletion boundary. Runs inside this
+    /// write transaction so another writer cannot change the checked rows.
+    pub fn cleanup_ids(&self, logical_paths: &[String]) -> Result<Vec<String>> {
+        if !self.active || self.kind != Kind::State || logical_paths.len() > 10_000 {
+            return Err(FAILED);
+        }
+        let selected: BTreeSet<_> = logical_paths
+            .iter()
+            .map(|p| {
+                crate::storage_preview::archived(p)
+                    .filter(|n| n == p)
+                    .ok_or(FAILED)
+            })
+            .collect::<Result<_>>()?;
+        if selected.len() != logical_paths.len() {
+            return Err(FAILED);
+        }
+        let Some((columns, _)) = self.schema(Table::Threads)? else {
+            return Err(FAILED);
+        };
+        if !columns.iter().any(|c| c == "id") || !columns.iter().any(|c| c == "rollout_path") {
+            return Err(FAILED);
+        }
+        let optional = |name: &str| {
+            if columns.iter().any(|c| c == name) {
+                quote(name)
+            } else {
+                "NULL".to_owned()
+            }
+        };
+        let sql = format!(
+            "SELECT id,rollout_path,{},{},{} FROM threads LIMIT {}",
+            optional("archived"),
+            optional("is_pinned"),
+            optional("history_mode"),
+            MAX_ROWS + 1
+        );
+        let mut query = self.db.prepare(&sql).map_err(failure)?;
+        let mut rows = query.query([]).map_err(failure)?;
+        let mut ids = BTreeSet::new();
+        let mut count = 0;
+        let mut budget = Budget { bytes: 0, rows: 0 };
+        while let Some(row) = rows.next().map_err(failure)? {
+            count += 1;
+            if count > MAX_ROWS {
+                return Err("storage_backup_too_large");
+            }
+            let path: String = row.get(1).map_err(failure)?;
+            budget.add(path.len())?;
+            if path.len() > 16_384 {
+                return Err(FAILED);
+            }
+            let Some(path) = crate::storage_preview::logical_pin(self.lease.home(), &path) else {
+                continue;
+            };
+            if !selected.contains(&path) {
+                continue;
+            }
+            let id: String = row.get(0).map_err(failure)?;
+            if id.is_empty() || id.len() > 256 {
+                return Err(FAILED);
+            }
+            if columns.iter().any(|c| c == "archived")
+                && row.get::<_, Option<i64>>(2).map_err(failure)? != Some(1)
+            {
+                return Err("referenced_history");
+            }
+            if row.get::<_, Option<i64>>(3).map_err(failure)? == Some(1) {
+                return Err("pinned_thread");
+            }
+            if row
+                .get::<_, Option<String>>(4)
+                .map_err(failure)?
+                .is_some_and(|s| s.eq_ignore_ascii_case("paginated"))
+            {
+                return Err("referenced_history");
+            }
+            ids.insert(id);
+        }
+        drop(rows);
+        drop(query);
+        let ids_vec: Vec<_> = ids.iter().cloned().collect();
+        if ids.is_empty() {
+            return Ok(ids_vec);
+        }
+        if let Some(edges) = self.capture(Table::SpawnEdges, &ids_vec)? {
+            let parent = edges
+                .columns
+                .iter()
+                .position(|s| s == "parent_thread_id")
+                .ok_or(FAILED)?;
+            let child = edges
+                .columns
+                .iter()
+                .position(|s| s == "child_thread_id")
+                .ok_or(FAILED)?;
+            for edge in edges.rows {
+                for index in [parent, child] {
+                    match &edge[index] {
+                        Cell::Text(s) if ids.contains(s) => {}
+                        _ => return Err("referenced_history"),
+                    }
+                }
+            }
+        }
+        for column in ["forked_from_id", "parent_thread_id", "source_thread_id"] {
+            if !columns.iter().any(|s| s == column) {
+                continue;
+            }
+            for chunk in ids_vec.chunks(200) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT id FROM threads WHERE {} IN ({placeholders}) LIMIT {}",
+                    quote(column),
+                    MAX_ROWS + 1
+                );
+                let mut q = self.db.prepare(&sql).map_err(failure)?;
+                let mut rows = q.query(params_from_iter(chunk)).map_err(failure)?;
+                let mut count = 0;
+                while let Some(row) = rows.next().map_err(failure)? {
+                    count += 1;
+                    let id: String = row.get(0).map_err(failure)?;
+                    budget.add(id.len())?;
+                    if count > MAX_ROWS {
+                        return Err("storage_backup_too_large");
+                    }
+                    if !ids.contains(&id) {
+                        return Err("referenced_history");
+                    }
+                }
+            }
+        }
+        Ok(ids_vec)
+    }
     /// Captures only known per-thread rows. Consolidation-job changes require a
     /// separate compare-and-restore record and are not included in this primitive.
     pub fn capture(&self, table: Table, thread_ids: &[String]) -> Result<Option<Rows>> {
