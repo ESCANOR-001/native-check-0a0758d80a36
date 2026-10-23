@@ -80,7 +80,12 @@ fn row_count(path: &Path, table: &str) -> Option<u64> {
     if !before.is_file() || !regular(&before) || before.len() > 64 * 1024 * 1024 {
         return None;
     }
-    let mut url = reqwest::Url::from_file_path(path).ok()?;
+    // SQLite NOFOLLOW also rejects linked ancestors. macOS's normal temporary
+    // root (/var -> /private/var) is one, so resolve ancestors after rejecting a
+    // linked database itself. Keep NOFOLLOW and the identity check below: a
+    // replacement during measurement must never produce a trusted count.
+    let canonical = path.canonicalize().ok()?;
+    let mut url = reqwest::Url::from_file_path(canonical).ok()?;
     url.set_query(Some("immutable=1"));
     let db = Connection::open_with_flags(
         url.as_str(),
@@ -376,6 +381,27 @@ mod tests {
         .unwrap();
         assert_eq!(scan(root.path())["total"]["fileCount"], 0);
         assert!(row_count(&root.path().join("state_1.sqlite"), "threads").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_report_reads_database_beneath_a_system_path_alias_without_sidecars() {
+        let root = tempfile::tempdir().unwrap();
+        let actual = root.path().join("actual");
+        fs::create_dir(&actual).unwrap();
+        let path = actual.join("state_1.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE threads(id INTEGER); INSERT INTO threads VALUES(1);")
+            .unwrap();
+        drop(db);
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert_eq!(row_count(&alias.join("state_1.sqlite"), "threads"), Some(1));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read_dir(&actual).unwrap().count(), 1);
+        std::os::unix::fs::symlink(&path, actual.join("state_2.sqlite")).unwrap();
+        assert_eq!(row_count(&alias.join("state_2.sqlite"), "threads"), None);
     }
 }
 #[derive(Clone)]

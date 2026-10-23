@@ -46,6 +46,7 @@ mod worktrees;
 
 pub mod invitation_file;
 pub mod profile_lock;
+mod repository_clone;
 pub mod storage;
 mod storage_disk;
 mod storage_report;

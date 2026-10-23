@@ -4889,3 +4889,104 @@ async fn existing_worktree_bootstrap_setup_recovery_never_repeats_or_recreates_c
     assert!(!checkout.exists());
     t.stop().await;
 }
+
+#[tokio::test]
+async fn repository_clone_does_not_block_either_agent_and_shutdown_never_replays_it() {
+    use tokio::io::AsyncReadExt;
+    let mut test = Test::new().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "git://127.0.0.1:{}/slow",
+        listener.local_addr().unwrap().port()
+    );
+    let p = json!({"remoteUrl":url,"destinationPath":test.dir.path().join("clone-withheld")});
+    let hub = test.hub.clone();
+    let params = p.clone();
+    let task = tokio::spawn(async move {
+        hub.call(
+            AgentKind::Codex,
+            "phone",
+            "sourceControl.cloneRepository",
+            params,
+        )
+        .await
+    });
+    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(8), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut bytes = [0u8; 1024];
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), stream.read(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap()
+            > 0
+    );
+    assert!(test
+        .hub
+        .call(
+            AgentKind::Codex,
+            "phone",
+            "sourceControl.cloneRepository",
+            p.clone()
+        )
+        .await
+        .unwrap_err()
+        .contains("already running"));
+    assert!(test
+        .hub
+        .call(
+            AgentKind::Claude,
+            "phone",
+            "sourceControl.cloneRepository",
+            p.clone()
+        )
+        .await
+        .unwrap_err()
+        .contains("not available"));
+    for (agent, id) in [
+        (AgentKind::Codex, "clone-code"),
+        (AgentKind::Claude, "clone-claude"),
+    ] {
+        test.create(agent, id).await;
+        test.call(agent, prompt(id, "while-cloning", "normal"))
+            .await
+            .unwrap();
+        let t = test.wait(agent, id, "ready").await;
+        assert_eq!(t["messages"].as_array().unwrap().len(), 2);
+    }
+    test.stop().await;
+    assert!(tokio::time::timeout(Duration::from_secs(4), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(4), stream.read(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    test.hub = Chats::start(test.db.clone(), test.config.clone())
+        .await
+        .unwrap();
+    assert!(test
+        .hub
+        .call(
+            AgentKind::Codex,
+            "phone",
+            "sourceControl.cloneRepository",
+            p
+        )
+        .await
+        .unwrap_err()
+        .contains("not be retried"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
+    test.stop().await;
+}

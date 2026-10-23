@@ -967,6 +967,7 @@ impl Hub {
     async fn run(mut self, mut receive: mpsc::Receiver<Request>) {
         let mut tick = tokio::time::interval(Duration::from_millis(120));
         let mut inspections = tokio::task::JoinSet::new();
+        let mut clone_jobs = tokio::task::JoinSet::new();
         let mut discovery = tokio::task::JoinSet::new();
         let mut capability_jobs = tokio::task::JoinSet::new();
         let mut tool_jobs = tokio::task::JoinSet::new();
@@ -1258,6 +1259,15 @@ impl Hub {
                         capability_jobs.spawn(async move {(id,crate::capabilities::inspect(config,cwd,disabled).await)});
                         continue;
                     }
+                    if r.method=="sourceControl.cloneRepository" {
+                        if r.agent!=AgentKind::Codex {let _=r.reply.send(Err("Repository cloning is not available for managed Claude chats".into()));continue;}
+                        if !clone_jobs.is_empty() {let _=r.reply.send(Err("A repository clone is already running; retry shortly".into()));continue;}
+                        let base=self.config.workspace.clone();let db=self.db.clone();
+                        clone_jobs.spawn(async move {
+                            let result=crate::repository_clone::run(db,&base,r.params).await;
+                            let _=r.reply.send(result);
+                        });continue;
+                    }
                     if ["vcs.refreshStatus","vcs.listRefs","review.getDiffPreview"].contains(&r.method.as_str()) {
                         if inspections.len()>=2 {let _=r.reply.send(Err("Git inspection busy; try again shortly".into()));continue;}
                         let base=self.config.workspace.clone();
@@ -1293,6 +1303,7 @@ impl Hub {
                     }
                 },
                 _=inspections.join_next(), if !inspections.is_empty()=>{},
+                _=clone_jobs.join_next(), if !clone_jobs.is_empty()=>{},
                 Some(result)=bootstrap_jobs.join_next(), if !bootstrap_jobs.is_empty()=>{
                     if let Ok((r,result))=result {
                         let id=s(&r.params["threadId"]).to_owned();self.tool_controls.remove(&id);
@@ -1441,6 +1452,8 @@ impl Hub {
         }
         inspections.abort_all();
         while inspections.join_next().await.is_some() {}
+        clone_jobs.abort_all();
+        while clone_jobs.join_next().await.is_some() {}
         capability_jobs.abort_all();
         while capability_jobs.join_next().await.is_some() {}
         tool_jobs.abort_all();

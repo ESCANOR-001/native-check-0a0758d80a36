@@ -38,7 +38,7 @@ fn windows_path_argument(text: &str) -> Result<String, String> {
 pub(crate) async fn git(root: &Path, args: &[&str]) -> Result<(i32, Vec<u8>), String> {
     git_with_timeout(root, args, Duration::from_secs(8), false).await
 }
-async fn git_with_timeout(
+pub(crate) async fn git_with_timeout(
     root: &Path,
     args: &[&str],
     timeout: Duration,
