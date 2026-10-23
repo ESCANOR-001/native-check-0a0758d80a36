@@ -27,6 +27,7 @@ mod legacy_claude;
 mod legacy_claude_assets;
 mod legacy_claude_bindings;
 mod legacy_claude_native;
+mod legacy_claude_reconcile;
 mod legacy_claude_resume;
 mod legacy_codex;
 mod legacy_codex_headers;

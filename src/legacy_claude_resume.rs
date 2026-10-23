@@ -15,18 +15,33 @@ fn expected(raw: &[u8], hash: &str) -> Result<Cursor, String> {
         return Err(INVALID.into());
     }
     let source: Value = serde_json::from_slice(raw).map_err(|_| INVALID)?;
-    if source["external"] != true {
-        return Err("An owned Claude session needs a quiesced native-history export before its resume checkpoint can migrate".into());
-    }
-    let sequence = source["remoteSequence"]
-        .as_u64()
-        .filter(|v| *v > 0 && *v <= 9_007_199_254_740_991)
-        .ok_or(INVALID)?;
     let identity = Identity {
         native_session: source["nativeId"].as_str().ok_or(INVALID)?.into(),
         bridge_session: source["bridgeId"].as_str().ok_or(INVALID)?.into(),
     };
-    Cursor::legacy(identity, sequence, hash.into())
+    if source["external"] == true {
+        let sequence = source["remoteSequence"]
+            .as_u64()
+            .filter(|v| *v > 0 && *v <= 9_007_199_254_740_991)
+            .ok_or(INVALID)?;
+        Cursor::legacy(identity, sequence, hash.into())
+    } else {
+        // An owned native export has no proven relay offset. Replay from zero
+        // with an immutable-row boundary, never skip events using a guessed
+        // sequence. A matching complete native export is required separately.
+        Cursor::new(identity)
+    }
+}
+fn native_proof(db: &rusqlite::Connection, id: &str, raw: &[u8], hash: &str) -> Result<(), String> {
+    let source: Value = serde_json::from_slice(raw).map_err(|_| INVALID)?;
+    if source["external"] == true {
+        return Ok(());
+    }
+    let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='legacy_claude_native')",[],|r|r.get(0)).map_err(|_|INVALID)?;
+    if !exists || !db.query_row("SELECT EXISTS(SELECT 1 FROM legacy_claude_native WHERE chat=?1 AND source_hash=?2 AND phase='prepared')",params![id,hash],|r|r.get::<_,bool>(0)).map_err(|_|INVALID)? {
+        return Err("An owned Claude session needs a verified quiesced native-history export before its replay checkpoint can migrate".into());
+    }
+    Ok(())
 }
 /// Called by the enclosing metadata verifier. Every cursor must be either absent
 /// or exactly the prepared legacy anchor; observed native progress forbids rollback.
@@ -73,6 +88,7 @@ pub(crate) fn verify(db: &rusqlite::Connection, id: &str) -> Result<(), String> 
             |r| r.get(0),
         )
         .map_err(|_| INVALID)?;
+    native_proof(db, id, &raw, &hash)?;
     let mut wanted = expected(&raw, &hash)?;
     let before: i64 = db
         .query_row(
@@ -118,6 +134,7 @@ pub(crate) fn rollback(db: &rusqlite::Connection, id: &str) -> Result<(), String
 impl Store {
     pub fn prepare_legacy_claude_resume(&mut self, id: &str) -> Result<Value, String> {
         let p = self.legacy_claude_prepared(id)?;
+        native_proof(&self.db, id, &p.source, &p.hash)?;
         let mut source = expected(&p.source, &p.hash)?;
         let before: i64 = self
             .db
@@ -163,7 +180,7 @@ impl Store {
         }
         tx.commit().map_err(|_| INVALID)?;
         Ok(
-            json!({"phase":"external-resume-prepared","sequence":source.sequence,"migrationComplete":false}),
+            json!({"phase":if source.sequence==0 {"owned-replay-prepared"} else {"external-resume-prepared"},"sequence":source.sequence,"migrationComplete":false}),
         )
     }
 }

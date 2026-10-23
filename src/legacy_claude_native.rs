@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufRead, BufReader, Read},
     path::{Component, Path},
@@ -26,6 +26,8 @@ struct Report {
     prompts: usize,
     replies: usize,
     checkpoints: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reconciled: Vec<crate::legacy_claude_reconcile::Binding>,
 }
 fn fingerprint(path: &Path) -> Result<String, String> {
     let raw = profile_snapshot::bytes(path, MAX_ROW).map_err(|_| INVALID)?;
@@ -54,7 +56,14 @@ struct Required {
     replies: BTreeSet<String>,
     checkpoints: BTreeSet<String>,
 }
-fn required(raw: &Value) -> Result<Required, String> {
+fn required(
+    raw: &Value,
+    reconciled: &[crate::legacy_claude_reconcile::Binding],
+) -> Result<Required, String> {
+    let reconciled: BTreeMap<_, _> = reconciled
+        .iter()
+        .map(|b| (b.message.as_str(), b.native.as_str()))
+        .collect();
     let mut users = BTreeSet::new();
     let mut replies = BTreeSet::new();
     for message in raw["thread"]["messages"].as_array().ok_or(INVALID)? {
@@ -67,7 +76,10 @@ fn required(raw: &Value) -> Result<Required, String> {
                 if mapped.is_some_and(|d| d["state"] == "cancelled") {
                     continue;
                 }
-                let native = mapped.and_then(|d| d["uuid"].as_str()).unwrap_or(id);
+                let native = mapped
+                    .and_then(|d| d["uuid"].as_str())
+                    .or_else(|| reconciled.get(id).copied())
+                    .unwrap_or(id);
                 uuid::Uuid::parse_str(native).map_err(|_| "An older prompt has no native identity in this export; reconcile its original delivery ledger before upgrading")?;
                 users.insert(native.to_owned());
             }
@@ -100,13 +112,14 @@ fn inspect(data: &Path, relative: &str, raw: &[u8]) -> Result<Report, String> {
     let native = source["nativeId"].as_str().ok_or(INVALID)?;
     uuid::Uuid::parse_str(native).map_err(|_| INVALID)?;
     relative_path(relative, native)?;
+    let path = data.join(relative);
+    let reconciled = crate::legacy_claude_reconcile::reconcile(&path, &source)?;
     let Required {
         mut users,
         mut replies,
         mut checkpoints,
-    } = required(&source)?;
+    } = required(&source, &reconciled)?;
     let (prompts, reply_count, checkpoint_count) = (users.len(), replies.len(), checkpoints.len());
-    let path = data.join(relative);
     open(data, true).map_err(|_| INVALID)?;
     open(path.parent().ok_or(INVALID)?, true).map_err(|_| INVALID)?;
     let (file, meta) = profile_snapshot::open(&path, MAX_FILE).map_err(|_| INVALID)?;
@@ -217,6 +230,7 @@ fn inspect(data: &Path, relative: &str, raw: &[u8]) -> Result<Report, String> {
         prompts,
         replies: reply_count,
         checkpoints: checkpoint_count,
+        reconciled,
     })
 }
 fn exists(db: &rusqlite::Connection) -> Result<bool, String> {
@@ -300,6 +314,11 @@ pub(crate) fn verify(db: &rusqlite::Connection, directory: &Path, id: &str) -> R
     if serde_json::from_str::<Report>(&report).map_err(|_| INVALID)? != expected {
         return Err(INVALID.into());
     }
+    let source: Value = serde_json::from_slice(&raw).map_err(|_| INVALID)?;
+    if reconciled_rows(db, id, source["nativeId"].as_str().ok_or(INVALID)?)? != expected.reconciled
+    {
+        return Err(INVALID.into());
+    }
     Ok(())
 }
 pub(crate) fn rollback(
@@ -309,6 +328,13 @@ pub(crate) fn rollback(
 ) -> Result<(), String> {
     verify(db, directory, id)?;
     if exists(db)? {
+        if bindings_table(db).map_err(|_| INVALID)? {
+            db.execute(
+                "DELETE FROM legacy_claude_native_bindings WHERE chat=?1",
+                [id],
+            )
+            .map_err(|_| INVALID)?;
+        }
         db.execute(
             "UPDATE legacy_claude_native SET phase='rolled-back' WHERE chat=?1",
             [id],
@@ -330,7 +356,6 @@ impl Store {
     ) -> Result<Value, String> {
         let prepared = self.legacy_claude_prepared(id)?;
         crate::legacy_claude_bindings::validate(&prepared.source)?;
-        required(&serde_json::from_slice(&prepared.source).map_err(|_| INVALID)?)?;
         let native = prepared.state["native_id"].as_str().ok_or(INVALID)?;
         relative_path(transcript, native)?;
         if prepared.state["external_claude"] == true {
@@ -391,7 +416,7 @@ impl Store {
         migration_snapshot::verify_restored(&restored, &environment).map_err(|_| INVALID)?;
         let encoded = serde_json::to_string(&report).map_err(|_| INVALID)?;
         self.check_history(encoded.len() as u64 + 65536)?;
-        self.db.execute_batch("CREATE TABLE IF NOT EXISTS legacy_claude_native(chat TEXT PRIMARY KEY,source_hash TEXT NOT NULL,bundle TEXT NOT NULL,transcript TEXT NOT NULL,report TEXT NOT NULL,phase TEXT NOT NULL);").map_err(|_|INVALID)?;
+        self.db.execute_batch("CREATE TABLE IF NOT EXISTS legacy_claude_native(chat TEXT PRIMARY KEY,source_hash TEXT NOT NULL,bundle TEXT NOT NULL,transcript TEXT NOT NULL,report TEXT NOT NULL,phase TEXT NOT NULL);CREATE TABLE IF NOT EXISTS legacy_claude_native_bindings(chat TEXT NOT NULL,session TEXT NOT NULL,native TEXT NOT NULL,message TEXT NOT NULL,turn TEXT NOT NULL,PRIMARY KEY(chat,session,native),UNIQUE(chat,session,message));").map_err(|_|INVALID)?;
         let tx = self.db.transaction().map_err(|_| INVALID)?;
         let old: Option<(String,String,String,String,String)>=tx.query_row("SELECT source_hash,bundle,transcript,report,phase FROM legacy_claude_native WHERE chat=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|_|INVALID)?;
         if let Some(old) = old {
@@ -407,6 +432,13 @@ impl Store {
                 return Err(INVALID.into());
             }
         } else {
+            for b in &report.reconciled {
+                tx.execute(
+                    "INSERT INTO legacy_claude_native_bindings VALUES(?1,?2,?3,?4,?5)",
+                    params![id, native, b.native, b.message, b.turn],
+                )
+                .map_err(|_| INVALID)?;
+            }
             tx.execute(
                 "INSERT INTO legacy_claude_native VALUES(?1,?2,?3,?4,?5,'prepared')",
                 params![id, prepared.hash, bundle, transcript, encoded],
@@ -416,7 +448,64 @@ impl Store {
         verify(&tx, &self.directory, id)?;
         tx.commit().map_err(|_| INVALID)?;
         Ok(
-            json!({"phase":"claude-native-history-prepared","rows":report.rows,"bytes":report.bytes,"prompts":report.prompts,"replies":report.replies,"fileCheckpoints":report.checkpoints,"migrationComplete":false}),
+            json!({"phase":"claude-native-history-prepared","rows":report.rows,"bytes":report.bytes,"prompts":report.prompts,"replies":report.replies,"fileCheckpoints":report.checkpoints,"reconciledPromptIds":report.reconciled.len(),"migrationComplete":false}),
         )
     }
+}
+fn bindings_table(db: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='legacy_claude_native_bindings')",[],|r|r.get(0))
+}
+fn reconciled_rows(
+    db: &rusqlite::Connection,
+    id: &str,
+    session: &str,
+) -> Result<Vec<crate::legacy_claude_reconcile::Binding>, String> {
+    if !bindings_table(db).map_err(|_| INVALID)? {
+        return Ok(vec![]);
+    }
+    let mut stmt=db.prepare("SELECT session,native,message,turn FROM legacy_claude_native_bindings WHERE chat=?1 ORDER BY native").map_err(|_|INVALID)?;
+    let rows = stmt
+        .query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                crate::legacy_claude_reconcile::Binding {
+                    native: r.get(1)?,
+                    message: r.get(2)?,
+                    turn: r.get(3)?,
+                },
+            ))
+        })
+        .map_err(|_| INVALID)?;
+    let mut result = vec![];
+    for row in rows {
+        let (saved, binding) = row.map_err(|_| INVALID)?;
+        if saved != session || result.len() >= 100_000 {
+            return Err(INVALID.into());
+        }
+        result.push(binding);
+    }
+    Ok(result)
+}
+pub(crate) fn lookup(
+    db: &rusqlite::Connection,
+    chat: &str,
+    session: &str,
+    native: &str,
+) -> rusqlite::Result<Option<crate::claude_outbox::Record>> {
+    if !bindings_table(db)? {
+        return Ok(None);
+    }
+    db.query_row("SELECT b.message,b.turn FROM legacy_claude_native_bindings b JOIN legacy_claude_native i ON i.chat=b.chat WHERE b.chat=?1 AND b.session=?2 AND b.native=?3 AND i.phase='prepared'",params![chat,session,native],|r|Ok(crate::claude_outbox::Record{input:crate::claude_turns::Input{native:native.into(),message:r.get(0)?,public_turn:r.get(1)?,local:true,steer:false},state:"legacy-consumed".into()})).optional()
+}
+pub(crate) fn reserved(
+    db: &rusqlite::Connection,
+    chat: &str,
+    session: &str,
+    native: &str,
+    message: &str,
+) -> rusqlite::Result<bool> {
+    if !bindings_table(db)? {
+        return Ok(false);
+    }
+    db.query_row("SELECT EXISTS(SELECT 1 FROM legacy_claude_native_bindings b JOIN legacy_claude_native i ON i.chat=b.chat WHERE b.chat=?1 AND b.session=?2 AND (b.native=?3 OR b.message=?4) AND i.phase='prepared')",params![chat,session,native,message],|r|r.get(0))
 }

@@ -37,12 +37,24 @@ fn expected(raw: &[u8]) -> Result<(String, Vec<Binding>), String> {
     for row in rows {
         let native = text(&row["uuid"], 36)?;
         uuid::Uuid::parse_str(&native).map_err(|_| INVALID)?;
-        let message = text(&row["messageId"], 128)?;
+        let message = text(&row["messageId"], 256)?;
         let turn = text(&row["turnId"], 128)?;
-        let steer = if row["steer"].is_null() {
-            false
-        } else {
-            row["steer"].as_bool().ok_or(INVALID)?
+        let steer = match &row["steer"] {
+            Value::Null => false,
+            Value::Bool(value) => *value,
+            // The TypeScript bridge saves the original queued-prompt record,
+            // not a boolean. Read its identity only; never execute its command
+            // or stage its attachments during migration.
+            Value::Object(_)
+                if row["steer"]["id"] == message
+                    && row["steer"]["command"]["type"] == "thread.turn.start"
+                    && row["steer"]["command"]["threadId"] == root["thread"]["id"]
+                    && row["steer"]["command"]["message"]["messageId"] == message
+                    && row["steer"]["command"]["message"]["role"] == "user" =>
+            {
+                true
+            }
+            _ => return Err(INVALID.into()),
         };
         let state = match row["state"].as_str() {
             Some("consumed") => "legacy-consumed",
@@ -50,13 +62,17 @@ fn expected(raw: &[u8]) -> Result<(String, Vec<Binding>), String> {
             _ => return Err(INVALID.into()),
         }
         .to_owned();
-        if !messages.iter().any(|m| {
-            m["id"] == message
-                && m["role"] == "user"
+        let found = messages.iter().find(|m| m["id"] == message);
+        // A cancelled steer is removed from the visible transcript when it is
+        // put back in the queue. A settled export may already have discarded
+        // that queue entry. Retain its tombstone without inventing a bubble.
+        if !found.is_some_and(|m| {
+            m["role"] == "user"
                 && m["turnId"] == turn
                 && m["streaming"] != true
                 && m["phase"] != "queued"
-        }) {
+        }) && !(found.is_none() && state == "cancelled" && steer)
+        {
             return Err(INVALID.into());
         }
         let binding = Binding {
@@ -160,9 +176,13 @@ pub(crate) fn lookup(
 ) -> rusqlite::Result<Option<Record>> {
     let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='legacy_claude_bindings')",[],|r|r.get(0))?;
     if !exists {
-        return Ok(None);
+        return crate::legacy_claude_native::lookup(db, chat, session, native);
     }
-    db.query_row("SELECT b.message,b.turn,b.steer,b.state FROM legacy_claude_bindings b JOIN legacy_claude_binding_import i ON i.chat=b.chat WHERE b.chat=?1 AND b.session=?2 AND b.native=?3 AND i.phase='prepared'",params![chat,session,native],|r|Ok(Record{input:Input{native:native.into(),message:r.get(0)?,public_turn:r.get(1)?,local:true,steer:r.get(2)?},state:r.get(3)?})).optional()
+    let found=db.query_row("SELECT b.message,b.turn,b.steer,b.state FROM legacy_claude_bindings b JOIN legacy_claude_binding_import i ON i.chat=b.chat WHERE b.chat=?1 AND b.session=?2 AND b.native=?3 AND i.phase='prepared'",params![chat,session,native],|r|Ok(Record{input:Input{native:native.into(),message:r.get(0)?,public_turn:r.get(1)?,local:true,steer:r.get(2)?},state:r.get(3)?})).optional()?;
+    match found {
+        Some(record) => Ok(Some(record)),
+        None => crate::legacy_claude_native::lookup(db, chat, session, native),
+    }
 }
 pub(crate) fn reserved(
     db: &rusqlite::Connection,
@@ -173,9 +193,14 @@ pub(crate) fn reserved(
 ) -> rusqlite::Result<bool> {
     let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='legacy_claude_bindings')",[],|r|r.get(0))?;
     if !exists {
-        return Ok(false);
+        return crate::legacy_claude_native::reserved(db, chat, session, native, message);
     }
-    db.query_row("SELECT EXISTS(SELECT 1 FROM legacy_claude_bindings b JOIN legacy_claude_binding_import i ON i.chat=b.chat WHERE b.chat=?1 AND b.session=?2 AND (b.native=?3 OR b.message=?4) AND i.phase='prepared')",params![chat,session,native,message],|r|r.get(0))
+    let found:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM legacy_claude_bindings b JOIN legacy_claude_binding_import i ON i.chat=b.chat WHERE b.chat=?1 AND b.session=?2 AND (b.native=?3 OR b.message=?4) AND i.phase='prepared')",params![chat,session,native,message],|r|r.get(0))?;
+    if found {
+        Ok(true)
+    } else {
+        crate::legacy_claude_native::reserved(db, chat, session, native, message)
+    }
 }
 impl Store {
     pub fn prepare_legacy_claude_bindings(&mut self, id: &str) -> Result<Value, String> {
