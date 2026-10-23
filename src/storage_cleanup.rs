@@ -29,18 +29,18 @@ fn fs_error(_: std::io::Error) -> &'static str {
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Section {
-    binding: Binding,
-    rows: Vec<Rows>,
-    consolidation: Option<ConsolidationChange>,
+pub(crate) struct Section {
+    pub(crate) binding: Binding,
+    pub(crate) rows: Vec<Rows>,
+    pub(crate) consolidation: Option<ConsolidationChange>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Backup {
-    version: u32,
-    id: String,
-    files: Vec<String>,
-    sections: Vec<Section>,
+pub(crate) struct Backup {
+    pub(crate) version: u32,
+    pub(crate) id: String,
+    pub(crate) files: Vec<String>,
+    pub(crate) sections: Vec<Section>,
 }
 struct Locked<'a> {
     db: Database<'a>,
@@ -341,7 +341,7 @@ fn cleanup_selected(
 /// ordinary quarantine into a purge or implicitly repeats a cleanup selection.
 pub fn resume_purge(home: &Path, id: &str) -> std::result::Result<Value, Failure> {
     let lease = acquire(home)?;
-    let mut stage = resume_stage(&lease, id)?;
+    let mut stage = resume_stage(&lease, id, false)?;
     if !stage.purge_started() {
         return Err("purge_not_started".into());
     }
@@ -364,7 +364,7 @@ pub fn restore(home: &Path, id: &str) -> std::result::Result<Value, Failure> {
     })
 }
 fn restore_locked(lease: &Lease, id: &str, hook: &dyn Fn(Point) -> Result<()>) -> Result<Value> {
-    let mut stage = resume_stage(lease, id)?;
+    let mut stage = resume_stage(lease, id, true)?;
     if stage.purge_started() {
         return Err("purge_started");
     }
@@ -422,7 +422,7 @@ fn restore_locked(lease: &Lease, id: &str, hook: &dyn Fn(Point) -> Result<()>) -
     stage.finish_restore().map_err(fs_error)?;
     Ok(response)
 }
-fn resume_stage<'a>(lease: &'a Lease, id: &str) -> Result<Stage<'a>> {
+fn resume_stage<'a>(lease: &'a Lease, id: &str, adopt_legacy: bool) -> Result<Stage<'a>> {
     // Accept the older epoch-only spelling for diagnostics, without interpreting
     // arbitrary input as a host path. Native journals use epoch-random IDs.
     let name = id.strip_prefix(".trash/").ok_or("invalid_trash")?;
@@ -442,7 +442,13 @@ fn resume_stage<'a>(lease: &'a Lease, id: &str) -> Result<Stage<'a>> {
         }
     })?;
     match std::fs::symlink_metadata(lease.home().join(id).join("native-stage.json")) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err("legacy_trash"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return if adopt_legacy {
+                crate::storage_legacy::adopt(lease, id)
+            } else {
+                Err("legacy_trash")
+            }
+        }
         Err(_) => return Err("fs_failed"),
         Ok(_) => {}
     }

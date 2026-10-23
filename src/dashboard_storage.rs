@@ -157,6 +157,10 @@ fn failed(f: Failure) -> Response {
         | "restore_pending_overlap"
         | "dest_exists"
         | "storage_restore_conflict"
+        | "legacy_backup_invalid"
+        | "legacy_backup_incomplete"
+        | "legacy_backup_lossy"
+        | "legacy_restore_incomplete"
         | "storage_schema_changed"
         | "storage_database_changed"
         | "purge_started"
@@ -174,6 +178,9 @@ fn failed(f: Failure) -> Response {
         "storage_restore_conflict" | "dest_exists" => "Newer history or files conflict with this restore. They were kept unchanged.",
         "storage_database_changed" | "storage_schema_changed" => "The agent database changed since cleanup. The recovery backup was kept.",
         "missing_trash" => "This trash entry is no longer available. Refresh the list.",
+        "legacy_restore_incomplete" => "An earlier restore or deletion was interrupted. Its remaining files and recovery records were kept; automatic restore cannot safely replace them.",
+        "legacy_backup_lossy" => "This older backup contains values whose original type or precision cannot be verified. It was kept without changing your history.",
+        "legacy_backup_invalid" | "legacy_backup_incomplete" => "This older backup is incomplete or does not match its archived chats. Its files and recovery records were kept unchanged.",
         "legacy_trash" => "This archive was created by the previous bridge. Its recovery files have been kept.",
         _ => "Storage operation could not finish. Recovery data was kept where available; refresh the list before retrying.",
     };

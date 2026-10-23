@@ -930,6 +930,97 @@ impl<'a> Database<'a> {
             identity: self.identity.clone(),
         })
     }
+    /// Decode the former JSON row backup against the current exact table schema.
+    /// JavaScript cannot preserve integers beyond its safe range. Do not guess
+    /// their original values, or silently drop columns when a schema changes.
+    pub(crate) fn legacy_rows(&self, table: Table, input: &[serde_json::Value]) -> Result<Rows> {
+        let (columns, keys) = self.schema(table)?.ok_or("storage_schema_changed")?;
+        let out = self.legacy_cells(table, input, columns, keys)?;
+        self.check_restore(&out)?;
+        Ok(out)
+    }
+    fn legacy_cells(
+        &self,
+        table: Table,
+        input: &[serde_json::Value],
+        columns: Vec<String>,
+        keys: Vec<String>,
+    ) -> Result<Rows> {
+        if input.len() > MAX_ROWS {
+            return Err("storage_backup_too_large");
+        }
+        let mut rows = Vec::new();
+        let mut budget = Budget { bytes: 0, rows: 0 };
+        for value in input {
+            let object = value.as_object().ok_or("legacy_backup_invalid")?;
+            if object.len() != columns.len() || columns.iter().any(|c| !object.contains_key(c)) {
+                return Err("storage_schema_changed");
+            }
+            let mut cells = Vec::new();
+            for column in &columns {
+                let value = &object[column];
+                budget.add(serde_json::to_vec(value).map_err(|_| FAILED)?.len() + 16)?;
+                cells.push(match value {
+                    serde_json::Value::Null => Cell::Null,
+                    serde_json::Value::String(v) => Cell::Text(v.clone()),
+                    serde_json::Value::Number(v) => {
+                        let n = v
+                            .as_f64()
+                            .filter(|v| v.is_finite() && v.abs() <= 9_007_199_254_740_991.0)
+                            .ok_or("legacy_backup_lossy")?;
+                        if n.fract() == 0.0 {
+                            Cell::Integer(n as i64)
+                        } else {
+                            Cell::Real(n)
+                        }
+                    }
+                    // The old serializer did not tag blobs. Objects/arrays could
+                    // also be malformed SQL values, so never reinterpret them.
+                    _ => return Err("legacy_backup_lossy"),
+                });
+            }
+            rows.push(cells);
+        }
+        let out = Rows {
+            table,
+            columns,
+            keys,
+            rows,
+        };
+        let positions = self.validate(&out)?;
+        let mut seen = BTreeSet::new();
+        for row in &out.rows {
+            let key: Vec<_> = positions.iter().map(|i| &row[*i]).collect();
+            if !seen.insert(serde_json::to_vec(&key).map_err(|_| FAILED)?) {
+                return Err("legacy_backup_invalid");
+            }
+        }
+        Ok(out)
+    }
+    pub(crate) fn legacy_consolidation(
+        &self,
+        before: Option<&serde_json::Value>,
+        after: &serde_json::Value,
+    ) -> Result<ConsolidationChange> {
+        for row in before.into_iter().chain(std::iter::once(after)) {
+            if row.get("kind").and_then(serde_json::Value::as_str)
+                != Some("memory_consolidate_global")
+                || row.get("job_key").and_then(serde_json::Value::as_str) != Some("global")
+            {
+                return Err("legacy_backup_invalid");
+            }
+        }
+        // These images intentionally may differ from the current global job.
+        // Existing compare-and-restore semantics protect newer consolidation.
+        let decode = |values: &[serde_json::Value]| -> Result<Rows> {
+            let (columns, keys) = self.schema(Table::Jobs)?.ok_or("storage_schema_changed")?;
+            self.legacy_cells(Table::Jobs, values, columns, keys)
+        };
+        Ok(ConsolidationChange {
+            before: decode(&before.into_iter().cloned().collect::<Vec<_>>())?,
+            after: decode(std::slice::from_ref(after))?,
+        })
+    }
     pub(crate) fn check_restore(&self, backup: &Rows) -> Result<()> {
         let keys = self.validate(backup)?;
         for row in &backup.rows {

@@ -44,6 +44,38 @@ fn options(directory: bool) -> OpenOptions {
     }
     o
 }
+fn owned_temporary(name: &str) -> bool {
+    name.strip_suffix(".tmp")
+        .and_then(|s| {
+            s.strip_prefix("journal-")
+                .or_else(|| s.strip_prefix("record-"))
+        })
+        .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
+}
+fn publish_new(directory: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let temp = directory.join(format!("record-{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::hard_link(&temp, directory.join(name))?;
+        sync_directory(directory)?;
+        fs::remove_file(&temp)?;
+        sync_directory(directory)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp);
+    }
+    result
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Identity {
     volume: u64,
@@ -138,7 +170,7 @@ fn stage_id(id: &str) -> bool {
         return false;
     };
     let parts: Vec<_> = s.split('-').collect();
-    parts.len() == 2
+    (1..=2).contains(&parts.len())
         && parts
             .iter()
             .all(|s| !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit()))
@@ -254,6 +286,111 @@ impl Lease {
         }
         sync_directory(&trash)?;
         Ok(s)
+    }
+    /// Adopt a complete legacy quarantine only after database/schema preflight.
+    /// No file is moved and no row is written here. Original recovery metadata
+    /// stays intact until the new checksummed journal is durably published.
+    pub(crate) fn adopt_legacy<'a>(
+        &'a self,
+        id: &str,
+        relatives: &[String],
+        records: &BTreeMap<String, Vec<u8>>,
+    ) -> io::Result<Stage<'a>> {
+        self.check()?;
+        if !stage_id(id) || relatives.is_empty() || relatives.len() > MAX_FILES {
+            return Err(invalid());
+        }
+        ordinary(&self.home.join(".trash"), true)?;
+        let path = self.home.join(id);
+        let directory_id = identity(&open(&path, true)?)?;
+        if fs::symlink_metadata(path.join(JOURNAL)).is_ok() {
+            return Err(invalid());
+        }
+        let mut names = BTreeSet::new();
+        let mut identities = BTreeSet::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut files = Vec::new();
+        for relative in relatives {
+            let name = archive_name(relative)?;
+            if !names.insert(name.to_owned()) {
+                return Err(invalid());
+            }
+            // A prior legacy partial restore cannot prove destination ownership.
+            // Preserve both copies instead of guessing that a matching size is safe.
+            match fs::symlink_metadata(self.home.join(relative)) {
+                Ok(_) => return Err(io::ErrorKind::AlreadyExists.into()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            let file = Fingerprint::read(&path.join(name), relative.clone(), deadline)?;
+            if !identities.insert(file.identity.clone()) {
+                return Err(invalid());
+            }
+            files.push(file);
+        }
+        let mut metadata = BTreeMap::new();
+        for (name, raw) in records {
+            if raw.len() as u64 > Stage::auxiliary_limit(name)? {
+                return Err(invalid());
+            }
+            if name != "native-rows.json"
+                && crate::profile_snapshot::bytes(&path.join(name), raw.len() as u64 + 1)? != *raw
+            {
+                return Err(invalid());
+            }
+            metadata.insert(
+                name.clone(),
+                Record {
+                    bytes: raw.len() as u64,
+                    sha256: format!("{:x}", Sha256::digest(raw)),
+                },
+            );
+        }
+        for entry in fs::read_dir(&path)? {
+            let entry = entry?;
+            let name = entry.file_name().into_string().map_err(|_| invalid())?;
+            if !names.contains(&name) && !records.contains_key(&name) && !owned_temporary(&name) {
+                return Err(invalid());
+            }
+            ordinary(&entry.path(), false)?;
+        }
+        let stage = Stage {
+            lease: self,
+            id: id.into(),
+            path: path.clone(),
+            directory_id,
+            journal: Journal {
+                version: 1,
+                home: self.home_id.clone(),
+                phase: Phase::Reconciled,
+                files,
+                records: metadata,
+            },
+        };
+        stage.check()?;
+        let raw = records.get("native-rows.json").ok_or_else(invalid)?;
+        match fs::symlink_metadata(path.join("native-rows.json")) {
+            Ok(_) => {
+                // A crash before publishing the journal may leave this immutable
+                // record. It is reusable only if the validated conversion matches.
+                if crate::profile_snapshot::bytes(&path.join("native-rows.json"), 16 * 1024 * 1024)?
+                    != *raw
+                {
+                    return Err(invalid());
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                publish_new(&path, "native-rows.json", raw)?
+            }
+            Err(e) => return Err(e),
+        }
+        stage.check()?;
+        let raw = serde_json::to_vec(&stage.journal).map_err(|_| invalid())?;
+        if raw.len() > MAX_JOURNAL {
+            return Err(invalid());
+        }
+        publish_new(&path, JOURNAL, &raw)?;
+        Ok(stage)
     }
     pub fn resume<'a>(&'a self, id: &str) -> io::Result<Stage<'a>> {
         self.check()?;
@@ -430,7 +567,7 @@ impl Stage<'_> {
     fn auxiliary_limit(name: &str) -> io::Result<u64> {
         match name {
             "manifest.json" => Ok(1024 * 1024),
-            "native-rows.json" => Ok(16 * 1024 * 1024),
+            "native-rows.json" | "satellite-backup.json" => Ok(16 * 1024 * 1024),
             _ => Err(invalid()),
         }
     }
@@ -685,21 +822,23 @@ impl Stage<'_> {
             if name == JOURNAL {
                 continue;
             }
-            let owned_temp = name.to_str().is_some_and(|s| {
-                s.strip_suffix(".tmp")
-                    .and_then(|s| {
-                        s.strip_prefix("journal-")
-                            .or_else(|| s.strip_prefix("record-"))
-                    })
-                    .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
-            });
+            let owned_temp = name.to_str().is_some_and(owned_temporary);
             if !complete
                 || (!owned_temp
-                    && !matches!(name.to_str(), Some("manifest.json" | "native-rows.json")))
+                    && !matches!(name.to_str(), Some("manifest.json" | "native-rows.json"))
+                    && !name
+                        .to_str()
+                        .is_some_and(|name| self.journal.records.contains_key(name)))
             {
                 return Err(io::ErrorKind::DirectoryNotEmpty.into());
             }
             ordinary(&e.path(), false)?;
+            if let Some(name) = name
+                .to_str()
+                .filter(|name| self.journal.records.contains_key(*name))
+            {
+                self.read_record(name)?;
+            }
         }
         // RowsRestored is durable before any backup is removed. A retry can
         // finish this phase even after a crash between the metadata removals.
