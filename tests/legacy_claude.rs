@@ -590,3 +590,215 @@ fn a_live_or_unprepared_profile_cannot_receive_legacy_chats() {
         .is_err());
     assert!(store.assert_migration_ready().is_ok());
 }
+
+#[test]
+fn external_observer_checkpoint_keeps_original_sequence_without_inventing_native_event_identity() {
+    let (dir, mut store, db) = setup();
+    let mut value = source(dir.path());
+    value["external"] = json!(true);
+    value["remoteSequence"] = json!(98);
+    let raw = raw(&value);
+    store.prepare_legacy_claude(&raw).unwrap();
+    let report = store
+        .prepare_legacy_claude_resume("original-android-chat")
+        .unwrap();
+    assert_eq!(report["sequence"], 98);
+    assert_eq!(report["migrationComplete"], false);
+    let identity = remodex_connect_native::claude_host::Identity {
+        native_session: NATIVE.into(),
+        bridge_session: "cse_legacy_fixture".into(),
+    };
+    let cursor = store
+        .claude_remote_cursor("original-android-chat", identity.clone())
+        .unwrap();
+    assert_eq!(cursor.sequence, 98);
+    assert!(cursor.event_id.is_empty());
+    assert!(cursor.digest.is_empty());
+    assert_eq!(
+        serde_json::to_value(&cursor).unwrap()["legacy_source"],
+        remodex_connect_native::auth::digest(std::str::from_utf8(&raw).unwrap())
+    );
+    drop(store);
+    let mut store = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        store
+            .prepare_legacy_claude_resume("original-android-chat")
+            .unwrap(),
+        report
+    );
+    assert_eq!(
+        store
+            .claude_remote_cursor("original-android-chat", identity)
+            .unwrap(),
+        cursor
+    );
+    store.prepare_legacy_claude(&raw).unwrap();
+    assert_eq!(count(&db, "chat_rows"), 5);
+    assert!(store.assert_migration_ready().is_err());
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    assert_eq!(count(&db, "native_sync"), 0);
+    assert_eq!(
+        db.query_row("SELECT phase FROM legacy_claude_resume", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "rolled-back"
+    );
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    store.rollback_legacy_connection().unwrap();
+}
+#[test]
+fn missing_owned_or_changed_checkpoints_never_skip_unknown_history() {
+    for (external, sequence) in [
+        (false, json!(98)),
+        (true, Value::Null),
+        (true, json!(0)),
+        (true, json!(9_007_199_254_740_992_u64)),
+        (true, json!("98")),
+    ] {
+        let (dir, mut store, db) = setup();
+        let mut value = source(dir.path());
+        value["external"] = json!(external);
+        value["remoteSequence"] = sequence;
+        store.prepare_legacy_claude(&raw(&value)).unwrap();
+        assert!(store
+            .prepare_legacy_claude_resume("original-android-chat")
+            .is_err());
+        assert_eq!(count(&db, "native_sync"), 0);
+        assert_eq!(count(&db, "chat_rows"), 5);
+    }
+    for mutation in [
+        "UPDATE native_sync SET cursor=json_set(cursor,'$.sequence',99)",
+        "UPDATE legacy_claude_resume SET source_hash='changed'",
+        "UPDATE legacy_claude_resume SET cursor='{}'",
+    ] {
+        let (dir, mut store, db) = setup();
+        let mut value = source(dir.path());
+        value["external"] = json!(true);
+        store.prepare_legacy_claude(&raw(&value)).unwrap();
+        store
+            .prepare_legacy_claude_resume("original-android-chat")
+            .unwrap();
+        db.execute_batch(mutation).unwrap();
+        assert!(store
+            .prepare_legacy_claude_resume("original-android-chat")
+            .is_err());
+        assert!(store
+            .rollback_legacy_claude("original-android-chat")
+            .is_err());
+        assert_eq!(count(&db, "chats"), 1);
+    }
+}
+#[tokio::test]
+async fn first_native_event_after_upgrade_advances_anchor_and_preserves_old_prompt_bubbles() {
+    use remodex_connect_native::{
+        auth::Auth, auth_service::AuthService, claude_host::Identity, claude_remote::Envelope,
+    };
+    let (dir, mut store, db) = setup();
+    let mut value = source(dir.path());
+    value["external"] = json!(true);
+    store.prepare_legacy_claude(&raw(&value)).unwrap();
+    store
+        .prepare_legacy_claude_resume("original-android-chat")
+        .unwrap();
+    let identity = Identity {
+        native_session: NATIVE.into(),
+        bridge_session: "cse_legacy_fixture".into(),
+    };
+    let before = store
+        .claude_remote_cursor("original-android-chat", identity.clone())
+        .unwrap();
+    let initial = store.load_chat("original-android-chat").unwrap();
+    let old = initial["thread"]["messages"].clone();
+    let service = AuthService::new(Auth::new(store)).unwrap();
+    let native = "00000000-0000-4000-8000-000000000019";
+    let mut cursor = before.clone();
+    let mut current = initial;
+    for (sequence, source, payload) in [
+        (
+            99,
+            "client",
+            json!({"type":"user","uuid":native,"session_id":NATIVE,"message":{"role":"user","content":"New Desktop prompt"},"client_platform":"desktop"}),
+        ),
+        (
+            100,
+            "worker",
+            json!({"type":"assistant","uuid":"00000000-0000-4000-8000-000000000020","session_id":NATIVE,"user_message_uuids":[native],"message":{"id":"new-native-reply","role":"assistant","content":[{"type":"text","text":"New reply"}]}}),
+        ),
+        (
+            101,
+            "worker",
+            json!({"type":"result","session_id":NATIVE,"user_message_uuids":[native],"subtype":"success","result":"New reply"}),
+        ),
+    ] {
+        let mut event = Envelope {
+            deliveries: vec![],
+            receipt_checkpoint: false,
+            recovery: None,
+            sequence: Some(sequence),
+            event_id: Some(format!("native-{sequence}")),
+            created_at: Some("2026-01-01T12:00:01.000Z".into()),
+            source: source.into(),
+            payload: Some(payload),
+        };
+        event.sequence = Some(98);
+        assert!(before.advance(&event, Value::Null).is_err());
+        event.sequence = Some(sequence);
+        let (state, projection) = remodex_connect_native::claude_history::project(
+            &service, current, &cursor, &event, true,
+        )
+        .await
+        .unwrap();
+        let after = cursor.advance(&event, projection).unwrap();
+        assert!(serde_json::to_value(&after)
+            .unwrap()
+            .get("legacy_source")
+            .is_none());
+        let saved = state.clone();
+        let start = cursor.clone();
+        let finish = after.clone();
+        service
+            .call(move |a| a.store.save_claude_remote(&saved, &start, &finish))
+            .await
+            .unwrap()
+            .unwrap();
+        current = state;
+        cursor = after;
+    }
+    assert_eq!(cursor.sequence, 101);
+    assert_eq!(cursor.event_id, "native-101");
+    assert_eq!(cursor.digest.len(), 64);
+    let final_state = service
+        .call(|a| a.store.load_chat("original-android-chat"))
+        .await
+        .unwrap()
+        .unwrap();
+    let messages = final_state["thread"]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4);
+    for original in old.as_array().unwrap() {
+        assert_eq!(
+            messages.iter().find(|m| m["id"] == original["id"]).unwrap(),
+            original
+        );
+    }
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m["text"] == "New Desktop prompt")
+            .count(),
+        1
+    );
+    assert_eq!(
+        messages.iter().filter(|m| m["text"] == "New reply").count(),
+        1
+    );
+    assert!(service
+        .call(|a| a.store.rollback_legacy_claude("original-android-chat"))
+        .await
+        .unwrap()
+        .is_err());
+    assert_eq!(count(&db, "chats"), 1);
+}

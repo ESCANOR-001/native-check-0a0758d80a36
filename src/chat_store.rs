@@ -419,7 +419,8 @@ impl Store {
                 || (after.sequence == before.sequence
                     && (batch.receipt.is_none()
                         || after.event_id != before.event_id
-                        || after.digest != before.digest))
+                        || after.digest != before.digest
+                        || after.legacy_source != before.legacy_source))
                 || state["native_id"] != after.identity.native_session
                 || state["remote_identity"] != serde_json::to_value(&after.identity).unwrap()
             {

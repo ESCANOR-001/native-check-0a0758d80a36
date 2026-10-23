@@ -12,6 +12,10 @@ pub struct Cursor {
     pub sequence: u64,
     pub event_id: String,
     pub digest: String,
+    /// A checkpoint committed by the previous bridge, before native event
+    /// hashes were recorded. Never presented as a native event digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) legacy_source: Option<String>,
     /// Bounded projection state (turn identities, not transcript content).
     pub projection: Value,
 }
@@ -23,8 +27,20 @@ impl Cursor {
             sequence: 0,
             event_id: String::new(),
             digest: String::new(),
+            legacy_source: None,
             projection: Value::Null,
         })
+    }
+    pub(crate) fn legacy(
+        identity: Identity,
+        sequence: u64,
+        source: String,
+    ) -> Result<Self, String> {
+        let mut value = Self::new(identity)?;
+        value.sequence = sequence;
+        value.legacy_source = Some(source);
+        value.validate()?;
+        Ok(value)
     }
     pub fn advance(&self, event: &Envelope, projection: Value) -> Result<Self, String> {
         self.validate()?;
@@ -51,6 +67,7 @@ impl Cursor {
             sequence,
             event_id: event_id.into(),
             digest,
+            legacy_source: None,
             projection,
         };
         next.validate()?;
@@ -58,9 +75,27 @@ impl Cursor {
     }
     pub fn validate(&self) -> Result<(), String> {
         self.identity.validate()?;
+        let legacy = match &self.legacy_source {
+            None => false,
+            Some(hash) => {
+                if self.sequence == 0
+                    || self.sequence > 9_007_199_254_740_991
+                    || hash.len() != 64
+                    || !hash
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    || !self.event_id.is_empty()
+                    || !self.digest.is_empty()
+                {
+                    return Err("Invalid imported Claude checkpoint".into());
+                }
+                true
+            }
+        };
         if self.sequence > i64::MAX as u64
             || (self.sequence == 0 && (!self.event_id.is_empty() || !self.digest.is_empty()))
-            || (self.sequence > 0
+            || (!legacy
+                && self.sequence > 0
                 && (self.event_id.is_empty()
                     || self.event_id.len() > 256
                     || self.digest.len() != 64
@@ -100,6 +135,33 @@ mod tests {
             source: "worker".into(),
             payload: Some(json!({"type":"assistant"})),
         }
+    }
+    #[test]
+    fn legacy_anchor_is_distinct_from_native_evidence_and_is_retired_on_first_new_event() {
+        let cursor = Cursor::legacy(identity(), 6, "a".repeat(64)).unwrap();
+        let mut event = event();
+        event.sequence = Some(6);
+        assert!(cursor.advance(&event, Value::Null).is_err());
+        event.sequence = Some(7);
+        let next = cursor.advance(&event, Value::Null).unwrap();
+        assert!(next.legacy_source.is_none());
+        assert_eq!(next.event_id, "event-7");
+        assert_eq!(next.digest.len(), 64);
+        let encoded = serde_json::to_value(&next).unwrap();
+        assert!(encoded.get("legacy_source").is_none());
+        assert_eq!(serde_json::from_value::<Cursor>(encoded).unwrap(), next);
+        for (sequence, hash) in [
+            (0, "a".repeat(64)),
+            (6, "invalid".into()),
+            (6, "z".repeat(64)),
+            (9_007_199_254_740_992, "a".repeat(64)),
+        ] {
+            assert!(Cursor::legacy(identity(), sequence, hash).is_err());
+        }
+        let mut mixed = cursor;
+        mixed.event_id = "native-event".into();
+        mixed.digest = "b".repeat(64);
+        assert!(mixed.validate().is_err());
     }
     #[test]
     fn projection_and_cursor_are_atomic_and_reject_stale_or_wrong_session_commits() {

@@ -69,8 +69,8 @@ fn ordered(state: &Value) -> Result<Vec<(&str, &Value)>, String> {
         .collect())
 }
 pub(crate) struct Prepared {
-    source: Vec<u8>,
-    hash: String,
+    pub(crate) source: Vec<u8>,
+    pub(crate) hash: String,
     pub(crate) state: Value,
     commands: Vec<String>,
     checkpoints: Vec<(String, String)>,
@@ -396,6 +396,7 @@ impl Store {
         if phase == "prepared" {
             verify(&tx, &p, &self.directory)?;
             crate::legacy_claude_assets::rollback(&tx, id)?;
+            crate::legacy_claude_resume::rollback(&tx, id)?;
             for table in ["chat_rows", "native_checkpoints", "tool_images"] {
                 tx.execute(&format!("DELETE FROM {table} WHERE chat=?1"), [id])
                     .map_err(|_| INVALID)?;
@@ -436,7 +437,8 @@ impl Store {
     }
 }
 fn verify_inactive(db: &rusqlite::Connection, id: &str) -> Result<(), String> {
-    for table in ["native_turns", "native_sync", "claude_outbox"] {
+    crate::legacy_claude_resume::verify(db, id)?;
+    for table in ["native_turns", "claude_outbox"] {
         let present: bool = db
             .query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE chat=?1)"),
