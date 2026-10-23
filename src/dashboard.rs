@@ -199,6 +199,7 @@ pub(crate) fn routes(app: App) -> Router<App> {
         .route("/api/storage/cleanup/preview", post(storage_preview))
         .route("/api/storage/trash", get(storage_trash))
         .route("/api/system/memory", get(memory))
+        .route("/api/diagnostics/desktop-log", get(diagnostics))
         .route("/api/stop", post(stop))
         .route("/api/android-remote", get(status))
         .route(
@@ -210,6 +211,19 @@ pub(crate) fn routes(app: App) -> Router<App> {
         .route("/api/android-remote/clients/{id}", delete(revoke))
         .route_layer(axum::middleware::from_fn_with_state(app, guard))
         .route("/opencodex-session", get(bootstrap))
+}
+async fn diagnostics(State(app): State<App>) -> Response {
+    let stopping = *app.stopping.borrow();
+    let Some(log) = app.diagnostics else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Native diagnostics are unavailable",
+        );
+    };
+    match log.report(stopping).await {
+        Ok(report) => response(StatusCode::OK, report),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, e),
+    }
 }
 async fn stop(State(app): State<App>, headers: HeaderMap) -> Response {
     if let Some(raw) = headers.get("x-opencodex-expected-pid") {

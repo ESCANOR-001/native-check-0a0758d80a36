@@ -94,6 +94,75 @@ async fn session(router: Router) -> (String, String) {
 }
 
 #[tokio::test]
+async fn diagnostics_requires_dashboard_authority_and_excludes_request_content() {
+    let mut f = setup();
+    let log = remodex_connect_native::diagnostics::Log::new(&f._root.path().join("state")).unwrap();
+    log.lifecycle(remodex_connect_native::diagnostics::Lifecycle::Ready);
+    log.flush().await;
+    f.app.diagnostics = Some(log.clone());
+    let router = f.app.router();
+    let path = "/api/diagnostics/desktop-log";
+    assert_eq!(
+        call(router.clone(), "GET", path, &[], Value::Null).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            router.clone(),
+            "GET",
+            path,
+            &[("authorization", &format!("Bearer {}", f.phone))],
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (token, csrf) = session(router.clone()).await;
+    let headers = [
+        ("x-opencodex-api-key", token.as_str()),
+        ("x-opencodex-gui-origin", "http://localhost:18900"),
+        ("origin", "http://localhost:18900"),
+        ("x-opencodex-csrf-token", csrf.as_str()),
+    ];
+    let (code, body) = call(
+        router.clone(),
+        "GET",
+        "/api/diagnostics/desktop-log?token=PRIVATE_QUERY",
+        &headers,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["reportVersion"], 1);
+    assert!(value["log"].as_str().unwrap().contains("runtime.ready"));
+    log.flush().await;
+    let report = log.report(false).await.unwrap().to_string();
+    let private_path = f._root.path().to_string_lossy().into_owned();
+    for private in [
+        token.as_str(),
+        f.phone.as_str(),
+        private_path.as_str(),
+        "PRIVATE_QUERY",
+    ] {
+        assert!(!report.contains(private));
+    }
+    assert_eq!(
+        call(
+            router,
+            "POST",
+            path,
+            &headers,
+            json!({"prompt":"PRIVATE_BODY"})
+        )
+        .await
+        .0,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+}
+
+#[tokio::test]
 async fn process_memory_requires_dashboard_session_and_reports_only_native_counters() {
     let f = setup();
     let router = f.app.router();

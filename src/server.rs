@@ -31,6 +31,7 @@ pub struct App {
     pub label: String,
     pub chats: Option<Chats>,
     pub dashboard: Option<crate::dashboard::Dashboard>,
+    pub diagnostics: Option<crate::diagnostics::Log>,
     pub(crate) metrics: crate::runtime_metrics::Metrics,
     pub(crate) online: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     pub stopping: tokio::sync::watch::Sender<bool>,
@@ -49,6 +50,7 @@ impl App {
             label: label.to_owned(),
             chats: None,
             dashboard: None,
+            diagnostics: None,
             metrics: Default::default(),
             online: Arc::default(),
             stopping: tokio::sync::watch::channel(false).0,
@@ -62,6 +64,7 @@ impl App {
     }
     pub fn router(self) -> Router {
         let dashboard = crate::dashboard::routes(self.clone());
+        let diagnostics = self.diagnostics.clone();
         Router::new()
             .route("/.well-known/t3/environment", get(environment))
             .route("/oauth/token", post(exchange))
@@ -85,25 +88,31 @@ impl App {
             .merge(dashboard)
             .fallback(crate::dashboard::static_file)
             .layer(axum::middleware::from_fn(
-                |request: Request, next: axum::middleware::Next| async move {
-                    let path = request.uri().path().to_owned();
-                    let response = next.run(request).await;
-                    if std::env::var_os("NATIVE_TRACE_HTTP").is_some() {
-                        eprintln!(
-                            "http {} {}",
-                            response.status().as_u16(),
-                            if path.starts_with("/api/android-remote/assets/") {
-                                if path.ends_with("/thumbnail") {
-                                    "/api/android-remote/assets/[capability]/thumbnail"
+                move |request: Request, next: axum::middleware::Next| {
+                    let diagnostics = diagnostics.clone();
+                    async move {
+                        let path = request.uri().path().to_owned();
+                        let response = next.run(request).await;
+                        if let Some(log) = diagnostics {
+                            log.request(&path, response.status().as_u16());
+                        }
+                        if std::env::var_os("NATIVE_TRACE_HTTP").is_some() {
+                            eprintln!(
+                                "http {} {}",
+                                response.status().as_u16(),
+                                if path.starts_with("/api/android-remote/assets/") {
+                                    if path.ends_with("/thumbnail") {
+                                        "/api/android-remote/assets/[capability]/thumbnail"
+                                    } else {
+                                        "/api/android-remote/assets/[capability]/image"
+                                    }
                                 } else {
-                                    "/api/android-remote/assets/[capability]/image"
+                                    &path
                                 }
-                            } else {
-                                &path
-                            }
-                        );
+                            );
+                        }
+                        response
                     }
-                    response
                 },
             ))
             .layer(DefaultBodyLimit::max(64 * 1024))

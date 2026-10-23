@@ -370,5 +370,10 @@ async fn dashboard_stop_closes_sockets_and_restart_keeps_phone_credentials() {
             .unwrap()
             .success());
         assert!(!invitation.exists());
+        let diagnostics = std::fs::read_to_string(state.join("service.log")).unwrap();
+        assert!(diagnostics.contains("runtime.ready"));
+        assert!(diagnostics.contains("runtime.stopping"));
+        assert!(diagnostics.contains("runtime.stopped"));
+        assert!(!diagnostics.contains(phone.as_ref().unwrap()));
     }
 }

@@ -39,6 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let mut app = App::new(auth, "Rust native foundation")?;
+    let diagnostics = remodex_connect_native::diagnostics::Log::new(&directory)?;
+    app.diagnostics = Some(diagnostics.clone());
     if let Some(path) = args.get(4) {
         let config: Config = serde_json::from_slice(&std::fs::read(path)?)?;
         app.chats = Some(Chats::start(app.auth.clone(), config).await?);
@@ -57,6 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_chats = chats.clone();
     let shutdown_signal = app.stopping.clone();
     let mut requested_stop = shutdown_signal.subscribe();
+    let shutdown_log = diagnostics.clone();
+    diagnostics.lifecycle(remodex_connect_native::diagnostics::Lifecycle::Ready);
     println!(
         "{}",
         serde_json::json!({"ready":true,"address":listener.local_addr()?.to_string(),
@@ -72,6 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = stopping => {},
             _ = requested_stop.wait_for(|requested| *requested) => {},
         }
+        shutdown_log.lifecycle(remodex_connect_native::diagnostics::Lifecycle::Stopping);
         shutdown_signal.send_replace(true);
         if let Some(chats) = shutdown_chats {
             let _ = chats
@@ -96,6 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await;
     }
+    diagnostics.lifecycle(remodex_connect_native::diagnostics::Lifecycle::Stopped);
+    diagnostics.flush().await;
     served?;
     Ok(())
 }
