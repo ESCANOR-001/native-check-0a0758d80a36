@@ -1143,6 +1143,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_follows_changed_local_link_without_replaying_a_paused_queue() {
+        let mut f = Fixture::start().await;
+        let before = f.thread().await;
+        let folder = f.config.claude.profile.join("projects").join("fixture");
+        std::fs::create_dir_all(&folder).unwrap();
+        let binding = json!({"type":"bridge-session","sessionId":NATIVE,
+            "bridgeSessionId":"cse_updated_fixture", "cwd":before["worktreePath"]});
+        std::fs::write(
+            folder.join(format!("{NATIVE}.jsonl")),
+            format!("{binding}\n"),
+        )
+        .unwrap();
+        f.edit_and_restart(|chat| {
+            chat["paused"] = json!(true);
+            chat["queue"] = json!([prompt("keep-paused", "do-not-send", opus("high"), "queue")]);
+        })
+        .await;
+        let saved =
+            f.db.call(|a| a.store.load_chat(CHAT))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            saved["remote_identity"]["bridge_session"],
+            "cse_updated_fixture"
+        );
+        assert_eq!(saved["native_id"], NATIVE);
+        assert_eq!(saved["paused"], true);
+        assert_eq!(saved["queue"].as_array().unwrap().len(), 1);
+        assert!(
+            f.log().is_empty(),
+            "relink sent a prompt or mutating control"
+        );
+        let thread = f.thread().await;
+        let rows: Vec<_> = thread["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["phase"] != "queued")
+            .cloned()
+            .collect();
+        assert_eq!(json!(rows), before["messages"]);
+        assert_eq!(thread["messages"][0]["queueStatus"], "paused");
+        // The same link reopens at its saved cursor, not a second new epoch.
+        f.restart().await;
+        assert!(f.log().is_empty());
+        f.stop().await;
+    }
+    #[tokio::test]
     async fn retry_original_shared_link_joins_the_handshake_and_never_sends_a_prompt_or_control() {
         let mut f = Fixture::start().await;
         let params = json!({"threadId":CHAT,"mode":"retry","commandId":"retry-link"});

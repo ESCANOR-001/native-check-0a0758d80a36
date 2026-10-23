@@ -260,7 +260,11 @@ impl Observer {
                         }
                     }
                     let receipt = crate::claude_host::Ledger::default().observe(frame)?;
-                    self.owner_stopped = receipt.owner_stopped;
+                    // Catch-up can contain a prior worker's shutdown. A fresh
+                    // initialize response plus init is still required before
+                    // readiness. Only a shutdown after that handshake belongs
+                    // to the connection we have actually verified.
+                    self.owner_stopped = receipt.owner_stopped && self.verified_at.is_some();
                     self.pending_receipt = Some(receipt);
                     if frame["type"] == "control_response"
                         && frame["response"]["request_id"] == self.init_request
@@ -284,7 +288,7 @@ impl Observer {
                         let cwd = frame["cwd"]
                             .as_str()
                             .ok_or("Claude did not confirm its project metadata")?;
-                        if cwd.is_empty() {
+                        if cwd.is_empty() || self.link_source.is_some() {
                             // Remote Control redacts cwd in some CLI versions.
                             // Revalidate the owner's local binding after the fresh
                             // worker handshake; never guess from a chat title.
@@ -306,7 +310,8 @@ impl Observer {
                                         .into(),
                                 );
                             }
-                        } else {
+                        }
+                        if !cwd.is_empty() {
                             let path = PathBuf::from(cwd);
                             if cwd.len() > 16384
                                 || !path.is_absolute()
@@ -625,7 +630,7 @@ mod tests {
             .emit(
                 1,
                 "worker",
-                json!({"type":"system","subtype":"init","cwd":dir.path()}),
+                json!({"type":"system","subtype":"worker_shutting_down"}),
             )
             .await;
         let app = Router::new()
@@ -726,6 +731,22 @@ mod tests {
             .iter()
             .all(|v| v["events"][0]["payload"]["request"]["subtype"] == "initialize"));
         assert!(observer.remote.forget_read("mutation-1").is_err());
+        // A shutdown in old catch-up did not block the fresh handshake, but
+        // an actual shutdown after readiness must immediately revoke control.
+        server
+            .emit(
+                observer.cursor.sequence + 1,
+                "worker",
+                json!({"type":"system","subtype":"worker_shutting_down"}),
+            )
+            .await;
+        assert!(!pump(&mut observer, &db, &chat, &mut projection).await);
+        assert!(!observer.ready());
+        assert!(observer
+            .next()
+            .await
+            .unwrap_err()
+            .contains("worker stopped"));
         serving.abort();
     }
 
@@ -787,6 +808,26 @@ mod tests {
             .await
             .unwrap();
         for seq in 1..=4 {
+            if seq == 4 {
+                let profile = dir.path().join("profile");
+                let transcripts = profile.join("projects").join("fixture");
+                std::fs::create_dir_all(&transcripts).unwrap();
+                let path = transcripts.join(format!("{}.jsonl", identity.native_session));
+                let mut row = json!({"type":"bridge-session","sessionId":identity.native_session,
+                    "bridgeSessionId":"cse_changed_during_handshake","cwd":dir.path()});
+                std::fs::write(&path, format!("{row}\n")).unwrap();
+                observer.link_source = Some((profile, dir.path().into()));
+                assert!(observer
+                    .next()
+                    .await
+                    .unwrap_err()
+                    .contains("binding changed"));
+                assert!(!observer.ready());
+                // The already received frame survives cancellation/validation
+                // failure; readiness still requires the original binding.
+                row["bridgeSessionId"] = json!(identity.bridge_session);
+                std::fs::write(&path, format!("{row}\n")).unwrap();
+            }
             let e = observer.next().await.unwrap();
             assert_eq!(e.sequence, Some(seq));
             assert!(!observer.ready());

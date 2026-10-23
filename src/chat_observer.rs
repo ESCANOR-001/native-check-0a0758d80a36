@@ -176,11 +176,38 @@ impl Hub {
         }
         let identity = chat.remote_identity.clone().unwrap();
         let key = id.to_owned();
-        let cursor = self
+        let mut cursor = self
             .db
             .call(move |a| a.store.claude_remote_cursor(&key, identity))
             .await?
             .map_err(|_| "Saved Claude cursor is unavailable")?;
+        let profile = self.config.claude.profile.clone();
+        let workspace = self.config.workspace.clone();
+        let native = chat.native_id.clone();
+        // Only a complete local bridge-session record for this native session
+        // may change the link. If unavailable, the observer retains its normal
+        // fail-closed read/handshake path (including revoked links).
+        if let Ok(Ok(link)) = tokio::task::spawn_blocking(move || {
+            crate::claude_link::read(&profile, &workspace, &native)
+        })
+        .await
+        {
+            if link.identity != cursor.identity {
+                let key = id.to_owned();
+                let before = cursor.clone();
+                let (state, next) = self
+                    .db
+                    .call(move |a| a.store.rebind_claude_link(&key, &before, &link))
+                    .await??;
+                self.chats.insert(
+                    id.into(),
+                    serde_json::from_value(state).map_err(|_| "Invalid recovered Claude chat")?,
+                );
+                cursor = next;
+                self.dirty = true;
+            }
+        }
+        let chat = &self.chats[id];
         let (_, requests) = crate::claude_history::control_state(&cursor.projection)?;
         let connection = Connection::observe_claude(
             self.config.claude.profile.clone(),
@@ -396,6 +423,11 @@ impl Hub {
                 self.claude_recovery.connected(id, Instant::now());
                 let chat = self.chats.get_mut(id).unwrap();
                 chat.thread["session"]["statusConfidence"] = json!("confirmed");
+                if chat.thread["session"]["lastError"]
+                    == "Reconnecting to Claude's updated link; saved history is retained"
+                {
+                    chat.thread["session"]["lastError"] = Value::Null;
+                }
                 projection::activity(
                     chat,
                     "claude-native-sync",

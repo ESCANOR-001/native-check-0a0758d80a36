@@ -33,6 +33,9 @@ struct State {
     /// Worker process verified at the last committed owner checkpoint.
     #[serde(default)]
     owner_pid: Option<u64>,
+    /// Finished transcript rows predating a relay change stay immutable on replay.
+    #[serde(default)]
+    relink_before: Option<i64>,
 }
 pub(crate) const OWNER_RESTARTED: &str = "The original Claude session restarted before this task finished. Its saved output is kept; nothing was resent.";
 
@@ -237,6 +240,28 @@ pub fn control_state(projection: &Value) -> Result<(Router, HashMap<String, Valu
             .map(|v| (s(&v["publicId"]).to_owned(), v))
             .collect(),
     ))
+}
+
+pub(crate) fn relink_projection(projection: &Value, before: i64) -> Result<Value, String> {
+    let mut state: State = if projection.is_null() {
+        State::default()
+    } else {
+        serde_json::from_value(projection.clone()).map_err(|_| "Invalid saved Claude projection")?
+    };
+    if state.router.active().is_some()
+        || state.router.pending().next().is_some()
+        || state.router.background().busy()
+        || !state.requests.is_empty()
+        || !state.processed_steers.is_empty()
+        || !state.processed_inputs.is_empty()
+        || state.historical_result.is_some()
+    {
+        return Err("Claude has unresolved work on its original link; nothing was replayed".into());
+    }
+    state.stream_id.clear();
+    state.stream_model.clear();
+    state.relink_before = Some(before);
+    serde_json::to_value(state).map_err(|_| "Cannot retain Claude's saved projection".into())
 }
 
 pub async fn project(
@@ -545,6 +570,34 @@ pub async fn project(
             .as_str()
             .filter(|s| !s.is_empty() && s.len() <= 256)
             .ok_or("Claude permission request has no identity")?;
+        if catchup {
+            if let Some(before) = reduced.relink_before {
+                let cid = id.clone();
+                let request = native.to_owned();
+                let turn = reduced
+                    .history_turn
+                    .as_deref()
+                    .unwrap_or(s(&chat.thread["latestTurn"]["turnId"]))
+                    .to_owned();
+                let tool = value["request"]["tool_use_id"].clone();
+                if db
+                    .call(move |a| {
+                        a.store
+                            .claude_relink_request(&cid, before, &request, &turn, &tool)
+                    })
+                    .await?
+                    .map_err(|_| "Claude approval history is unavailable")?
+                    .is_some()
+                {
+                    // A relay replay cannot resurrect a previously resolved
+                    // permission, even if the old response is omitted.
+                    return Ok((
+                        serde_json::to_value(chat).unwrap(),
+                        serde_json::to_value(reduced).unwrap(),
+                    ));
+                }
+            }
+        }
         if reduced.requests.len() >= 16 && !reduced.requests.contains_key(native) {
             return Err("Too many pending Claude requests; reconnect to reconcile them".into());
         }
@@ -707,6 +760,35 @@ pub async fn project(
         json!(reduced.requests.values().any(crate::questions::is_input));
     reduced.stream_id = chat.stream_id.clone();
     reduced.stream_model = chat.stream_model.clone();
+    if catchup {
+        if let Some(before) = reduced.relink_before {
+            let keys: Vec<_> = ["messages", "activities", "proposedPlans"]
+                .into_iter()
+                .flat_map(|kind| {
+                    chat.thread[kind]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(move |r| (kind, s(&r["id"]).to_owned()))
+                })
+                .collect();
+            let cid = id.clone();
+            let old = db
+                .call(move |a| a.store.claude_relink_rows(&cid, before, &keys))
+                .await?
+                .map_err(|_| "Claude replay history is unavailable")?;
+            for (kind, saved) in old {
+                if let Some(row) = chat.thread[kind]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|r| r["id"] == saved["id"])
+                {
+                    *row = saved;
+                }
+            }
+        }
+    }
     let reduced = serde_json::to_value(reduced).unwrap();
     if reduced.to_string().len() > 128 * 1024
         || ["messages", "activities", "proposedPlans"].iter().any(|k| {
@@ -1392,6 +1474,105 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cursor, reloaded);
+    }
+    #[tokio::test]
+    async fn relink_replay_preserves_old_rows_and_accepts_new_remote_input_once() {
+        let (dir, db, mut cursor, native) = setup().await;
+        let input = uuid::Uuid::new_v4().to_string();
+        let frames = [
+            json!({"type":"user","session_id":native,"uuid":input,"message":{"role":"user","content":"Old prompt"}}),
+            json!({"type":"assistant","session_id":native,"user_message_uuid":input,"message":{"id":"old-answer","content":[{"type":"text","text":"Old answer"},{"type":"tool_use","id":"old-tool","name":"Read","input":{"file_path":"README.md"}}]}}),
+            json!({"type":"control_request","request_id":"old-approval","request":{"subtype":"can_use_tool","tool_name":"Read","tool_use_id":"old-tool","input":{"file_path":"README.md"}}}),
+            json!({"type":"control_response","response":{"request_id":"old-approval","subtype":"success"}}),
+            json!({"type":"user","session_id":native,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"old-tool","content":"Private output"}]}}),
+            json!({"type":"result","session_id":native,"user_message_uuid":input,"is_error":false}),
+        ];
+        for (i, frame) in frames.iter().enumerate() {
+            step_at(
+                &db,
+                &mut cursor,
+                i as u64 + 1,
+                frame.clone(),
+                "2026-10-21T01:00:00Z",
+            )
+            .await;
+        }
+        let cwd = dir.path().canonicalize().unwrap();
+        db.call(move |a| {
+            let mut chat = a.store.load_chat("history-chat").unwrap();
+            chat["external_claude"] = json!(true);
+            chat["thread"]["worktreePath"] = json!(cwd);
+            a.store.save_chat(&chat, None).unwrap();
+        })
+        .await
+        .unwrap();
+        let before = db
+            .call(|a| a.store.load_chat("history-chat"))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut link = crate::claude_link::Link {
+            identity: cursor.identity.clone(),
+            cwd: dir.path().canonicalize().unwrap(),
+            title: String::new(),
+            internal_inputs: vec![],
+        };
+        link.identity.bridge_session = "cse_history_replaced".into();
+        let saved = cursor.clone();
+        cursor = db
+            .call(move |a| a.store.rebind_claude_link("history-chat", &saved, &link))
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        for (i, frame) in frames.iter().enumerate() {
+            step(&db, &mut cursor, i as u64 + 1, frame.clone()).await;
+        }
+        let after = db
+            .call(|a| a.store.load_chat("history-chat"))
+            .await
+            .unwrap()
+            .unwrap();
+        for kind in ["messages", "activities"] {
+            assert_eq!(
+                before["thread"][kind], after["thread"][kind],
+                "replayed {kind} changed"
+            );
+        }
+        let new = uuid::Uuid::new_v4().to_string();
+        let frame = json!({"type":"user","uuid":new,"session_id":native,"message":{"role":"user","content":"New remote prompt"}});
+        step(&db, &mut cursor, 7, frames[2].clone()).await;
+        assert!(
+            control_state(&cursor.projection).unwrap().1.is_empty(),
+            "old approval was resurrected"
+        );
+        step(&db, &mut cursor, 8, frame.clone()).await;
+        step(&db, &mut cursor, 9, frame).await;
+        step(&db, &mut cursor, 10, json!({"type":"assistant","user_message_uuid":new,"message":{"id":"new-answer","content":[{"type":"text","text":"New work"}]}})).await;
+        step(&db, &mut cursor, 11, frames[2].clone()).await;
+        assert_eq!(
+            control_state(&cursor.projection).unwrap().1.len(),
+            1,
+            "a new turn's request ID reuse was hidden"
+        );
+        let after = db
+            .call(|a| a.store.load_chat("history-chat"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after["thread"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["id"] == new)
+                .count(),
+            1
+        );
+        assert_eq!(
+            after["thread"]["messages"][0],
+            before["thread"]["messages"][0]
+        );
     }
     #[tokio::test]
     async fn historical_turn_keeps_native_times_across_reopen() {
