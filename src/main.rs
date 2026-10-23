@@ -62,7 +62,10 @@ async fn serve(
     let listener = tokio::net::TcpListener::bind(&args[2]).await?;
     let store = Store::open(&directory)?;
     let mut auth = Auth::new(store);
-    let invite = if auth.control_enabled()? && auth.local_network_enabled()? {
+    let invite = if auth.control_enabled()?
+        && auth.local_network_enabled()?
+        && !auth.quick_tunnel_enabled()?
+    {
         Some(auth.invite("Rust native foundation", &args[3], auth::now())?)
     } else {
         None
@@ -85,6 +88,21 @@ async fn serve(
             &args[3],
         )?);
     }
+    // Explicit candidate-only helper selection. Normal service configuration,
+    // credentials, and existing cloudflared processes are never changed.
+    let tunnel_origin = if let Some(executable) = std::env::var_os("REMODEX_NATIVE_CLOUDFLARED") {
+        Some(
+            remodex_connect_native::tunnel::Origin::start(
+                &mut app,
+                PathBuf::from(executable),
+                &directory,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let shutdown_tunnel = app.tunnel.clone();
     let invitation = invite
         .as_ref()
         .map(|v| InvitationFile::create(&directory, v))
@@ -125,6 +143,9 @@ async fn serve(
         }
         shutdown_log.lifecycle(remodex_connect_native::diagnostics::Lifecycle::Stopping);
         shutdown_signal.send_replace(true);
+        if let Some(tunnel) = shutdown_tunnel {
+            tunnel.shutdown().await;
+        }
         shutdown_storage.drain_storage_policy().await;
         if let Some(chats) = shutdown_chats {
             let _ = chats
@@ -148,6 +169,9 @@ async fn serve(
                 .unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Bridge cleanup did not finish; restart was cancelled")))
         }
     };
+    if let Some(origin) = tunnel_origin {
+        origin.shutdown().await?;
+    }
     drop(invitation);
     if let Some(chats) = chats {
         let _ = tokio::time::timeout(

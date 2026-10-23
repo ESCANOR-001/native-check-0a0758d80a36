@@ -34,6 +34,7 @@ pub struct App {
     pub diagnostics: Option<crate::diagnostics::Log>,
     /// Present only after an inherited native supervisor pipe is verified.
     pub restart: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub tunnel: Option<crate::tunnel::Manager>,
     pub(crate) network: crate::network_access::Access,
     pub(crate) metrics: crate::runtime_metrics::Metrics,
     pub(crate) online: Arc<std::sync::Mutex<HashMap<String, usize>>>,
@@ -74,6 +75,7 @@ impl App {
             dashboard: None,
             diagnostics: None,
             restart: None,
+            tunnel: None,
             metrics: Default::default(),
             online: Arc::default(),
             stopping: tokio::sync::watch::channel(false).0,
@@ -86,9 +88,22 @@ impl App {
         })
     }
     pub fn router(self) -> Router {
-        let dashboard = crate::dashboard::routes(self.clone());
+        self.routes(true)
+    }
+    /// Dedicated tunnel origin: deliberately contains no browser bootstrap,
+    /// dashboard administration or static assets, even for loopback clients.
+    /// A local proxy must never inherit the PC administrator's socket authority.
+    pub fn phone_router(self) -> Router {
+        self.routes(false)
+    }
+    fn routes(self, administration: bool) -> Router {
+        let dashboard = if administration {
+            crate::dashboard::routes(self.clone())
+        } else {
+            Router::new()
+        };
         let diagnostics = self.diagnostics.clone();
-        Router::new()
+        let routes = Router::new()
             .route("/.well-known/t3/environment", get(environment))
             .route("/oauth/token", post(exchange))
             .route("/api/auth/session", get(session))
@@ -108,8 +123,13 @@ impl App {
                 phone_control_guard,
             ))
             .route("/healthz", get(health))
-            .merge(dashboard)
-            .fallback(crate::dashboard::static_file)
+            .merge(dashboard);
+        let routes = if administration {
+            routes.fallback(crate::dashboard::static_file)
+        } else {
+            routes.fallback(|| async { failure(StatusCode::NOT_FOUND, "Route not found") })
+        };
+        routes
             .layer(axum::middleware::from_fn(
                 move |request: Request, next: axum::middleware::Next| {
                     let diagnostics = diagnostics.clone();

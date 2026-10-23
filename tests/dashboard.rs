@@ -171,6 +171,260 @@ async fn diagnostics_requires_dashboard_authority_and_excludes_request_content()
 }
 
 #[tokio::test]
+async fn tunnel_origin_never_exposes_admin_even_with_loopback_and_real_dashboard_credentials() {
+    use axum::serve::ListenerExt as _;
+    let f = setup();
+    let local = f.app.clone().router();
+    let (token, csrf) = session(local.clone()).await;
+    let headers = [
+        ("x-opencodex-api-key", token.as_str()),
+        ("x-opencodex-gui-origin", "http://localhost:18900"),
+        ("origin", "http://localhost:18900"),
+        ("x-opencodex-csrf-token", csrf.as_str()),
+    ];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let phone = f.app.clone().phone_router();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener.tap_io(|_| {}),
+            phone.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    for (method, path) in [
+        ("GET", "/"),
+        ("GET", "/main.js"),
+        ("GET", "/opencodex-session"),
+        ("GET", "/api/android-remote"),
+        ("GET", "/api/storage"),
+        ("GET", "/api/diagnostics/desktop-log"),
+        ("POST", "/api/stop"),
+        ("POST", "/api/restart"),
+        ("PUT", "/api/android-remote/settings"),
+        ("POST", "/api/storage/cleanup"),
+    ] {
+        let mut request = http
+            .request(method.parse().unwrap(), format!("http://{address}{path}"))
+            .header("host", "localhost:18900")
+            .header("authorization", format!("Bearer {}", f.phone));
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+        let response = request.body("{}").send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+        assert!(!response.text().await.unwrap().contains("Existing UI"));
+    }
+    assert!(!*f.app.stopping.borrow());
+    // A real phone credential works through the dedicated origin, including
+    // when direct LAN access is disabled. Forwarded headers grant nothing.
+    let disable = call(
+        local.clone(),
+        "PUT",
+        "/api/android-remote/settings",
+        &headers,
+        json!({"localNetworkEnabled":false}),
+    )
+    .await;
+    assert_eq!(disable.0, StatusCode::OK);
+    let url = format!("http://{address}/api/auth/session");
+    assert_eq!(
+        http.get(&url)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["authenticated"],
+        false
+    );
+    assert_eq!(
+        http.post(format!("http://{address}/api/auth/websocket-ticket"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        http.get(&url)
+            .header("authorization", format!("Bearer {}", f.phone))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["authenticated"],
+        true
+    );
+    assert_eq!(
+        call(local, "GET", "/api/android-remote", &headers, Value::Null)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn quick_tunnel_preferences_persist_but_unverified_urls_cannot_pair() {
+    let mut f = setup();
+    let empty = f._root.path().join("empty.yml");
+    std::fs::write(&empty, b"{}\n").unwrap();
+    let tunnel = remodex_connect_native::tunnel::Manager::new(
+        remodex_connect_native::tunnel::Config {
+            executable: env!("CARGO_BIN_EXE_chat-fixture").into(),
+            empty_config: empty,
+            origin: "127.0.0.1:12345".parse().unwrap(),
+            environment_id: f.app.environment_id.clone(),
+        },
+        false,
+    )
+    .unwrap();
+    f.app.tunnel = Some(tunnel.clone());
+    let router = f.app.clone().router();
+    let (token, csrf) = session(router.clone()).await;
+    let headers = [
+        ("x-opencodex-api-key", token.as_str()),
+        ("x-opencodex-csrf-token", csrf.as_str()),
+        ("origin", "http://localhost:18900"),
+        ("x-opencodex-gui-origin", "http://localhost:18900"),
+    ];
+    let (code, body) = call(
+        router.clone(),
+        "PUT",
+        "/api/android-remote/settings",
+        &headers,
+        json!({"connectionChoice":"quick"}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let status: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(status["connectionChoice"], "quick");
+    assert_eq!(status["pairingAvailable"], false);
+    assert!(status["tunnel"]["runtime"]["publicUrl"].is_null());
+    assert!(f
+        .app
+        .auth
+        .call(|a| a.quick_tunnel_enabled())
+        .await
+        .unwrap()
+        .unwrap());
+    assert_eq!(
+        call(
+            router.clone(),
+            "POST",
+            "/api/android-remote/pairing",
+            &headers,
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    for path in [
+        "/api/android-remote/tunnel/check",
+        "/api/android-remote/tunnel/retry",
+    ] {
+        assert_eq!(
+            call(router.clone(), "POST", path, &[], json!({})).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(
+                router.clone(),
+                "POST",
+                path,
+                &headers,
+                json!({"url":"https://untrusted.invalid"})
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            call(router.clone(), "POST", path, &headers, json!({}))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        call(
+            router.clone(),
+            "PUT",
+            "/api/android-remote/settings",
+            &headers,
+            json!({"controlEnabled":false,"connectionChoice":"named"})
+        )
+        .await
+        .0,
+        StatusCode::NOT_IMPLEMENTED
+    );
+    assert!(f
+        .app
+        .auth
+        .call(|a| a.control_enabled())
+        .await
+        .unwrap()
+        .unwrap());
+    let disabled = call(
+        router.clone(),
+        "PUT",
+        "/api/android-remote/settings",
+        &headers,
+        json!({"controlEnabled":false}),
+    )
+    .await;
+    assert_eq!(disabled.0, StatusCode::OK);
+    assert_eq!(tunnel.state().status, "stopped");
+    assert_eq!(
+        call(
+            router.clone(),
+            "POST",
+            "/api/android-remote/tunnel/retry",
+            &headers,
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        call(
+            router.clone(),
+            "PUT",
+            "/api/android-remote/settings",
+            &headers,
+            json!({"controlEnabled":true,"connectionChoice":"local"})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(tunnel.state().status, "stopped");
+    assert_eq!(
+        call(
+            router,
+            "POST",
+            "/api/android-remote/pairing",
+            &headers,
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    tunnel.shutdown().await;
+}
+
+#[tokio::test]
 async fn restart_requires_supervisor_and_local_csrf_authority_and_stop_overrides_it() {
     use std::sync::{
         atomic::{AtomicBool, Ordering},

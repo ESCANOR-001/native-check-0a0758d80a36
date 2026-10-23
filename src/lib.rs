@@ -61,6 +61,7 @@ mod storage_policy_job;
 mod storage_preview;
 mod storage_report;
 mod storage_trash;
+pub mod tunnel;
 
 mod subprocess;
 

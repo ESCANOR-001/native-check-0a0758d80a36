@@ -223,6 +223,8 @@ pub(crate) fn routes(app: App) -> Router<App> {
         )
         .route("/api/android-remote/pairing", post(pair))
         .route("/api/android-remote/settings", put(settings))
+        .route("/api/android-remote/tunnel/retry", post(tunnel_retry))
+        .route("/api/android-remote/tunnel/check", post(tunnel_check))
         .route("/api/android-remote/clients/{id}", delete(revoke))
         .route_layer(axum::middleware::from_fn_with_state(app, guard))
         .route("/opencodex-session", get(bootstrap))
@@ -472,19 +474,21 @@ async fn status(State(app): State<App>) -> Response {
         .lock()
         .map(|v| v.keys().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
-    let state = app.auth.call(move |a| -> rusqlite::Result<(bool, bool, bool, Vec<Value>)> {
+    let state = app.auth.call(move |a| -> rusqlite::Result<(bool, bool, bool, bool, Vec<Value>)> {
         // Expired credentials still need a visible repair/revoke action. Never
         // hide the phone precisely when its authorization needs replacement.
         let mut stmt = a.store.db.prepare("SELECT id,label,os,created_at FROM clients ORDER BY created_at DESC LIMIT 128")?;
         let clients = stmt.query_map([], |r| { let id:String=r.get(0)?;let created:i64=r.get(3)?;
             Ok(json!({"id":id,"label":r.get::<_,String>(1)?,"os":r.get::<_,String>(2)?,"deviceType":"mobile", "createdAt":auth::timestamp(created),"scopes":auth::SCOPES.split(' ').collect::<Vec<_>>(),"online":online.contains(&id)}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((a.control_enabled()?, a.keep_awake()?, a.local_network_enabled()?, clients))
+        Ok((a.control_enabled()?, a.keep_awake()?, a.local_network_enabled()?,a.quick_tunnel_enabled()?, clients))
     }).await;
-    let Ok(Ok((enabled, keep_awake, local, clients))) = state else {
+    let Ok(Ok((enabled, keep_awake, local, quick, clients))) = state else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "Pairing store unavailable");
     };
     let d = app.dashboard.as_ref().unwrap();
+    let tunnel=app.tunnel.as_ref().map(|t|serde_json::to_value(t.state()).unwrap_or(Value::Null)).unwrap_or_else(||json!({"mode":"quick","status":if quick{"error"}else{"stopped"},"publicUrl":null,"error":if quick{json!("cloudflared_unavailable")}else{Value::Null}}));
+    let remote_ready = quick && tunnel["status"] == "ready" && tunnel["publicUrl"].is_string();
     let platform = if cfg!(windows) {
         "win32"
     } else if cfg!(target_os = "macos") {
@@ -495,8 +499,8 @@ async fn status(State(app): State<App>) -> Response {
     response(
         StatusCode::OK,
         json!({"version":1,"controlEnabled":enabled,"keepAwake":keep_awake,"localNetworkEnabled":local,
-        "connectionChoice":"local","pairingAvailable":enabled && local,"gateway":{"status":if enabled {"ready"} else {"stopped"},"backgroundServer":"current-process","port":d.port},
-        "reachableAddresses":if local {vec![d.public_url.clone()]} else {vec![]},"tunnel":{"configuration":{"mode":"quick","hasNamedTunnelToken":false},"runtime":{"mode":"quick","status":"stopped","publicUrl":null,"error":null}},
+        "connectionChoice":if quick{"quick"}else{"local"},"pairingAvailable":enabled && if quick{remote_ready}else{local},"gateway":{"status":if enabled {"ready"} else {"stopped"},"backgroundServer":"current-process","port":d.port},
+        "reachableAddresses":if local {vec![d.public_url.clone()]} else {vec![]},"tunnel":{"configuration":{"mode":"quick","hasNamedTunnelToken":false},"runtime":tunnel},
         "desktop":{"id":"desktop","label":app.label,"platform":platform,"address":d.public_url,"online":true},"clients":clients}),
     )
 }
@@ -630,17 +634,65 @@ async fn pair(
     if body.as_object().is_none_or(|v| !v.is_empty()) {
         return error(StatusCode::BAD_REQUEST, "Provide an empty pairing request");
     }
-    if !app.network.enabled() {
+    let quick = match app.auth.call(|a| a.quick_tunnel_enabled()).await {
+        Ok(Ok(v)) => v,
+        _ => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Pairing settings unavailable",
+            )
+        }
+    };
+    if !quick && !app.network.enabled() {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Enable local network access on this PC before pairing a phone",
         );
     }
-    let url = app.dashboard.as_ref().unwrap().public_url.clone();
+    let url = if quick {
+        match app
+            .tunnel
+            .as_ref()
+            .map(|t| t.state())
+            .filter(|s| s.status == "ready")
+            .and_then(|s| s.public_url)
+        {
+            Some(url) => url,
+            None => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Wait for the remote connection to be verified before pairing",
+                )
+            }
+        }
+    } else {
+        app.dashboard.as_ref().unwrap().public_url.clone()
+    };
     let label = app.label.clone();
+    let tunnel = app.tunnel.clone();
     match app
         .auth
-        .call(move |a| a.invite_for(&label, &url, replace, auth::now()))
+        .call(move |a| {
+            // Recheck within the settings worker so a concurrent mode change
+            // cannot mint an invitation for a connection that was just disabled.
+            let valid = a
+                .quick_tunnel_enabled()
+                .map_err(|_| "Pairing settings unavailable")?
+                == quick
+                && if quick {
+                    tunnel.as_ref().is_some_and(|t| {
+                        let state = t.state();
+                        state.status == "ready" && state.public_url.as_deref() == Some(url.as_str())
+                    })
+                } else {
+                    a.local_network_enabled()
+                        .map_err(|_| "Pairing settings unavailable")?
+                };
+            if !valid {
+                return Err("Connection changed; request a new pairing code");
+            }
+            a.invite_for(&label, &url, replace, auth::now())
+        })
         .await
     {
         Ok(Ok(v)) => response(
@@ -674,25 +726,35 @@ async fn settings(State(app): State<App>, Json(body): Json<Value>) -> Response {
     }
     // Validate the whole update before persisting anything. Unsupported actions
     // must not appear successful or partially disable a working phone.
-    if object.get("connectionChoice").is_some_and(|v| v != "local") {
+    if object
+        .get("connectionChoice")
+        .is_some_and(|v| v == "named" || (v == "quick" && app.tunnel.is_none()))
+    {
         return error(
             StatusCode::NOT_IMPLEMENTED,
-            "Tunnel controls are not migrated yet; no settings changed",
+            "This tunnel mode is unavailable; no settings changed",
         );
     }
     let enabled = body["controlEnabled"].as_bool();
     let keep_awake = body["keepAwake"].as_bool();
     let local = body["localNetworkEnabled"].as_bool();
     let network = app.network.clone();
-    if (enabled.is_some() || keep_awake.is_some() || local.is_some())
+    let quick = body["connectionChoice"].as_str().map(|s| s == "quick");
+    let tunnel = app.tunnel.clone();
+    if (enabled.is_some() || keep_awake.is_some() || local.is_some() || quick.is_some())
         && !matches!(
             app.auth
                 .call(move |a| {
-                    a.set_connection_settings(enabled, keep_awake, local)?;
+                    let run = enabled.unwrap_or(a.control_enabled()?)
+                        && quick.unwrap_or(a.quick_tunnel_enabled()?);
+                    a.set_connection_preferences(enabled, keep_awake, local, quick)?;
                     // Commit and live application share the serialized auth
                     // worker, even if the HTTP caller disconnects midway.
                     if let Some(local) = local {
                         network.set(local);
+                    }
+                    if let Some(tunnel) = tunnel {
+                        tunnel.configure(run);
                     }
                     Ok::<_, rusqlite::Error>(())
                 })
@@ -704,6 +766,40 @@ async fn settings(State(app): State<App>, Json(body): Json<Value>) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             "Cannot save phone control settings",
         );
+    }
+    status(State(app)).await
+}
+async fn tunnel_retry(State(app): State<App>, Json(body): Json<Value>) -> Response {
+    tunnel_action(app, body, true).await
+}
+async fn tunnel_check(State(app): State<App>, Json(body): Json<Value>) -> Response {
+    tunnel_action(app, body, false).await
+}
+async fn tunnel_action(app: App, body: Value, retry: bool) -> Response {
+    if body.as_object().is_none_or(|b| !b.is_empty()) {
+        return error(StatusCode::BAD_REQUEST, "Provide an empty retry request");
+    }
+    if !matches!(
+        app.auth
+            .call(|a| Ok::<_, rusqlite::Error>(a.control_enabled()? && a.quick_tunnel_enabled()?))
+            .await,
+        Ok(Ok(true))
+    ) {
+        return error(
+            StatusCode::CONFLICT,
+            "Enable the remote connection before retrying",
+        );
+    }
+    let Some(tunnel) = &app.tunnel else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Tunnel helper is unavailable",
+        );
+    };
+    if retry {
+        tunnel.retry();
+    } else {
+        tunnel.check();
     }
     status(State(app)).await
 }

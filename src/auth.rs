@@ -272,6 +272,9 @@ impl Auth {
     pub fn local_network_enabled(&self) -> rusqlite::Result<bool> {
         self.bool_setting("local_network_enabled", true)
     }
+    pub fn quick_tunnel_enabled(&self) -> rusqlite::Result<bool> {
+        self.bool_setting("quick_tunnel_enabled", false)
+    }
     fn bool_setting(&self, key: &str, default: bool) -> rusqlite::Result<bool> {
         use rusqlite::OptionalExtension;
         let value: Option<String> = self
@@ -304,11 +307,21 @@ impl Auth {
         keep_awake: Option<bool>,
         local: Option<bool>,
     ) -> rusqlite::Result<()> {
+        self.set_connection_preferences(enabled, keep_awake, local, None)
+    }
+    pub fn set_connection_preferences(
+        &mut self,
+        enabled: Option<bool>,
+        keep_awake: Option<bool>,
+        local: Option<bool>,
+        quick: Option<bool>,
+    ) -> rusqlite::Result<()> {
         let tx = self.store.db.transaction()?;
         for (key, value) in [
             ("phone_control_enabled", enabled),
             ("keep_awake", keep_awake),
             ("local_network_enabled", local),
+            ("quick_tunnel_enabled", quick),
         ] {
             if let Some(value) = value {
                 tx.execute("INSERT INTO metadata(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key, if value {"true"} else {"false"}])?;
