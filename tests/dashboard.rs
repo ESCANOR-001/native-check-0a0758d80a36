@@ -194,6 +194,43 @@ async fn agents_dashboard_uses_real_profile_status_and_isolated_preferences() {
         .0,
         StatusCode::UNAUTHORIZED
     );
+    for body in [
+        json!({"enabled":false}),
+        json!({"enabled":true}),
+        json!({"desktopSync":false}),
+        json!({"desktopSync":true}),
+    ] {
+        let (code, response) = call(f.app.clone().router(), "PUT", path, &good, body.clone()).await;
+        assert_eq!(code, StatusCode::OK, "{response}");
+        let value: Value = serde_json::from_str(&response).unwrap();
+        for (key, expected) in body.as_object().unwrap() {
+            assert_eq!(&value[key], expected);
+        }
+    }
+    assert_eq!(
+        call(
+            f.app.clone().router(),
+            "PUT",
+            path,
+            &good,
+            json!({"enabled":"false"})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(
+            f.app.clone().router(),
+            "PUT",
+            path,
+            &good[..2],
+            json!({"enabled":false})
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(
         std::fs::read_to_string(f._root.path().join("setup-auth-probes.log"))
             .unwrap()

@@ -34,7 +34,8 @@ impl Hub {
         agent: AgentKind,
         p: &Value,
     ) -> Result<Value, String> {
-        if agent != AgentKind::Claude || !self.config.claude.remote_control {
+        if agent != AgentKind::Claude || !self.claude_enabled || !self.config.claude.remote_control
+        {
             return Err("Enable Claude synchronization in this isolated profile first".into());
         }
         let requested = s(&p["threadId"]);
@@ -107,6 +108,9 @@ impl Hub {
     }
 
     pub(super) async fn launch_external_claude(&mut self, id: &str) -> Result<(), String> {
+        if !self.claude_enabled || !self.config.claude.remote_control {
+            return Err("Enable Claude Code sharing in this bridge first".into());
+        }
         if self.active.contains_key(id) {
             return Ok(());
         }

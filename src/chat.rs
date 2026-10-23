@@ -6,6 +6,8 @@ mod metadata;
 mod native_control;
 #[path = "chat_observer.rs"]
 mod observer;
+#[path = "chat_setup.rs"]
+mod setup;
 pub(crate) use observer::StopIntent;
 
 use crate::{
@@ -203,8 +205,10 @@ pub struct Chats {
     setup: crate::agent_setup::ClaudeSetup,
 }
 impl Chats {
-    pub async fn start(db: AuthService, config: Config) -> Result<Self, String> {
+    pub async fn start(db: AuthService, mut config: Config) -> Result<Self, String> {
         config.validate()?;
+        let switches = setup::Settings::load(&db, config.claude.remote_control).await?;
+        config.claude.remote_control = switches.desktop_sync;
         let setup =
             crate::agent_setup::ClaudeSetup::new(config.claude.clone(), config.workspace.clone())?;
         let limits = config.storage.clone();
@@ -266,7 +270,7 @@ impl Chats {
                     .await?
                     .map_err(|_| "Cannot retain uncertain Claude delivery records")?;
             }
-            if config.claude.remote_control && claude_recoverable(&chat) {
+            if switches.enabled && config.claude.remote_control && claude_recoverable(&chat) {
                 projection::activity(
                     &mut chat,
                     "claude-native-sync",
@@ -310,7 +314,7 @@ impl Chats {
         let (send, receive) = mpsc::channel(16);
         let (changes_tx, changes) = watch::channel(0);
         let mut claude_recovery = crate::claude_reconnect::Recovery::default();
-        if config.claude.remote_control {
+        if switches.enabled && config.claude.remote_control {
             let mut owned: Vec<_> = chats
                 .iter()
                 .filter(|(_, c)| claude_recoverable(c))
@@ -339,6 +343,7 @@ impl Chats {
             Hub {
                 db,
                 config,
+                claude_enabled: switches.enabled,
                 chats,
                 projects,
                 models,
@@ -391,6 +396,9 @@ impl Chats {
             let mut state = self
                 .send_request(agent, client, "native.claudeSetupSnapshot", json!({}))
                 .await?;
+            if enabled == Some(true) && (state["enabled"] != true || state["desktopSync"] != true) {
+                return Err("Enable Claude Code and Desktop sharing in this bridge before automatic connection".into());
+            }
             state["autoConnect"] = self.setup.preference(enabled).await?;
             return Ok(state);
         }
@@ -405,6 +413,9 @@ impl Chats {
                 json!({}),
             )
             .await?;
+        if state["enabled"] != true {
+            return Ok(state);
+        }
         let account = self.setup.account(refresh).await;
         state["ready"] = json!(account["ready"] == true && state["catalogReady"] == true);
         state["account"] = account["account"].clone();
@@ -436,6 +447,16 @@ impl Chats {
         receive
             .await
             .map_err(|_| "Native chat service stopped".to_owned())?
+    }
+    pub async fn configure_claude(&self, settings: Value) -> Result<Value, String> {
+        self.send_request(
+            AgentKind::Claude,
+            "dashboard",
+            "native.configureClaude",
+            settings,
+        )
+        .await?;
+        self.claude_setup(false).await
     }
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changes.clone()
@@ -495,6 +516,7 @@ struct Hub {
     prepared_bootstraps: HashMap<String, (Chat, PathBuf)>,
     db: AuthService,
     config: Config,
+    claude_enabled: bool,
     chats: HashMap<String, Chat>,
     projects: Value,
     models: HashMap<String, Value>,
@@ -557,7 +579,7 @@ pub(crate) fn finish(chat: &mut Chat, state: &str, error: Option<&str>) {
 }
 impl Hub {
     async fn reconnect_claude(&mut self) {
-        if !self.config.claude.remote_control {
+        if !self.claude_enabled || !self.config.claude.remote_control {
             return;
         }
         // One launch per tick and at most two handshakes; never compete with
@@ -1004,7 +1026,10 @@ impl Hub {
             // Metadata-only and isolated: idle shared connections must not keep
             // a stale catalog (or its alias-to-wire mapping) forever.
             if discovery.is_empty() && self.busy_count() == 0 {
-                if let Some(agent) = to_discover.pop() {
+                if let Some(agent) = to_discover
+                    .pop()
+                    .filter(|a| *a != AgentKind::Claude || self.claude_enabled)
+                {
                     let config = self.config.provider(agent).clone();
                     let cwd = self.config.workspace.clone();
                     discovery.spawn(async move {
@@ -1016,6 +1041,18 @@ impl Hub {
                 request=receive.recv()=>{
                     let Some(r)=request else {break};
                     if r.method=="native.shutdown" {self.shutdown().await; let _=r.reply.send(Ok(json!({})));break;}
+                    if r.method=="native.configureClaude" {
+                        // Wait for bounded metadata/jobs rather than racing a configuration
+                        // change against a CLI launched with the previous setup.
+                        let result = if !discovery.is_empty() || !capability_jobs.is_empty() || !tool_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !worktree_jobs.is_empty() {
+                            Err("Wait for agent setup or pending background controls to finish".into())
+                        } else {self.configure_claude(&r.params).await};
+                        if result.is_ok() && self.claude_enabled && !self.models.contains_key(AgentKind::Claude.instance()) && !to_discover.contains(&AgentKind::Claude) {to_discover.push(AgentKind::Claude);}
+                        let _=r.reply.send(result);continue;
+                    }
+                    if r.agent==AgentKind::Claude && !self.claude_enabled && (r.method=="orchestration.dispatchCommand" || r.method=="native.createChat" || r.method.starts_with("claude.")) {
+                        let _=r.reply.send(Err("Enable Claude Code in the Remodex dashboard first".into()));continue;
+                    }
                     if r.method=="native.watchShared" {
                         let id=s(&r.params["threadId"]).to_owned();
                         if r.agent==AgentKind::Codex && self.config.codex.shared_server.is_some() && self.checked(r.agent,&id).is_ok() && (self.shared_watches.len()<64 || self.shared_watches.contains_key(&id)) {
@@ -1962,9 +1999,10 @@ impl Hub {
         };
         let error = self.discovery_errors.get(agent.instance());
         let known = self.models.contains_key(agent.instance());
+        let enabled = agent != AgentKind::Claude || self.claude_enabled;
         json!({"cwd":self.config.workspace,"keybindingsConfigPath":"","keybindings":[],"issues":[],"availableEditors":[],
-        "providers":[{"instanceId":agent.instance(),"driver":agent.driver(),"displayName":title,"enabled":true,"installed":true,"status":if error.is_some(){"error"}else if known{"ready"}else{"unknown"},"version":null,"auth":{"status":"unknown"},"checkedAt":now(),"availability":"available","showInteractionModeToggle":true,"message":error.map(String::as_str).unwrap_or(if known {"Model list loaded. Account access is checked when a request is sent."}else{"Checking the isolated CLI's available models..."}),"models":self.models.get(agent.instance()).cloned().unwrap_or_else(||crate::models::fallback(&p.model)),"skills":[],"plugins":[],"slashCommands":[]}],
-        "settings":{"addProjectBaseDirectory":self.config.workspace,"providerInstances":{agent.instance():{"driver":agent.driver(),"displayName":title,"enabled":true}},"providers":{agent.driver():{"enabled":true}}},
+        "providers":[{"instanceId":agent.instance(),"driver":agent.driver(),"displayName":title,"enabled":enabled,"installed":true,"status":if !enabled{"disabled"}else if error.is_some(){"error"}else if known{"ready"}else{"unknown"},"version":null,"auth":{"status":"unknown"},"checkedAt":now(),"availability":if enabled{"available"}else{"unavailable"},"showInteractionModeToggle":true,"message":error.map(String::as_str).unwrap_or(if known {"Model list loaded. Account access is checked when a request is sent."}else{"Checking the isolated CLI's available models..."}),"models":self.models.get(agent.instance()).cloned().unwrap_or_else(||crate::models::fallback(&p.model)),"skills":[],"plugins":[],"slashCommands":[]}],
+        "settings":{"addProjectBaseDirectory":self.config.workspace,"providerInstances":{agent.instance():{"driver":agent.driver(),"displayName":title,"enabled":enabled}},"providers":{agent.driver():{"enabled":enabled}}},
         "environment":{"capabilities":{"androidRemoteAtomicPromptEdit":true,"androidRemoteOptimisticPromptAcknowledgement":true}},
         "observability":{"logsDirectoryPath":"","localTracingEnabled":false,"otlpTracesEnabled":false,"otlpMetricsEnabled":false}})
     }
@@ -2084,7 +2122,7 @@ impl Hub {
                     issue = error.and_then(|e| crate::agent_setup::verification_issue(e));
                 }
                 Ok(
-                    json!({"enabled":true,"desktopSync":self.config.claude.remote_control,"installed":self.config.claude.executable.is_file(),"catalogReady":known && error.is_none(),"ready":false,"error":error,"account":{},"binary":self.config.claude.executable,"activeSessions":active,"connectedSessions":connected,"connection":{"connectedSessions":connected,"verificationRequiredSessions":verification_count,"verificationIssue":issue,"desktopVerification":"unconfirmed"},"models":self.models.get(AgentKind::Claude.instance()).cloned().unwrap_or_else(||json!([]))}),
+                    json!({"enabled":self.claude_enabled,"desktopSync":self.config.claude.remote_control,"installed":self.config.claude.executable.is_file(),"catalogReady":known && error.is_none(),"ready":false,"error":error,"account":{},"binary":self.config.claude.executable,"activeSessions":active,"connectedSessions":connected,"connection":{"connectedSessions":connected,"verificationRequiredSessions":verification_count,"verificationIssue":issue,"desktopVerification":"unconfirmed"},"models":self.models.get(AgentKind::Claude.instance()).cloned().unwrap_or_else(||json!([]))}),
                 )
             }
             "server.getConfig" | "subscribeServerConfig" => Ok(self.config(agent)),
@@ -3117,6 +3155,9 @@ impl Hub {
         self.launch_worker(id, false).await
     }
     async fn launch_worker(&mut self, id: &str, recovering: bool) -> Result<(), String> {
+        if self.chats[id].agent == AgentKind::Claude && !self.claude_enabled {
+            return Err("Enable Claude Code in the Remodex dashboard first".into());
+        }
         let chat = &self.chats[id];
         if chat.external_claude {
             if !recovering {

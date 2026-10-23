@@ -308,8 +308,26 @@ async fn claude_settings(State(app): State<App>, Json(body): Json<Value>) -> Res
     }) {
         return error(StatusCode::BAD_REQUEST, "Unknown Claude setup setting");
     }
+    if !object.contains_key("autoConnectNewSessions") && !object.contains_key("binary") {
+        if object.values().any(|v| !v.is_boolean()) {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "Bridge switches must be true or false",
+            );
+        }
+        let Some(chats) = app.chats else {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Select the isolated agent configuration first",
+            );
+        };
+        return match chats.configure_claude(body).await {
+            Ok(v) => response(StatusCode::OK, v),
+            Err(e) => error(StatusCode::CONFLICT, &e),
+        };
+    }
     if object.len() != 1 || !object.contains_key("autoConnectNewSessions") {
-        return error(StatusCode::NOT_IMPLEMENTED, "Bridge agent enablement, executable and transport changes are not migrated yet; no settings changed");
+        return error(StatusCode::NOT_IMPLEMENTED, "Change automatic connection separately; executable selection is not migrated yet. No settings changed");
     }
     let Some(enabled) = body["autoConnectNewSessions"].as_bool() else {
         return error(

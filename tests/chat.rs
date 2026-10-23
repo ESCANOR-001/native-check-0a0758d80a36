@@ -123,6 +123,202 @@ impl Test {
     }
 }
 
+async fn configure_switches(test: &Test, value: Value) -> Value {
+    let start = std::time::Instant::now();
+    loop {
+        match test.hub.configure_claude(value.clone()).await {
+            Ok(v) => return v,
+            Err(e)
+                if e.starts_with("Wait for agent setup")
+                    && start.elapsed() < Duration::from_secs(10) =>
+            {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            Err(e) => panic!("settings failed: {e}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn claude_setup_switches_are_durable_preserve_history_and_leave_codex_running() {
+    let mut test = Test::hosted().await;
+    let a = AgentKind::Claude;
+    test.create(a, "switch-host").await;
+    test.call(a, prompt("switch-host", "first", "normal"))
+        .await
+        .unwrap();
+    let before = test.wait(a, "switch-host", "ready").await;
+    test.create(AgentKind::Codex, "independent").await;
+    test.call(AgentKind::Codex, prompt("independent", "hold", "normal"))
+        .await
+        .unwrap();
+    test.wait(AgentKind::Codex, "independent", "running").await;
+    let off = configure_switches(&test, json!({"enabled":false})).await;
+    assert_eq!(off["enabled"], false);
+    assert_eq!(off["ready"], false);
+    assert_eq!(off["connectedSessions"], 0);
+    assert_eq!(
+        test.detail(a, "switch-host").await["messages"],
+        before["messages"]
+    );
+    assert_eq!(
+        test.detail(a, "switch-host").await["latestTurn"],
+        before["latestTurn"]
+    );
+    assert_eq!(
+        test.detail(AgentKind::Codex, "independent").await["session"]["status"],
+        "running"
+    );
+    assert!(test
+        .call(a, prompt("switch-host", "must-not-send", "normal"))
+        .await
+        .unwrap_err()
+        .contains("Enable Claude Code"));
+    assert!(test
+        .hub
+        .call(a, "phone", "claude.setAutoConnect", json!({"enabled":true}))
+        .await
+        .is_err());
+    let config = test
+        .hub
+        .call(a, "phone", "server.getConfig", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(config["providers"][0]["enabled"], false);
+    test.stop().await;
+    test.hub = Chats::start(test.db.clone(), test.config.clone())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        std::fs::read_to_string(test.dir.path().join("host-remote-links.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "disabled hosts must not restart"
+    );
+    assert_eq!(
+        test.hub
+            .call(a, "phone", "claude.getSyncSettings", json!({}))
+            .await
+            .unwrap()["enabled"],
+        false
+    );
+    configure_switches(&test, json!({"enabled":true})).await;
+    wait_links(&test, 2).await;
+    assert_eq!(
+        test.detail(a, "switch-host").await["messages"],
+        before["messages"]
+    );
+    let off = configure_switches(&test, json!({"desktopSync":false})).await;
+    assert_eq!(off["enabled"], true);
+    assert_eq!(off["desktopSync"], false);
+    assert_eq!(off["connectedSessions"], 0);
+    test.stop().await;
+    test.hub = Chats::start(test.db.clone(), test.config.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        test.hub
+            .call(a, "phone", "claude.getSyncSettings", json!({}))
+            .await
+            .unwrap()["desktopSync"],
+        false
+    );
+    configure_switches(&test, json!({"desktopSync":true})).await;
+    wait_links(&test, 3).await;
+    test.call(a, prompt("switch-host", "second", "normal"))
+        .await
+        .unwrap();
+    test.wait(a, "switch-host", "ready").await;
+    assert_eq!(
+        std::fs::read_to_string(test.dir.path().join("host-prompts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "settings changes must not replay input"
+    );
+    let links: Vec<Value> =
+        std::fs::read_to_string(test.dir.path().join("host-remote-links.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+    assert_eq!(links[1]["reattach"], links[0]["bridge"]);
+    assert_eq!(links[2]["reattach"], links[0]["bridge"]);
+    test.stop().await;
+}
+
+#[tokio::test]
+async fn claude_setup_refuses_busy_work_and_failed_persistence_without_disconnecting() {
+    let test = Test::hosted().await;
+    configure_switches(&test, json!({"enabled":true})).await;
+    let a = AgentKind::Claude;
+    test.create(a, "protected").await;
+    test.call(a, prompt("protected", "hold", "normal"))
+        .await
+        .unwrap();
+    test.wait(a, "protected", "running").await;
+    assert!(test
+        .hub
+        .configure_claude(json!({"enabled":false}))
+        .await
+        .is_err());
+    assert!(test
+        .hub
+        .configure_claude(json!({"desktopSync":false}))
+        .await
+        .is_err());
+    assert_eq!(
+        test.detail(a, "protected").await["session"]["status"],
+        "running"
+    );
+    test.call(
+        a,
+        json!({"type":"thread.turn.interrupt","commandId":"stop-protected","threadId":"protected"}),
+    )
+    .await
+    .unwrap();
+    test.wait(a, "protected", "interrupted").await;
+    rusqlite::Connection::open(test.dir.path().join("native-connect.sqlite")).unwrap().execute_batch("CREATE TRIGGER fail_setup BEFORE INSERT ON metadata WHEN NEW.key='native.claudeSettings' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+    let error = test
+        .hub
+        .configure_claude(json!({"enabled":false,"desktopSync":false}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("Cannot save Claude bridge settings"),
+        "{error}"
+    );
+    let current = test
+        .hub
+        .call(a, "phone", "claude.getSyncSettings", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(current["enabled"], true);
+    assert_eq!(current["desktopSync"], true);
+    assert_eq!(current["connectedSessions"], 1);
+    assert!(test
+        .hub
+        .configure_claude(json!({"enabled":false,"extra":true}))
+        .await
+        .is_err());
+    test.call(a, prompt("protected", "after-failure", "normal"))
+        .await
+        .unwrap();
+    test.wait(a, "protected", "ready").await;
+    assert_eq!(
+        std::fs::read_to_string(test.dir.path().join("host-remote-links.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    test.stop().await;
+}
+
 #[tokio::test]
 async fn native_claude_setup_preferences_do_not_disconnect_hosts_or_change_codex() {
     let test = Test::hosted().await;
@@ -228,6 +424,13 @@ async fn external_claude_restart_keeps_owner_history_without_launching_another_c
     test.hub = Chats::start(test.db.clone(), test.config.clone())
         .await
         .unwrap();
+    assert!(
+        test.hub
+            .configure_claude(json!({"enabled":false}))
+            .await
+            .is_err(),
+        "a disconnected externally-owned task still protects setup"
+    );
     // No transcript/auth exists: the observer must fail closed, never resume
     // the UUID in the otherwise functional fixture CLI.
     tokio::time::sleep(Duration::from_millis(1200)).await;

@@ -64,11 +64,6 @@ impl ClaudeSetup {
         })
     }
     pub async fn preference(&self, enabled: Option<bool>) -> Result<Value, String> {
-        // This slice changes only the native future-session preference. It
-        // cannot secretly enable a bridge transport absent from its config.
-        if enabled == Some(true) && !self.config.remote_control {
-            return Err("Enable Claude sharing in this isolated bridge configuration first".into());
-        }
         let permit = self
             .files
             .clone()
