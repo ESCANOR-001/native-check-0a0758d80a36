@@ -206,10 +206,9 @@ async fn download(
     sha256: &str,
     limit: u64,
 ) -> Result<(), &'static str> {
-    let response = client
-        .get(url)
-        .send()
+    let response = tokio::time::timeout(Duration::from_secs(30), client.get(url).send())
         .await
+        .map_err(|_| "download_failed")?
         .map_err(|_| "download_failed")?;
     if !response.status().is_success() || response.content_length().is_some_and(|n| n > limit) {
         return Err("download_failed");
@@ -222,7 +221,10 @@ async fn download(
     let mut stream = response.bytes_stream();
     let mut hash = Sha256::new();
     let mut total = 0u64;
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = tokio::time::timeout(Duration::from_secs(30), stream.next())
+        .await
+        .map_err(|_| "download_failed")?
+    {
         let chunk = chunk.map_err(|_| "download_failed")?;
         total += chunk.len() as u64;
         if total > limit {
@@ -293,7 +295,7 @@ pub(crate) async fn resolve(executable: &Path, directory: &Path) -> Result<PathB
         .https_only(true)
         .redirect(reqwest::redirect::Policy::limited(5))
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(90))
+        .timeout(Duration::from_secs(600))
         .build()
         .map_err(|_| FAILED)?;
     let url = format!(

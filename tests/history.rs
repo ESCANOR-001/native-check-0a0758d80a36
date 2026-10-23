@@ -5,6 +5,43 @@ fn state(rows: Vec<Value>) -> Value {
     json!({"agent":"codex","thread":{"id":"large","messages":rows,"activities":[]},"queue":[],"native_id":"preserved-session","resumed":true})
 }
 #[test]
+fn replaying_a_history_page_does_not_write_unchanged_rows_or_advance_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Store::open(dir.path()).unwrap();
+    db.init_chats().unwrap();
+    let chat = state(vec![json!({"id":"one","turnId":"turn","text":"retained"})]);
+    db.save_chat(&chat, None).unwrap();
+    let reader = rusqlite::Connection::open(dir.path().join("native-connect.sqlite")).unwrap();
+    let sequence = || {
+        reader
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name='chat_rows'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    let before = sequence();
+    for _ in 0..20 {
+        db.save_chat(&chat, None).unwrap();
+    }
+    assert_eq!(
+        sequence(),
+        before,
+        "unchanged rows must not allocate sequence numbers"
+    );
+    let mut changed = chat.clone();
+    changed["thread"]["messages"][0]["text"] = json!("updated");
+    db.save_chat(&changed, None).unwrap();
+    let page = db.history_page("large", None, None).unwrap();
+    assert_eq!(page["messages"][0]["sequence"], before);
+    assert_eq!(page["messages"][0]["text"], "updated");
+    drop(db);
+    let mut reopened = Store::open(dir.path()).unwrap();
+    reopened.init_chats().unwrap();
+    assert_eq!(reopened.history_page("large", None, None).unwrap(), page);
+}
+#[test]
 fn claude_connection_confirmation_survives_paging_without_loading_old_transcript() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = Store::open(dir.path()).unwrap();
