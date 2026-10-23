@@ -8,6 +8,8 @@ mod native_control;
 mod observer;
 #[path = "chat_setup.rs"]
 mod setup;
+#[path = "chat_sync_recovery.rs"]
+mod sync_recovery;
 pub(crate) use observer::StopIntent;
 
 use crate::{
@@ -392,6 +394,9 @@ impl Chats {
         method: &str,
         params: Value,
     ) -> Result<Value, String> {
+        if method == "claude.recoverDesktopSync" {
+            return self.retry_claude_sync(agent, client, params).await;
+        }
         if matches!(method, "claude.getSyncSettings" | "claude.setAutoConnect") {
             if agent != AgentKind::Claude {
                 return Err("Select Claude Code before changing its settings".into());
@@ -1086,6 +1091,14 @@ impl Hub {
                             let watch=self.shared_watches.entry(id).or_insert((Instant::now(),Instant::now()));watch.0=Instant::now()+Duration::from_secs(3);
                         }
                         let _=r.reply.send(Ok(json!({})));continue;
+                    }
+                    if r.method=="native.retryClaudeSync" {
+                        let result=self.request_sync_retry(r.agent,&r.params).await;
+                        let _=r.reply.send(result);continue;
+                    }
+                    if r.method=="native.claudeSyncStatus" {
+                        let result=self.sync_retry_status(r.agent,s(&r.params["threadId"]));
+                        let _=r.reply.send(result);continue;
                     }
                     // Check native receipts before any bootstrap/edit/job can
                     // create side effects under a reused dispatch command ID.

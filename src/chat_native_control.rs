@@ -784,6 +784,7 @@ mod tests {
         /// Holds each scripted acknowledgement and prompt turn until released.
         gate: Arc<tokio::sync::Semaphore>,
         connections: Arc<AtomicUsize>,
+        hold_handshake: Arc<std::sync::atomic::AtomicBool>,
     }
     impl Default for Worker {
         fn default() -> Self {
@@ -799,6 +800,7 @@ mod tests {
                 ]))),
                 gate: Arc::new(tokio::sync::Semaphore::new(0)),
                 connections: Default::default(),
+                hold_handshake: Default::default(),
             }
         }
     }
@@ -824,6 +826,9 @@ mod tests {
     /// script and records prompts, then finishes their turns. Like the real
     /// relay, writes are answered while earlier events await their commit.
     async fn serve(mut fake: Fake, worker: Worker) {
+        while worker.hold_handshake.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let (done, mut replies) = mpsc::unbounded_channel::<Option<Vec<Value>>>();
         let mut outgoing: VecDeque<Value> = VecDeque::new();
         let mut pending: observer_fixture::Pending = None;
@@ -1135,6 +1140,123 @@ mod tests {
     }
     fn opus(effort: &str) -> Value {
         json!({"instanceId":"claude-code","model":"opus","options":[{"id":"effort","value":effort}]})
+    }
+
+    #[tokio::test]
+    async fn retry_original_shared_link_joins_the_handshake_and_never_sends_a_prompt_or_control() {
+        let mut f = Fixture::start().await;
+        let params = json!({"threadId":CHAT,"mode":"retry","commandId":"retry-link"});
+        let before = f.thread().await;
+        let count = f.worker.connections.load(Ordering::SeqCst);
+        for _ in 0..2 {
+            let result = f
+                .hub
+                .call(
+                    AgentKind::Claude,
+                    "phone",
+                    "claude.recoverDesktopSync",
+                    params.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result["status"], "connected");
+        }
+        assert_eq!(f.worker.connections.load(Ordering::SeqCst), count);
+        assert!(f.log().is_empty());
+        f.stop().await;
+        f.db.call(|a| {
+            let mut saved = a.store.load_chat(CHAT).unwrap();
+            saved["paused"] = json!(true);
+            saved["queue"] = json!([prompt(
+                "held-after-reconnect",
+                "held",
+                opus("high"),
+                "queue"
+            )]);
+            a.store.save_chat(&saved, None).unwrap();
+        })
+        .await
+        .unwrap();
+        f.worker.hold_handshake.store(true, Ordering::SeqCst);
+        f.hub = Chats::start(f.db.clone(), f.config.clone()).await.unwrap();
+        let hub = f.hub.clone();
+        let pending = tokio::spawn(async move {
+            hub.call(
+                AgentKind::Claude,
+                "phone",
+                "claude.recoverDesktopSync",
+                params,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while f.worker.connections.load(Ordering::SeqCst) == count {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !pending.is_finished(),
+            "Repair cannot succeed before the original worker confirms the connection"
+        );
+        f.worker.hold_handshake.store(false, Ordering::SeqCst);
+        let result = tokio::time::timeout(Duration::from_secs(8), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["status"], "connected");
+        assert_eq!(f.worker.connections.load(Ordering::SeqCst), count + 1);
+        let after = f.thread().await;
+        let displayed = after["messages"].as_array().unwrap();
+        assert_eq!(
+            displayed
+                .iter()
+                .filter(|m| m["phase"] != "queued")
+                .cloned()
+                .collect::<Vec<_>>(),
+            before["messages"].as_array().unwrap().clone()
+        );
+        assert_eq!(
+            displayed
+                .iter()
+                .filter(|m| m["phase"] == "queued" && m["queueStatus"] == "paused")
+                .count(),
+            1
+        );
+        assert_eq!(after["latestTurn"], before["latestTurn"]);
+        f.db.call(|a| {
+            let saved = a.store.load_chat(CHAT).unwrap();
+            assert_eq!(saved["paused"], true);
+            assert_eq!(saved["queue"].as_array().unwrap().len(), 1);
+        })
+        .await
+        .unwrap();
+        assert!(f.log().is_empty());
+        f.stop().await;
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_other_agents_invalid_modes_and_payloads_without_native_writes() {
+        let f = Fixture::start().await;
+        for agent in [AgentKind::Codex, AgentKind::Claude] {
+            for params in [
+                json!({"threadId":CHAT,"mode":"replace","commandId":"no-fork"}),
+                json!({"threadId":CHAT,"mode":"retry","commandId":""}),
+                json!({"threadId":CHAT,"mode":"retry","commandId":"extra","prompt":"NEVER_SEND"}),
+            ] {
+                assert!(f
+                    .hub
+                    .call(agent, "phone", "claude.recoverDesktopSync", params)
+                    .await
+                    .is_err());
+            }
+        }
+        assert!(f.log().is_empty());
+        assert_eq!(f.worker.connections.load(Ordering::SeqCst), 1);
+        f.stop().await;
     }
 
     #[tokio::test]
