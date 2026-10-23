@@ -24,6 +24,7 @@ pub mod dashboard;
 pub mod diagnostics;
 mod legacy_claude;
 mod legacy_claude_assets;
+mod legacy_codex;
 pub mod legacy_connection;
 pub mod migration_snapshot;
 pub mod restart_drain;
