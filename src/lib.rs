@@ -54,6 +54,7 @@ pub mod storage;
 mod storage_disk;
 mod storage_preview;
 mod storage_report;
+mod storage_trash;
 
 mod subprocess;
 

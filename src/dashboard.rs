@@ -197,6 +197,7 @@ pub(crate) fn routes(app: App) -> Router<App> {
         .route("/api/connect/activity", get(activity))
         .route("/api/storage", get(storage_report))
         .route("/api/storage/cleanup/preview", post(storage_preview))
+        .route("/api/storage/trash", get(storage_trash))
         .route("/api/android-remote", get(status))
         .route(
             "/api/android-remote/claude-code",
@@ -254,6 +255,21 @@ async fn storage_preview(
     match chats.storage_report.preview(percent).await {
         Ok(value) => response(StatusCode::OK, value),
         Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    }
+}
+async fn storage_trash(State(app): State<App>) -> Response {
+    let Some(chats) = app.chats else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Select the isolated agent configuration first",
+        );
+    };
+    match chats.storage_report.trash().await {
+        Ok(value) => response(StatusCode::OK, value),
+        Err(_) => response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":"trash_list_failed","entries":[]}),
+        ),
     }
 }
 async fn guard(State(app): State<App>, req: Request, next: Next) -> Response {

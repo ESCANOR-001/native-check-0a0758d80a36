@@ -76,6 +76,7 @@ impl Snapshot {
     pub fn new(path: &Path) -> io::Result<Self> {
         let dir = std::env::temp_dir().join(format!("remodex-report-{}", uuid::Uuid::new_v4()));
         let mut builder = fs::DirBuilder::new();
+        builder.recursive(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;

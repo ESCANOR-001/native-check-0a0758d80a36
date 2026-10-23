@@ -267,6 +267,39 @@ async fn agents_dashboard_uses_real_profile_status_and_isolated_preferences() {
         std::fs::read_to_string(&archived).unwrap(),
         "PRIVATE_ARCHIVED"
     );
+    let trash_path = "/api/storage/trash";
+    assert_eq!(
+        call(router.clone(), "GET", trash_path, &[], Value::Null)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            router.clone(),
+            "GET",
+            trash_path,
+            &[("authorization", &format!("Bearer {}", f.phone))],
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let stage = f._root.path().join(".trash/1");
+    std::fs::create_dir_all(&stage).unwrap();
+    std::fs::write(stage.join("test.jsonl"), "PRIVATE_QUARANTINE").unwrap();
+    let (code, body) = call(router.clone(), "GET", trash_path, &good, Value::Null).await;
+    assert_eq!(code, StatusCode::OK);
+    let listed: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(listed["entries"][0]["id"], ".trash/1");
+    assert_eq!(listed["entries"][0]["fileCount"], 1);
+    assert!(!body.contains("PRIVATE_QUARANTINE"));
+    assert!(!body.contains(f._root.path().to_str().unwrap()));
+    assert_eq!(
+        std::fs::read_to_string(stage.join("test.jsonl")).unwrap(),
+        "PRIVATE_QUARANTINE"
+    );
     assert_eq!(
         call(router.clone(), "POST", "/api/storage", &good, json!({}))
             .await

@@ -1,5 +1,5 @@
 //! Bounded, read-only profile measurement for the existing Storage page.
-//! SQLite counts use immutable snapshots, never creating WAL/SHM sidecars.
+//! SQLite counts use disposable snapshots, never creating source WAL/SHM sidecars.
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -80,21 +80,13 @@ fn row_count(path: &Path, table: &str) -> Option<u64> {
     if !before.is_file() || !regular(&before) || before.len() > 64 * 1024 * 1024 {
         return None;
     }
-    // SQLite NOFOLLOW also rejects linked ancestors. macOS's normal temporary
-    // root (/var -> /private/var) is one, so resolve ancestors after rejecting a
-    // linked database itself. Keep NOFOLLOW and the identity check below: a
-    // replacement during measurement must never produce a trusted count.
-    let canonical = path.canonicalize().ok()?;
-    let mut url = reqwest::Url::from_file_path(canonical).ok()?;
-    url.set_query(Some("immutable=1"));
-    let db = Connection::open_with_flags(
-        url.as_str(),
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_URI
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .ok()?;
+    // immutable=1 ignores a live WAL. Recover only our bounded disposable copy
+    // so recently committed rows count without changing the source profile.
+    let snapshot = crate::profile_snapshot::Snapshot::new(path).ok()?;
+    let db =
+        Connection::open_with_flags(snapshot.path(), OpenFlags::SQLITE_OPEN_READ_WRITE).ok()?;
     db.busy_timeout(Duration::ZERO).ok()?;
+    db.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA mmap_size=0;").ok()?;
     let sql: String = db
         .query_row(
             "SELECT substr(sql,1,256) FROM sqlite_schema WHERE type='table' AND name=?1",
@@ -367,6 +359,28 @@ mod tests {
         assert_eq!(db_name("state_10.sqlite-shm"), Some((3, 10, false)));
         assert!(db_name("state_bad.sqlite").is_none());
     }
+    #[test]
+    fn storage_report_counts_committed_wal_rows_without_changing_source_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state_1.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE threads(id INTEGER); INSERT INTO threads VALUES(1),(2);").unwrap();
+        let names = ["state_1.sqlite", "state_1.sqlite-wal", "state_1.sqlite-shm"];
+        let before: Vec<_> = names
+            .iter()
+            .map(|n| fs::read(root.path().join(n)).unwrap())
+            .collect();
+        assert_eq!(row_count(&path, "threads"), Some(2));
+        assert_eq!(
+            names
+                .iter()
+                .map(|n| fs::read(root.path().join(n)).unwrap())
+                .collect::<Vec<_>>(),
+            before
+        );
+        db.execute_batch("INSERT INTO threads VALUES(3)").unwrap();
+        assert_eq!(row_count(&path, "threads"), Some(3));
+    }
     #[cfg(unix)]
     #[test]
     fn storage_report_excludes_linked_files_directories_and_databases() {
@@ -451,6 +465,20 @@ impl Reader {
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             crate::storage_preview::preview(&home, percent).map_err(str::to_owned)
+        })
+        .await
+        .map_err(|_| "Storage scanner stopped".to_owned())?
+    }
+    pub async fn trash(&self) -> Result<Value, String> {
+        let permit = self
+            .gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "Storage scan is busy; retry shortly")?;
+        let home = self.home.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            crate::storage_trash::list(&home).map_err(str::to_owned)
         })
         .await
         .map_err(|_| "Storage scanner stopped".to_owned())?
