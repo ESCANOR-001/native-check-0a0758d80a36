@@ -385,8 +385,22 @@ pub(crate) async fn run(
         // revert enforces the final idle-state check in its own session owner.
         let meta=rpc(&mut connection,"thread/read",json!({"threadId":intent.native,"includeTurns":false})).await?.map_err(|_|PENDING)?;
         if meta["thread"]["id"]!=intent.native {return Err(PENDING.to_owned());}
+        if deliver && meta["thread"]["historyMode"]!="paginated" {return Ok(Outcome::Rejected("Safe conversation Revert requires a paginated Codex session; saved history was not changed.".into()));}
         if !matches!(meta["thread"]["status"]["type"].as_str(),Some("idle"|"notLoaded")) {
             return if deliver {Ok(Outcome::Rejected("Stop the native task before reverting its conversation".into()))}else{Ok(Outcome::Uncertain)};
+        }
+        if deliver && meta["thread"]["status"]["type"]=="notLoaded" {
+            // Revert requires a loaded session. Do not resume a goal-bearing
+            // chat as resume may automatically start more work. Supply no model,
+            // access, workspace or other overrides to the existing session.
+            let goal=rpc(&mut connection,"thread/goal/get",json!({"threadId":intent.native})).await?;
+            if !goal.is_ok_and(|v|v.get("goal")==Some(&Value::Null)) {
+                return Ok(Outcome::Rejected("This unloaded chat has a goal or its goal state could not be verified. Open it in its owner and finish or pause its work before reverting; no conversation change was sent.".into()));
+            }
+            let loaded=rpc(&mut connection,"thread/resume",json!({"threadId":intent.native,"excludeTurns":true})).await?.map_err(|_|PENDING)?;
+            if loaded["thread"]["id"]!=intent.native || loaded["thread"]["status"]["type"]!="idle" {
+                return Ok(Outcome::Rejected("Codex did not confirm an idle original session; no conversation change was sent.".into()));
+            }
         }
         let removed=removed_turns(&mut connection,&intent,deliver).await?;
         let present=removed.is_some();

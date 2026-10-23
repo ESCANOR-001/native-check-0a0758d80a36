@@ -127,6 +127,16 @@ async fn conversation_revert_preserves_native_identity_revision_prefix_and_idemp
         .unwrap();
     t.call(AgentKind::Codex, command.clone()).await.unwrap();
     let after = t.detail(AgentKind::Codex, "revert").await;
+    let resumes =
+        std::fs::read_to_string(t.dir.path().join("revert-fixture-resumes.jsonl")).unwrap();
+    let resumes: Vec<Value> = resumes
+        .lines()
+        .map(|v| serde_json::from_str(v).unwrap())
+        .collect();
+    assert_eq!(
+        resumes,
+        vec![json!({"threadId":native,"excludeTurns":true})]
+    );
     assert!(after["messages"].to_string().contains("retain-first"));
     assert!(!after["messages"].to_string().contains("remove-second"));
     assert!(!after["messages"].to_string().contains("remove-third"));
@@ -271,6 +281,7 @@ async fn conversation_revert_refuses_native_busy_unsupported_and_failed_backup_w
 ) {
     for mode in [
         "revert-fixture-native-busy",
+        "revert-fixture-goal",
         "reject-fixture-revert",
         "backup-failure",
     ] {
@@ -291,6 +302,9 @@ async fn conversation_revert_refuses_native_busy_unsupported_and_failed_backup_w
             revert_calls(&t),
             usize::from(mode == "reject-fixture-revert")
         );
+        if mode != "reject-fixture-revert" {
+            assert!(!t.dir.path().join("revert-fixture-resumes.jsonl").exists());
+        }
         assert_eq!(
             db.query_row(
                 "SELECT count(*) FROM native_reverts WHERE phase='pending'",

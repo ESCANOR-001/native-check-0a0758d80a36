@@ -108,6 +108,7 @@ fn main() {
     let mut hosted = false;
     let mut host_inputs: Vec<String> = vec![];
     let mut host_waiting: Option<String> = None;
+    let mut revert_loaded = false;
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         let v: Value = serde_json::from_str(&line).unwrap();
@@ -117,8 +118,26 @@ fn main() {
                 "model/list" => out(
                     json!({"id":v["id"],"result":{"data":[{"model":"test","displayName":"Test model","supportedReasoningEfforts":[{"reasoningEffort":"high"},{"reasoningEffort":"low"}]}]}}),
                 ),
-                "thread/start" | "thread/resume" | "thread/read" => out(
-                    json!({"id":v["id"],"result":{"thread":{"id":v["params"]["threadId"].as_str().filter(|s|!s.is_empty()).unwrap_or("native-fixture-thread"),"status":{"type":if std::path::Path::new("revert-fixture-native-busy").exists(){"active"}else{"idle"}}}}}),
+                "thread/start" | "thread/resume" | "thread/read" => {
+                    if v["method"] == "thread/resume"
+                        && std::path::Path::new("revert-fixture-turns.json").exists()
+                    {
+                        let mut log = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("revert-fixture-resumes.jsonl")
+                            .unwrap();
+                        writeln!(log, "{}", v["params"]).unwrap();
+                    }
+                    if v["method"] != "thread/read" {
+                        revert_loaded = true;
+                    }
+                    out(
+                        json!({"id":v["id"],"result":{"thread":{"id":v["params"]["threadId"].as_str().filter(|s|!s.is_empty()).unwrap_or("native-fixture-thread"),"historyMode":"paginated","status":{"type":if std::path::Path::new("revert-fixture-native-busy").exists(){"active"}else if !revert_loaded && std::path::Path::new("revert-fixture-turns.json").exists(){"notLoaded"}else{"idle"}}}}}),
+                    );
+                }
+                "thread/goal/get" => out(
+                    json!({"id":v["id"],"result":{"goal":if std::path::Path::new("revert-fixture-goal").exists(){json!({"status":"active"})}else{Value::Null}}}),
                 ),
                 "thread/turns/list" => {
                     let rows: Value = std::fs::read("revert-fixture-turns.json")
@@ -140,6 +159,12 @@ fn main() {
                     out(json!({"id":v["id"],"result":{"data":page,"nextCursor":next}}));
                 }
                 "thread/revert" => {
+                    if !revert_loaded {
+                        out(
+                            json!({"id":v["id"],"error":{"code":-32000,"message":"thread not found"}}),
+                        );
+                        continue;
+                    }
                     let mut log = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
