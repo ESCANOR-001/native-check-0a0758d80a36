@@ -9,6 +9,138 @@ fn auth() -> (TempDir, Auth) {
     let auth = Auth::new(Store::open(dir.path()).unwrap());
     (dir, auth)
 }
+
+#[test]
+fn replacement_is_bound_to_one_phone_and_commits_only_after_a_successful_exchange() {
+    let (dir, mut a) = auth();
+    let (_, old) = pair(&mut a, 1000, None, Some("old-install"));
+    let (_, other) = pair(&mut a, 1000, None, Some("other-install"));
+    let ticket = a.ticket(&old.client_id, 1001).unwrap().unwrap()["ticket"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let invitation = a
+        .invite_for(
+            "test",
+            "http://127.0.0.1:1",
+            Some(old.client_id.clone()),
+            1001,
+        )
+        .unwrap();
+    let token = invitation["pairingToken"].as_str().unwrap();
+    let competing = a
+        .invite_for(
+            "test",
+            "http://127.0.0.1:1",
+            Some(old.client_id.clone()),
+            1001,
+        )
+        .unwrap();
+    assert!(a.authenticate(&old.access_token, 1002).unwrap().is_some());
+    assert!(a
+        .exchange(token, Some("invalid-proof"), Metadata::default(), 1002)
+        .unwrap()
+        .is_none());
+    assert!(a.authenticate(&old.access_token, 1002).unwrap().is_some());
+    let proof = "c".repeat(64);
+    let new = a
+        .exchange(token, Some(&proof), Metadata::default(), 1003)
+        .unwrap()
+        .unwrap();
+    assert_eq!(new.replaced_client_ids, vec![old.client_id.clone()]);
+    assert!(a.authenticate(&old.access_token, 1004).unwrap().is_none());
+    assert!(a.authenticate(&other.access_token, 1004).unwrap().is_some());
+    assert!(a.consume_ticket(&ticket, 1004).unwrap().is_none());
+    assert!(a
+        .exchange(
+            competing["pairingToken"].as_str().unwrap(),
+            None,
+            Metadata::default(),
+            1004
+        )
+        .unwrap()
+        .is_none());
+    let retry = a
+        .exchange(token, Some(&proof), Metadata::default(), 1004)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.access_token, new.access_token);
+    assert!(retry.replaced_client_ids.is_empty());
+    drop(a);
+    let a = Auth::new(Store::open(dir.path()).unwrap());
+    assert!(a.authenticate(&new.access_token, 1005).unwrap().is_some());
+    assert!(a.authenticate(&old.access_token, 1005).unwrap().is_none());
+    assert!(a.authenticate(&other.access_token, 1005).unwrap().is_some());
+}
+
+#[test]
+fn failed_replacement_write_preserves_original_phone_and_retry_code() {
+    let (dir, mut a) = auth();
+    let (_, old) = pair(&mut a, 1000, None, None);
+    let invitation = a
+        .invite_for(
+            "test",
+            "http://127.0.0.1:1",
+            Some(old.client_id.clone()),
+            1001,
+        )
+        .unwrap();
+    let token = invitation["pairingToken"].as_str().unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("native-connect.sqlite")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_pair BEFORE INSERT ON clients BEGIN SELECT RAISE(ABORT,'simulated write failure'); END;").unwrap();
+    assert!(a.exchange(token, None, Metadata::default(), 1002).is_err());
+    assert!(a.authenticate(&old.access_token, 1002).unwrap().is_some());
+    assert!(a.has_invitation(invitation["pairingLinkId"].as_str().unwrap(), 1002));
+    db.execute_batch("DROP TRIGGER fail_pair;").unwrap();
+    assert!(a
+        .exchange(token, None, Metadata::default(), 1003)
+        .unwrap()
+        .is_some());
+    assert!(a.authenticate(&old.access_token, 1003).unwrap().is_none());
+}
+
+#[test]
+fn revoked_replacement_target_invalidates_its_codes_but_expired_target_can_be_repaired() {
+    let (_dir, mut a) = auth();
+    let (_, old) = pair(&mut a, 1000, None, None);
+    let invitation = a
+        .invite_for(
+            "test",
+            "http://127.0.0.1:1",
+            Some(old.client_id.clone()),
+            1001,
+        )
+        .unwrap();
+    a.revoke(&old.client_id).unwrap();
+    assert!(!a.has_invitation(invitation["pairingLinkId"].as_str().unwrap(), 1002));
+    assert!(a
+        .invite_for("test", "http://127.0.0.1:1", Some(old.client_id), 1002)
+        .is_err());
+    let (_, expired) = pair(&mut a, 1000, None, None);
+    let later = 1001 + ACCESS_MS;
+    assert!(a
+        .authenticate(&expired.access_token, later)
+        .unwrap()
+        .is_none());
+    let invitation = a
+        .invite_for(
+            "test",
+            "http://127.0.0.1:1",
+            Some(expired.client_id.clone()),
+            later,
+        )
+        .unwrap();
+    let repaired = a
+        .exchange(
+            invitation["pairingToken"].as_str().unwrap(),
+            None,
+            Metadata::default(),
+            later,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(repaired.replaced_client_ids, vec![expired.client_id]);
+}
 fn pair(
     a: &mut Auth,
     now: i64,

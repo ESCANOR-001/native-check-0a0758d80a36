@@ -48,6 +48,7 @@ fn clean(value: Option<&str>, max: usize, fallback: &str) -> String {
 struct Invitation {
     id: String,
     expires: i64,
+    replace: Option<String>,
 }
 struct Ticket {
     client: String,
@@ -95,12 +96,30 @@ impl Auth {
         self.recovery.retain(|_, v| v.expires > now);
     }
     pub fn invite(&mut self, label: &str, url: &str, now: i64) -> Result<Value, &'static str> {
+        self.invite_for(label, url, None, now)
+    }
+    pub fn invite_for(
+        &mut self,
+        label: &str,
+        url: &str,
+        replace: Option<String>,
+        now: i64,
+    ) -> Result<Value, &'static str> {
         if !self.control_enabled().map_err(|_| "Settings unavailable")? {
             return Err("Phone control is disabled");
         }
         self.prune(now);
         if self.invitations.len() >= MAX_PENDING {
             return Err("too many pending invitations");
+        }
+        if let Some(id) = &replace {
+            if !self
+                .store
+                .client_exists(id)
+                .map_err(|_| "Pairing store unavailable")?
+            {
+                return Err("The phone authorization no longer exists");
+            }
         }
         let raw = secret("ocx_pair_");
         let id = uuid::Uuid::new_v4().to_string();
@@ -109,6 +128,7 @@ impl Auth {
             Invitation {
                 id: id.clone(),
                 expires: now + PAIRING_MS,
+                replace,
             },
         );
         Ok(json!({"type":"remodex-mobile-pairing", "version":1,
@@ -153,8 +173,14 @@ impl Auth {
             }
             return Ok(None);
         }
-        if !self.invitations.contains_key(&key) {
+        let Some(invitation) = self.invitations.get(&key) else {
             return Ok(None);
+        };
+        let replace = invitation.replace.clone();
+        if let Some(id) = &replace {
+            if !self.store.client_exists(id)? {
+                return Ok(None);
+            }
         }
         // Reserve bounded recovery capacity before committing/consuming a token.
         if proof.is_some() && self.recovery.len() >= MAX_PENDING {
@@ -176,9 +202,15 @@ impl Auth {
             credential_digest: digest(&raw),
             installation_digest: installation,
         };
-        let replaced = self.store.replace_client(&client)?;
+        let replaced = self
+            .store
+            .replace_client_target(&client, replace.as_deref())?;
         self.invitations.remove(&key);
         self.tickets.retain(|_, v| !replaced.contains(&v.client));
+        self.invitations
+            .retain(|_, v| !v.replace.as_ref().is_some_and(|id| replaced.contains(id)));
+        self.recovery
+            .retain(|_, v| !replaced.contains(&v.result.client_id));
         let result = Exchange {
             access_token: raw,
             expires_at: client.expires_at,
@@ -265,6 +297,8 @@ impl Auth {
         let revoked = self.store.revoke(client)?;
         self.tickets.retain(|_, v| v.client != client);
         self.recovery.retain(|_, v| v.result.client_id != client);
+        self.invitations
+            .retain(|_, v| v.replace.as_deref() != Some(client));
         Ok(revoked)
     }
 }

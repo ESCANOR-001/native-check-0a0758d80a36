@@ -94,6 +94,68 @@ async fn session(router: Router) -> (String, String) {
 }
 
 #[tokio::test]
+async fn expired_phone_remains_visible_and_can_be_repaired_without_deleting_history() {
+    let f = setup();
+    let db =
+        rusqlite::Connection::open(f._root.path().join("state/native-connect.sqlite")).unwrap();
+    db.execute("UPDATE clients SET expires_at=0 WHERE id=?1", [&f.client])
+        .unwrap();
+    drop(db);
+    let router = f.app.clone().router();
+    let (token, csrf) = session(router.clone()).await;
+    let good = [
+        ("x-opencodex-api-key", token.as_str()),
+        ("x-opencodex-gui-origin", "http://localhost:18900"),
+        ("origin", "http://localhost:18900"),
+        ("x-opencodex-csrf-token", csrf.as_str()),
+    ];
+    let (code, body) = call(
+        router.clone(),
+        "GET",
+        "/api/android-remote",
+        &good,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let status: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(status["clients"][0]["id"], f.client);
+    assert_eq!(status["clients"][0]["online"], false);
+    let (code, body) = call(
+        router,
+        "POST",
+        &format!("/api/android-remote/pairing?replaceClientId={}", f.client),
+        &good,
+        json!({}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED);
+    let value: Value = serde_json::from_str(&body).unwrap();
+    let qr: Value = serde_json::from_str(value["qrPayload"].as_str().unwrap()).unwrap();
+    f.app
+        .auth
+        .call(move |a| {
+            assert!(a.authenticate(&f.phone, auth::now()).unwrap().is_none());
+            let exchanged = a
+                .exchange(
+                    qr["pairingToken"].as_str().unwrap(),
+                    None,
+                    Metadata::default(),
+                    auth::now(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(exchanged.replaced_client_ids, vec![f.client]);
+            assert!(a
+                .authenticate(&exchanged.access_token, auth::now())
+                .unwrap()
+                .is_some());
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn dashboard_requires_local_socket_host_origin_and_distinct_credentials() {
     let f = setup();
     let router = f.app.clone().router();
@@ -229,7 +291,33 @@ async fn dashboard_requires_local_socket_host_origin_and_distinct_credentials() 
         )
         .await
         .0,
-        StatusCode::NOT_IMPLEMENTED
+        StatusCode::BAD_REQUEST
+    );
+    let (s, repair) = call(
+        router.clone(),
+        "POST",
+        &format!("/api/android-remote/pairing?replaceClientId={}", f.client),
+        &good,
+        json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let repair: Value = serde_json::from_str(&repair).unwrap();
+    let repair_id = repair["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        call(
+            router.clone(),
+            "POST",
+            &format!(
+                "/api/android-remote/pairing?replaceClientId={}",
+                uuid::Uuid::new_v4()
+            ),
+            &good,
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
     );
     let qr: Value = serde_json::from_str(pairing["qrPayload"].as_str().unwrap()).unwrap();
     assert_eq!(qr["directUrl"], "http://127.0.0.1:18900");
@@ -270,6 +358,12 @@ async fn dashboard_requires_local_socket_host_origin_and_distinct_credentials() 
         StatusCode::OK
     );
     let old = f.phone;
+    assert!(!f
+        .app
+        .auth
+        .call(move |a| a.has_invitation(&repair_id, auth::now()))
+        .await
+        .unwrap());
     assert!(f
         .app
         .auth

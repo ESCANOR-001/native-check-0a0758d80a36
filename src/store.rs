@@ -82,15 +82,43 @@ impl Store {
     }
 
     pub fn replace_client(&mut self, client: &Client) -> rusqlite::Result<Vec<String>> {
+        self.replace_client_target(client, None)
+    }
+    pub fn client_exists(&self, id: &str) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM clients WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )
+    }
+    pub fn replace_client_target(
+        &mut self,
+        client: &Client,
+        target: Option<&str>,
+    ) -> rusqlite::Result<Vec<String>> {
         let tx = self.db.transaction()?;
+        if let Some(id) = target {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM clients WHERE id=?1)",
+                [id],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+        }
         let replaced = {
-            let mut stmt = tx.prepare("SELECT id FROM clients WHERE installation_digest=?1")?;
-            let rows = stmt.query_map([&client.installation_digest], |row| row.get(0))?;
+            let mut stmt = tx.prepare(
+                "SELECT id FROM clients WHERE installation_digest=?1 OR id=?2 ORDER BY id",
+            )?;
+            let rows = stmt.query_map(params![&client.installation_digest, target], |row| {
+                row.get(0)
+            })?;
             rows.collect::<rusqlite::Result<Vec<String>>>()?
         };
         tx.execute(
-            "DELETE FROM clients WHERE installation_digest=?1",
-            [&client.installation_digest],
+            "DELETE FROM clients WHERE installation_digest=?1 OR id=?2",
+            params![&client.installation_digest, target],
         )?;
         tx.execute(
             "INSERT INTO clients VALUES (?1,?2,?3,?4,?5,?6,?7)",

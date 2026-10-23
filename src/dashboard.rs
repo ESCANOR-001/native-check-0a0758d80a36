@@ -247,8 +247,10 @@ async fn status(State(app): State<App>) -> Response {
         .map(|v| v.keys().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
     let state = app.auth.call(move |a| -> rusqlite::Result<(bool, Vec<Value>)> {
-        let mut stmt = a.store.db.prepare("SELECT id,label,os,created_at FROM clients WHERE expires_at>?1 ORDER BY created_at LIMIT 128")?;
-        let clients = stmt.query_map([auth::now()], |r| { let id:String=r.get(0)?;let created:i64=r.get(3)?;
+        // Expired credentials still need a visible repair/revoke action. Never
+        // hide the phone precisely when its authorization needs replacement.
+        let mut stmt = a.store.db.prepare("SELECT id,label,os,created_at FROM clients ORDER BY created_at DESC LIMIT 128")?;
+        let clients = stmt.query_map([], |r| { let id:String=r.get(0)?;let created:i64=r.get(3)?;
             Ok(json!({"id":id,"label":r.get::<_,String>(1)?,"os":r.get::<_,String>(2)?,"deviceType":"mobile", "createdAt":auth::timestamp(created),"scopes":auth::SCOPES.split(' ').collect::<Vec<_>>(),"online":online.contains(&id)}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((a.control_enabled()?, clients))
@@ -277,11 +279,28 @@ async fn pair(
     Query(query): Query<HashMap<String, String>>,
     bytes: axum::body::Bytes,
 ) -> Response {
-    if !query.is_empty() {
+    if query.keys().any(|k| k != "replaceClientId")
+        || query
+            .get("replaceClientId")
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
+    {
         return error(
-            StatusCode::NOT_IMPLEMENTED,
-            "Replacement pairing is not migrated yet; existing devices are unchanged",
+            StatusCode::BAD_REQUEST,
+            "Provide a valid paired device ID only",
         );
+    }
+    let replace = query.get("replaceClientId").cloned();
+    if let Some(id) = replace.clone() {
+        match app.auth.call(move |a| a.store.client_exists(&id)).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                return error(
+                    StatusCode::NOT_FOUND,
+                    "The phone authorization no longer exists",
+                )
+            }
+            _ => return error(StatusCode::SERVICE_UNAVAILABLE, "Pairing store unavailable"),
+        }
     }
     let body = if bytes.is_empty() {
         json!({})
@@ -292,16 +311,13 @@ async fn pair(
         }
     };
     if body.as_object().is_none_or(|v| !v.is_empty()) {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "Provide an empty pairing request; replacement pairing is not yet migrated",
-        );
+        return error(StatusCode::BAD_REQUEST, "Provide an empty pairing request");
     }
     let url = app.dashboard.as_ref().unwrap().public_url.clone();
     let label = app.label.clone();
     match app
         .auth
-        .call(move |a| a.invite(&label, &url, auth::now()))
+        .call(move |a| a.invite_for(&label, &url, replace, auth::now()))
         .await
     {
         Ok(Ok(v)) => response(
