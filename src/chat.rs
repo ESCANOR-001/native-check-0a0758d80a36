@@ -203,6 +203,7 @@ pub struct Chats {
     send: mpsc::Sender<Request>,
     changes: watch::Receiver<u64>,
     setup: crate::agent_setup::ClaudeSetup,
+    pub(crate) activity: crate::activity::Reader,
 }
 impl Chats {
     pub async fn start(db: AuthService, mut config: Config) -> Result<Self, String> {
@@ -218,6 +219,7 @@ impl Chats {
         config.claude.remote_control = switches.desktop_sync;
         let setup =
             crate::agent_setup::ClaudeSetup::new(config.claude.clone(), config.workspace.clone())?;
+        let activity = crate::activity::Reader::new(config.codex.profile.clone());
         let limits = config.storage.clone();
         db.call(move |a| a.store.configure_storage(limits))
             .await??;
@@ -377,6 +379,7 @@ impl Chats {
             send,
             changes,
             setup,
+            activity,
         })
     }
     pub async fn call(

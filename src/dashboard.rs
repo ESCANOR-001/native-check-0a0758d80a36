@@ -194,6 +194,7 @@ fn secure(mut r: Response) -> Response {
 }
 pub(crate) fn routes(app: App) -> Router<App> {
     Router::new()
+        .route("/api/connect/activity", get(activity))
         .route("/api/android-remote", get(status))
         .route(
             "/api/android-remote/claude-code",
@@ -204,6 +205,18 @@ pub(crate) fn routes(app: App) -> Router<App> {
         .route("/api/android-remote/clients/{id}", delete(revoke))
         .route_layer(axum::middleware::from_fn_with_state(app, guard))
         .route("/opencodex-session", get(bootstrap))
+}
+async fn activity(State(app): State<App>) -> Response {
+    let Some(chats) = app.chats else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Select the isolated agent configuration first",
+        );
+    };
+    match chats.activity.read().await {
+        Ok(value) => response(StatusCode::OK, value),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e),
+    }
 }
 async fn guard(State(app): State<App>, req: Request, next: Next) -> Response {
     let Some(d) = &app.dashboard else {

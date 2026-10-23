@@ -1,5 +1,6 @@
 //! Native Connect migration, opt-in and isolated from the production runtime.
 //! Only advertise a capability when its implementation and parity checks exist.
+mod activity;
 pub mod agent;
 mod agent_setup;
 pub mod auth;

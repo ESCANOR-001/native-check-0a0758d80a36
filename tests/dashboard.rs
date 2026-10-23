@@ -142,6 +142,48 @@ async fn agents_dashboard_uses_real_profile_status_and_isolated_preferences() {
         assert!(started.elapsed() < std::time::Duration::from_secs(8));
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    let activity_path = "/api/connect/activity";
+    assert_eq!(
+        call(router.clone(), "GET", activity_path, &[], Value::Null)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            router.clone(),
+            "GET",
+            activity_path,
+            &[("authorization", &format!("Bearer {}", f.phone))],
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let sessions = f._root.path().join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let transcript = sessions.join("test.jsonl");
+    let source=concat!(
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"PRIVATE_THREAD\"}}\n",
+        "{\"type\":\"turn_context\",\"payload\":{\"model\":\"fixture-model\",\"turn_id\":\"PRIVATE_TURN\"}}\n",
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"PRIVATE_TURN\"}}\n"
+    );
+    std::fs::write(&transcript, source).unwrap();
+    let (code, body) = call(router.clone(), "GET", activity_path, &good, Value::Null).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(!body.contains("PRIVATE"));
+    let report: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(report["source"], "native-codex");
+    assert_eq!(report["rows"][0]["model"], "fixture-model");
+    assert_eq!(report["diagnostics"]["configReadOnly"], true);
+    assert_eq!(std::fs::read_to_string(transcript).unwrap(), source);
+    assert_eq!(
+        call(router.clone(), "POST", activity_path, &good, json!({}))
+            .await
+            .0,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
     let (code, body) = call(
         router.clone(),
         "PUT",
