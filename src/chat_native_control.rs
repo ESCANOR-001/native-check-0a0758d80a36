@@ -60,22 +60,43 @@ impl Hub {
             r.client,
             s(&r.params["commandId"])
         );
-        let receipt = self
+        let (command, receipt) = self
             .db
-            .call(move |a| a.store.tool_action(&key))
+            .call(move |a| {
+                Ok::<_, rusqlite::Error>((
+                    a.store.command_digest(&key)?,
+                    a.store.tool_action(&key)?,
+                ))
+            })
             .await?
             .map_err(|_| "Control store unavailable")?;
-        let Some((previous, value)) = receipt else {
+        if command.is_none() && receipt.is_none() {
             // Ordinary prompts may contain attachments. Do not serialize or
             // duplicate their buffers just to check an absent control receipt.
             return Ok(None);
-        };
-        let digest = format!("{:x}", Sha256::digest(r.params.to_string().as_bytes()));
-        if previous == digest {
-            crate::native_control::response(value).map(|_| Some(json!({"sequence":self.seq})))
-        } else {
-            Err("Command ID was already used for different content".into())
         }
+        struct DigestWriter(Sha256);
+        impl std::io::Write for DigestWriter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.update(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut digest = DigestWriter(Sha256::new());
+        serde_json::to_writer(&mut digest, &r.params).map_err(|_| "Invalid command")?;
+        let digest = format!("{:x}", digest.0.finalize());
+        if command.as_ref().is_some_and(|prior| prior != &digest)
+            || receipt.as_ref().is_some_and(|(prior, _)| prior != &digest)
+        {
+            return Err("Command ID was already used for different content".into());
+        }
+        if let Some((_, value)) = receipt {
+            crate::native_control::response(value)?;
+        }
+        Ok(Some(json!({"sequence":self.seq})))
     }
 
     /// Shared settings go through the existing worker, never a new CLI or an

@@ -6,6 +6,8 @@ mod metadata;
 mod native_control;
 #[path = "chat_observer.rs"]
 mod observer;
+#[path = "chat_send_recovery.rs"]
+mod send_recovery;
 #[path = "chat_setup.rs"]
 mod setup;
 #[path = "chat_sync_recovery.rs"]
@@ -1087,6 +1089,7 @@ impl Hub {
         let mut shared_jobs = tokio::task::JoinSet::new();
         let mut shared_reads = HashSet::new();
         let mut shared_sends: HashMap<String, (Instant, u64, Request)> = HashMap::new();
+        let mut claude_sends = send_recovery::Sends::default();
         let mut shared_send_epoch = 0u64;
         let mut previews: HashMap<String, crate::checkpoints::Preview> = HashMap::new();
         let mut capability_waiters: HashMap<String, Vec<oneshot::Sender<Result<Value, String>>>> =
@@ -1168,19 +1171,23 @@ impl Hub {
                     });
                 }
             }
+            claude_sends.refresh(&self);
             tokio::select! {
-                request=receive.recv()=>{
-                    let Some(r)=request else {break};
+                request=async { match claude_sends.pop() { Some(r)=>Some(r), None=>receive.recv().await.map(|r|(r,None)) } }=>{
+                    let Some((r,waiting_token))=request else {break};
+                    if waiting_token.as_ref().is_some_and(|token| !send_recovery::Sends::valid(&self,&r,token)) {
+                        let _=r.reply.send(Err("Connection wait ended or the session changed; your prompt was not sent".into()));continue;
+                    }
                     if r.method=="native.shutdown" {self.shutdown().await; let _=r.reply.send(Ok(json!({})));break;}
                     if r.method=="native.prepareStorage" {
-                        let busy=self.busy_count()>0 || !self.tool_controls.is_empty() || !clone_jobs.is_empty() || !worktree_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !tool_jobs.is_empty() || !shared_sends.is_empty() || !shared_jobs.is_empty() || !discovery.is_empty() || !capability_jobs.is_empty() || !inspections.is_empty() || self.usage_task.is_some() || self.chats.values().any(|c|!c.queue.is_empty() || matches!(s(&c.thread["session"]["status"]),"starting"|"running"|"stopping"));
+                        let busy=self.busy_count()>0 || !self.tool_controls.is_empty() || !clone_jobs.is_empty() || !worktree_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !tool_jobs.is_empty() || !claude_sends.is_empty() || !shared_sends.is_empty() || !shared_jobs.is_empty() || !discovery.is_empty() || !capability_jobs.is_empty() || !inspections.is_empty() || self.usage_task.is_some() || self.chats.values().any(|c|!c.queue.is_empty() || matches!(s(&c.thread["session"]["status"]),"starting"|"running"|"stopping"));
                         let result=if restart_gate.load(Ordering::Acquire)!=2 {Err("storage_mutation_busy".into())}else if busy {Err("codex_busy".into())}else {Ok(json!(self.chats.values().filter(|c|c.agent==AgentKind::Codex && !c.native_id.is_empty() && c.thread["deletedAt"].is_null()).map(|c|c.native_id.clone()).collect::<Vec<_>>()))};
                         let _=r.reply.send(result);continue;
                     }
                     if matches!(r.method.as_str(),"native.prepareRestart"|"native.restartStatus") {
-                        let busy=self.busy_count()>0 || !self.tool_controls.is_empty() || !clone_jobs.is_empty() || !worktree_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !tool_jobs.is_empty() || !shared_sends.is_empty() || self.chats.values().any(|c|!c.queue.is_empty() || matches!(s(&c.thread["session"]["status"]),"starting"|"running"|"stopping"));
+                        let busy=self.busy_count()>0 || !self.tool_controls.is_empty() || !clone_jobs.is_empty() || !worktree_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !tool_jobs.is_empty() || !claude_sends.is_empty() || !shared_sends.is_empty() || self.chats.values().any(|c|!c.queue.is_empty() || matches!(s(&c.thread["session"]["status"]),"starting"|"running"|"stopping"));
                         if r.method=="native.restartStatus" {
-                            let drain_busy=self.busy_count()>0 || !self.tool_controls.is_empty() || !clone_jobs.is_empty() || !worktree_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !tool_jobs.is_empty() || !shared_sends.is_empty() || self.chats.values().any(|c|!c.paused && !c.queue.is_empty());
+                            let drain_busy=self.busy_count()>0 || !self.tool_controls.is_empty() || !clone_jobs.is_empty() || !worktree_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !tool_jobs.is_empty() || !claude_sends.is_empty() || !shared_sends.is_empty() || self.chats.values().any(|c|!c.paused && !c.queue.is_empty());
                             let _=r.reply.send(Ok(json!({"ready":!busy && restart_gate.load(Ordering::Acquire)==0,"drainReady":!drain_busy,"isDraining":restart_gate.load(Ordering::Acquire)==3,"activeTurnCount":self.busy_count()})));continue;
                         }
                         let result=if restart_gate.load(Ordering::Acquire)==0 {Err("Restart reservation is no longer active".into())}else if busy {Err("Finish or stop active tasks and clear queued messages before restarting this bridge".into())}else {Ok(json!({"reserved":true}))};
@@ -1190,7 +1197,7 @@ impl Hub {
                     if r.method=="native.configureClaude" {
                         // Wait for bounded metadata/jobs rather than racing a configuration
                         // change against a CLI launched with the previous setup.
-                        let result = if !discovery.is_empty() || !capability_jobs.is_empty() || !tool_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !worktree_jobs.is_empty() || self.usage_task.is_some() {
+                        let result = if !claude_sends.is_empty() || !discovery.is_empty() || !capability_jobs.is_empty() || !tool_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !worktree_jobs.is_empty() || self.usage_task.is_some() {
                             Err("Wait for agent setup or pending background controls to finish".into())
                         } else {self.configure_claude(&r.params).await};
                         if result.is_ok() && self.claude_enabled && !self.models.contains_key(AgentKind::Claude.instance()) && !to_discover.contains(&AgentKind::Claude) {to_discover.push(AgentKind::Claude);}
@@ -1222,6 +1229,10 @@ impl Hub {
                             Err(error)=>{let _=r.reply.send(Err(error));continue;},
                             Ok(None)=>{},
                         }
+                    }
+                    claude_sends.cancel_for(&r);
+                    if send_recovery::Sends::needs_wait(&self,&r) {
+                        claude_sends.hold(&self,r,waiting_token);continue;
                     }
                     if self.chats.get(s(&r.params["threadId"])).is_some_and(|c|c.external_claude) && ((r.method=="claude.sessionAction" && !["connect","newWorktree"].contains(&s(&r.params["action"])) && !native_control::supported(&r.params["action"])) || r.params.get("promptEdit").is_some()) {
                         // Same outcomes as the TypeScript bridge for Desktop-owned chats.
@@ -1583,6 +1594,7 @@ impl Hub {
                 }
             }
         }
+        claude_sends.shutdown();
         shared_jobs.abort_all();
         while shared_jobs.join_next().await.is_some() {}
         for (_, (_, _, r)) in shared_sends {

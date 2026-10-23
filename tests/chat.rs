@@ -1378,6 +1378,116 @@ async fn hosted_claude_routes_early_start_and_hidden_meta_input_without_dropping
 }
 
 #[tokio::test]
+async fn reconnecting_claude_waits_for_fresh_send_but_stop_and_caller_cancel_never_replay() {
+    for outcome in ["send", "stop", "cancel"] {
+        let mut t = Test::hosted().await;
+        let a = AgentKind::Claude;
+        t.create(a, "send-recovery").await;
+        t.call(a, prompt("send-recovery", "ORIGINAL", "normal"))
+            .await
+            .unwrap();
+        let before = t.wait(a, "send-recovery", "ready").await;
+        t.stop().await;
+        std::fs::write(t.dir.path().join("host-reattach-pause"), "").unwrap();
+        t.hub = Chats::start(t.db.clone(), t.config.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !t.dir.path().join("host-reattach-entered").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // A receipt from before restart must return immediately, even while
+        // a new connection is paused. It cannot occupy the pending-send slot.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            t.call(a, prompt("send-recovery", "ORIGINAL", "normal")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let command = prompt("send-recovery", "AFTER_HANDSHAKE", "normal");
+        let hub = t.hub.clone();
+        let copy = command.clone();
+        let waiting = tokio::spawn(async move {
+            hub.call(a, "phone", "orchestration.dispatchCommand", copy)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the prompt should wait for this same chat instead of returning a worker-limit error"
+        );
+        let status = tokio::time::timeout(
+            Duration::from_secs(1),
+            t.hub.call(
+                a,
+                "phone",
+                "native.claudeSyncStatus",
+                json!({"threadId":"send-recovery"}),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(status["status"], "connecting");
+        assert_eq!(
+            std::fs::read_to_string(t.dir.path().join("host-prompts.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        if outcome == "stop" {
+            t.call(a,json!({"type":"thread.turn.interrupt","threadId":"send-recovery","commandId":"stop-while-connecting"})).await.unwrap();
+            assert!(waiting.await.unwrap().unwrap_err().contains("Stop"));
+        } else if outcome == "cancel" {
+            waiting.abort();
+            assert!(waiting.await.unwrap_err().is_cancelled());
+        } else {
+            std::fs::remove_file(t.dir.path().join("host-reattach-pause")).unwrap();
+            waiting.await.unwrap().unwrap();
+            let after = t.wait(a, "send-recovery", "ready").await;
+            assert_eq!(
+                after["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|m| m["text"] == "AFTER_HANDSHAKE")
+                    .count(),
+                2
+            );
+            for original in before["messages"].as_array().unwrap() {
+                assert!(after["messages"].as_array().unwrap().contains(original));
+            }
+            t.call(a, command).await.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(t.dir.path().join("host-prompts.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+            t.stop().await;
+            continue;
+        }
+        std::fs::remove_file(t.dir.path().join("host-reattach-pause")).unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            std::fs::read_to_string(t.dir.path().join("host-prompts.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(!t.detail(a, "send-recovery").await["messages"]
+            .to_string()
+            .contains("AFTER_HANDSHAKE"));
+        t.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn hosted_claude_remote_turn_during_reattach_cannot_replace_handshake_or_replay_local_prompt()
 {
     let mut test = Test::hosted().await;

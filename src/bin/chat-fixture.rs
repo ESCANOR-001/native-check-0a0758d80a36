@@ -359,6 +359,17 @@ fn main() {
                 )
                 .unwrap();
                 if v["request"]["reattach_session_id"].is_string()
+                    && std::path::Path::new("host-reattach-pause").exists()
+                {
+                    std::fs::write("host-reattach-entered", "").unwrap();
+                    let began = std::time::Instant::now();
+                    while std::path::Path::new("host-reattach-pause").exists()
+                        && began.elapsed() < std::time::Duration::from_secs(8)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+                if v["request"]["reattach_session_id"].is_string()
                     && std::path::Path::new("host-attach-message").exists()
                 {
                     let native = "00000000-0000-4000-8000-000000000031";
