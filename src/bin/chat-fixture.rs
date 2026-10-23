@@ -470,6 +470,11 @@ This came from another Claude session — not typed by your user, but very likel
             out(
                 json!({"type":"control_response","response":{"subtype":"success","request_id":v["request_id"],"response":{"models":[{"value":"test","displayName":"Test","supportsEffort":true,"supportedEffortLevels":["high"]}]}}}),
             );
+            if v["request"]["subtype"] == "stop_task" {
+                assert_eq!(v["request"]["task_id"], "fixture-background");
+                std::fs::write("background-stopped", "STOPPED").unwrap();
+                continue;
+            }
             if v["request"]["subtype"] == "interrupt" {
                 if let Some(waiting) = host_waiting.take() {
                     assert_eq!(v["request"]["cancel_queued"], true);
@@ -546,6 +551,9 @@ This came from another Claude session — not typed by your user, but very likel
                 );
                 std::thread::spawn(|| {
                     for _ in 0..1500 {
+                        if std::path::Path::new("background-stopped").exists() {
+                            return;
+                        }
                         if std::path::Path::new("background-release").exists() {
                             std::fs::write("background-finished", "TOOL_REALLY_FINISHED").unwrap();
                             out(

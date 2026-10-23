@@ -500,6 +500,7 @@ struct Worker {
     claude_router: Option<crate::claude_turns::Router>,
     claude_background: crate::claude_background::Tasks,
     claude_deferred_result: Option<Value>,
+    claude_stop: Option<crate::claude_background::StopSequence>,
     local_turn: Option<ClaudeLocalTurn>,
     recovering: bool,
     observer: Option<observer::State>,
@@ -553,6 +554,7 @@ struct Hub {
 }
 pub(crate) fn finish(chat: &mut Chat, state: &str, error: Option<&str>) {
     chat.pending_message = Value::Null;
+    chat.external_stop = None;
     let t = &mut chat.thread;
     t["session"]["status"] = json!(if state == "completed" { "ready" } else { state });
     t["session"]["activeTurnId"] = Value::Null;
@@ -712,6 +714,7 @@ impl Hub {
                 claude_router: None,
                 claude_background: Default::default(),
                 claude_deferred_result: None,
+                claude_stop: None,
                 local_turn: None,
                 recovering: false,
                 observer: None,
@@ -2911,7 +2914,8 @@ impl Hub {
                     }
                     // Receipt precedes control delivery, so reconnect cannot repeat a stop.
                     self.chats.get_mut(&id).unwrap().paused = true;
-                    let stop_id = observer::record_stop(self.chats.get_mut(&id).unwrap());
+                    let background = self.background_tasks(&id)?;
+                    let stop_id = observer::record_stop(self.chats.get_mut(&id).unwrap(), background.stop_targets());
                     self.save(&id, receipt).await?;
                     let w = self.active.get_mut(&id).unwrap();
                     w.stopping = true;
@@ -2919,7 +2923,11 @@ impl Hub {
                     let request = if agent == AgentKind::Codex {
                         json!({"id":"stop","method":"turn/interrupt","params":{"threadId":self.chats[&id].native_id,"turnId":w.native_turn}})
                     } else {
-                        json!({"type":"control_request","request_id":stop_id,"request":{"subtype":"interrupt","cancel_queued":w.claude_router.is_some()}})
+                        let interrupt = json!({"type":"control_request","request_id":stop_id,"request":{"subtype":"interrupt","cancel_queued":w.claude_router.is_some()}});
+                        let sequence = crate::claude_background::StopSequence::new(self.chats[&id].external_stop.as_ref().unwrap().background.clone(), interrupt);
+                        let request = sequence.first(&background)?;
+                        w.claude_stop = Some(sequence);
+                        request
                     };
                     if w.stage != "running" {
                         self.end(&id, "interrupted", None).await;
@@ -3334,6 +3342,7 @@ impl Hub {
                 claude_router: hosted.then(Default::default),
                 claude_background: Default::default(),
                 claude_deferred_result: None,
+                claude_stop: None,
                 local_turn: None,
                 recovering,
                 observer: None,
@@ -3492,8 +3501,9 @@ impl Hub {
             return Err("Choose Approve once, Decline or Cancel turn in this experiment".into());
         }
         let cancel = decision == "cancel";
+        let background = self.background_tasks(id)?;
         let stop_id = if cancel {
-            observer::record_stop(self.chats.get_mut(id).unwrap())
+            observer::record_stop(self.chats.get_mut(id).unwrap(), background.stop_targets())
         } else {
             String::new()
         };
@@ -3518,7 +3528,22 @@ impl Hub {
             .map_err(|_| "Approval response could not be delivered; it was not retried")?;
         w.requests.remove(rid);
         if cancel && self.chats[id].agent == AgentKind::Claude {
-            w.connection.send(&json!({"type":"control_request","request_id":stop_id,"request":{"subtype":"interrupt","cancel_queued":w.claude_router.is_some()}})).await.map_err(|_|"CLI disconnected while cancelling")?;
+            let interrupt = json!({"type":"control_request","request_id":stop_id,"request":{"subtype":"interrupt","cancel_queued":w.claude_router.is_some()}});
+            let sequence = crate::claude_background::StopSequence::new(
+                self.chats[id]
+                    .external_stop
+                    .as_ref()
+                    .unwrap()
+                    .background
+                    .clone(),
+                interrupt,
+            );
+            let request = sequence.first(&background)?;
+            w.claude_stop = Some(sequence);
+            w.connection
+                .send(&request)
+                .await
+                .map_err(|_| "CLI disconnected while cancelling")?;
         }
         let chat = self.chats.get_mut(id).unwrap();
         if allowed && original["request"]["tool_name"] == "ExitPlanMode" {
@@ -3597,6 +3622,14 @@ impl Hub {
                 );
                 self.complete_native_control(&id).await;
                 return Ok(());
+            }
+            if let Some(stop) = &self.chats[&id].external_stop {
+                let w = self.active.get_mut(&id).unwrap();
+                if let Some(router) = &mut w.claude_router {
+                    router.acknowledge_task_stop(&v, &stop.background);
+                } else {
+                    w.claude_background.acknowledge_stop(&v, &stop.background);
+                }
             }
             let cid = id.clone();
             let frame = v.clone();
@@ -4526,6 +4559,11 @@ impl Hub {
             .map_err(|_| "Could not save streamed history")?;
         chat.thread = saved["thread"].clone();
         self.db.call(|a| a.store.check_history(0)).await??;
+        if !codex {
+            self.advance_task_stop(&id, &v).await?;
+        }
+        let w = self.active.get_mut(&id).unwrap();
+        let chat = self.chats.get_mut(&id).unwrap();
         let completed = if codex {
             v["method"] == "turn/completed"
         } else {
@@ -4769,6 +4807,7 @@ impl Hub {
         w.requests.clear();
         w.steers.clear();
         w.stopping = false;
+        w.claude_stop = None;
         w.deadline = None;
         if let Some(local) = &w.local_turn {
             chat.thread["latestTurn"] = local.latest.clone();

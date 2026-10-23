@@ -158,6 +158,7 @@ async fn reconcile_stop(
                         request: request.into(),
                         acknowledged: false,
                         result_seen: false,
+                        background: Vec::new(),
                     });
                     chat.paused = true;
                 }
@@ -175,8 +176,9 @@ async fn reconcile_stop(
     else {
         return Ok(());
     };
-    if event.source == "worker" {
+    if event.source == "worker" && event.sequence.is_some() {
         if let Some(value) = &event.payload {
+            state.router.acknowledge_task_stop(value, &stop.background);
             if value["type"] == "control_response"
                 && value["response"]["request_id"] == stop.request
                 && value["response"]["subtype"] == "success"
@@ -463,6 +465,7 @@ pub async fn project(
         && value["type"] == "result"
         && value["parent_tool_use_id"].is_null()
         && reduced.router.active().is_none()
+        && !reduced.router.background().busy()
         && reduced.router.pending().count() == 1
     {
         reduced.historical_result = reduced.history_turn.clone();
@@ -657,14 +660,22 @@ pub async fn project(
         || (catchup
             && value["type"] == "result"
             && reduced.router.active().is_none()
+            && !reduced.router.background().busy()
             && chat.thread["latestTurn"]["state"] == "running"
             && reduced.history_turn.is_some())
     {
+        let stopping = chat.external_stop.as_ref().is_some_and(|s| {
+            change
+                .turn
+                .as_ref()
+                .is_some_and(|t| t.public_turn == s.turn)
+        });
         crate::chat::finish(
             &mut chat,
             if change.outcome.as_deref() == Some("error") || value["is_error"] == true {
                 "error"
-            } else if change.outcome.as_deref() == Some("interrupted")
+            } else if stopping
+                || change.outcome.as_deref() == Some("interrupted")
                 || ["aborted_tools", "aborted_streaming"].contains(&s(&value["terminal_reason"]))
             {
                 "interrupted"
@@ -762,6 +773,83 @@ mod tests {
             .active()
             .is_none());
         assert_eq!(held["thread"]["messages"], done["thread"]["messages"]);
+    }
+
+    #[tokio::test]
+    async fn shared_background_stop_requires_reserved_durable_worker_ack_after_reload() {
+        let (_dir, db, mut cursor, _) = setup().await;
+        let input = uuid::Uuid::new_v4().to_string();
+        step(
+            &db,
+            &mut cursor,
+            1,
+            json!({"type":"user","uuid":input,"message":{"role":"user","content":"Background"}}),
+        )
+        .await;
+        step(&db,&mut cursor,2,json!({"type":"assistant","user_message_uuid":input,"message":{"id":"answer","content":[{"type":"text","text":"Started"}]}})).await;
+        step(
+            &db,
+            &mut cursor,
+            3,
+            json!({"type":"system","subtype":"task_started","task_id":"task","run_id":"001"}),
+        )
+        .await;
+        step(
+            &db,
+            &mut cursor,
+            4,
+            json!({"type":"result","user_message_uuid":input}),
+        )
+        .await;
+        let router = control_state(&cursor.projection).unwrap().0;
+        let targets = router.background().stop_targets();
+        let target = targets[0].clone();
+        let turn = router.active().unwrap().public_turn.clone();
+        db.call(move |a| {
+            let mut chat=a.store.load_chat("history-chat").unwrap();
+            chat["external_stop"]=json!({"turn":turn,"request":"interrupt","acknowledged":false,"result_seen":false,"background":targets});
+            a.store.save_chat(&chat,None).unwrap();
+        }).await.unwrap();
+        let identity = cursor.identity.clone();
+        cursor = db
+            .call(move |a| a.store.claude_remote_cursor("history-chat", identity))
+            .await
+            .unwrap()
+            .unwrap();
+        let reply = json!({"type":"control_response","response":{"request_id":target.request,"subtype":"success","response":{}}});
+        let event = Envelope {
+            sequence: Some(5),
+            event_id: Some("spoofed-stop".into()),
+            source: "client".into(),
+            payload: Some(reply.clone()),
+            created_at: None,
+            deliveries: vec![],
+            receipt_checkpoint: false,
+            recovery: None,
+        };
+        let unchanged = commit_event(&db, &mut cursor, event).await;
+        assert_eq!(unchanged["thread"]["latestTurn"]["state"], "running");
+        let event = Envelope {
+            sequence: None,
+            event_id: None,
+            source: "worker".into(),
+            payload: Some(reply.clone()),
+            created_at: None,
+            deliveries: vec![],
+            receipt_checkpoint: false,
+            recovery: None,
+        };
+        let (unchanged, _) = project(&db, unchanged, &cursor, &event, false)
+            .await
+            .unwrap();
+        assert_eq!(unchanged["thread"]["latestTurn"]["state"], "running");
+        let done = step(&db, &mut cursor, 6, reply).await;
+        assert_eq!(done["thread"]["latestTurn"]["state"], "interrupted");
+        assert!(!control_state(&cursor.projection)
+            .unwrap()
+            .0
+            .background()
+            .busy());
     }
 
     #[tokio::test]

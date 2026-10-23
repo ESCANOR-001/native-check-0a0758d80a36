@@ -13,9 +13,14 @@ pub(crate) struct StopIntent {
     pub request: String,
     pub acknowledged: bool,
     pub result_seen: bool,
+    #[serde(default)]
+    pub background: Vec<crate::claude_background::StopTarget>,
 }
-pub(super) fn record_stop(chat: &mut Chat) -> String {
-    if !chat.external_claude {
+pub(super) fn record_stop(
+    chat: &mut Chat,
+    targets: Vec<crate::claude_background::StopTarget>,
+) -> String {
+    if chat.agent != AgentKind::Claude {
         return "stop".into();
     }
     let request = format!("remodex-stop-{}", uuid::Uuid::new_v4());
@@ -24,11 +29,50 @@ pub(super) fn record_stop(chat: &mut Chat) -> String {
         request: request.clone(),
         acknowledged: false,
         result_seen: false,
+        background: targets,
     });
     request
 }
 
 impl Hub {
+    pub(super) fn background_tasks(
+        &self,
+        id: &str,
+    ) -> Result<crate::claude_background::Tasks, String> {
+        let worker = self.active.get(id).ok_or("Claude worker disconnected")?;
+        if let Some(observer) = &worker.observer {
+            let (router, _) = crate::claude_history::control_state(&observer.cursor.projection)?;
+            Ok(router.background().clone())
+        } else if let Some(router) = &worker.claude_router {
+            Ok(router.background().clone())
+        } else {
+            Ok(worker.claude_background.clone())
+        }
+    }
+    /// Called only for original worker replies, after their state is durable.
+    pub(super) async fn advance_task_stop(
+        &mut self,
+        id: &str,
+        frame: &Value,
+    ) -> Result<(), String> {
+        if !self
+            .active
+            .get(id)
+            .is_some_and(|w| w.stopping && w.claude_stop.is_some())
+        {
+            return Ok(());
+        }
+        let tasks = self.background_tasks(id)?;
+        let w = self.active.get_mut(id).unwrap();
+        if let Some(request) = w.claude_stop.as_mut().unwrap().reply(frame, &tasks)? {
+            w.deadline = Some(Instant::now() + Duration::from_secs(10));
+            w.connection
+                .send(&request)
+                .await
+                .map_err(|_| "Background Stop delivery is uncertain; it was not replayed")?;
+        }
+        Ok(())
+    }
     pub(super) async fn connect_external_claude(
         &mut self,
         agent: AgentKind,
@@ -170,6 +214,7 @@ impl Hub {
                 claude_router: None,
                 claude_background: Default::default(),
                 claude_deferred_result: None,
+                claude_stop: None,
                 local_turn: None,
                 recovering: true,
                 observer: Some(State {
@@ -457,6 +502,7 @@ impl Hub {
             if w.stage == "idle" {
                 w.deadline = None;
                 w.stopping = false;
+                w.claude_stop = None;
                 w.steers.clear();
             }
         }
@@ -468,6 +514,11 @@ impl Hub {
             None
         };
         self.chats.insert(id.into(), next);
+        if event.source == "worker" && event.sequence.is_some() {
+            if let Some(payload) = &event.payload {
+                self.advance_task_stop(id, payload).await?;
+            }
+        }
         if let (Some(intent), Some(payload)) =
             (&self.chats[id].native_control, event.payload.as_ref())
         {

@@ -1283,6 +1283,59 @@ async fn claude_background_tools_finish_before_queue_and_do_not_get_killed_at_fo
 }
 
 #[tokio::test]
+async fn claude_stop_ends_background_task_without_releasing_queue_or_waiting_for_notification() {
+    for hosted in [false, true] {
+        let t = if hosted {
+            Test::hosted().await
+        } else {
+            Test::new().await
+        };
+        let a = AgentKind::Claude;
+        t.create(a, "background-stop").await;
+        t.call(a, prompt("background-stop", "background-fixture", "normal"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let d = t.detail(a, "background-stop").await;
+                if d["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["text"] == "FOREGROUND_COMPLETE")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        t.call(a, prompt("background-stop", "MUST_REMAIN_QUEUED", "queue"))
+            .await
+            .unwrap();
+        let stop = json!({"type":"thread.turn.interrupt","threadId":"background-stop","commandId":"stop-once"});
+        t.call(a, stop.clone()).await.unwrap();
+        let done = t.wait(a, "background-stop", "interrupted").await;
+        t.call(a, stop).await.unwrap();
+        assert_eq!(done["latestTurn"]["state"], "interrupted");
+        assert_eq!(
+            std::fs::read_to_string(t.dir.path().join("background-stopped")).unwrap(),
+            "STOPPED"
+        );
+        std::fs::write(t.dir.path().join("background-release"), "finish").unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!t.dir.path().join("background-finished").exists());
+        assert!(!done["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "assistant" && m["text"] == "MUST_REMAIN_QUEUED"));
+        t.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn android_folder_picker_legacy_model_placeholder_uses_each_agents_default() {
     let t = Test::new().await;
     for (agent, id) in [

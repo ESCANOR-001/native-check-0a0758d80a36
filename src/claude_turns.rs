@@ -178,6 +178,16 @@ pub struct Router {
     deferred_completion: Option<Change>,
 }
 impl Router {
+    pub(crate) fn background(&self) -> &crate::claude_background::Tasks {
+        &self.background
+    }
+    pub(crate) fn acknowledge_task_stop(
+        &mut self,
+        frame: &Value,
+        targets: &[crate::claude_background::StopTarget],
+    ) {
+        self.background.acknowledge_stop(frame, targets);
+    }
     /// Claude emits a user-role control notice after a rejected tool, without
     /// a synthetic flag. It is not a prompt and must not consume a worker slot.
     /// Explicit human input and already registered input IDs stay untouched.
