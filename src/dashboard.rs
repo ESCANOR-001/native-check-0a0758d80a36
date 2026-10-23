@@ -199,6 +199,7 @@ pub(crate) fn routes(app: App) -> Router<App> {
         .route("/api/storage/cleanup/preview", post(storage_preview))
         .route("/api/storage/trash", get(storage_trash))
         .route("/api/system/memory", get(memory))
+        .route("/api/stop", post(stop))
         .route("/api/android-remote", get(status))
         .route(
             "/api/android-remote/claude-code",
@@ -209,6 +210,34 @@ pub(crate) fn routes(app: App) -> Router<App> {
         .route("/api/android-remote/clients/{id}", delete(revoke))
         .route_layer(axum::middleware::from_fn_with_state(app, guard))
         .route("/opencodex-session", get(bootstrap))
+}
+async fn stop(State(app): State<App>, headers: HeaderMap) -> Response {
+    if let Some(raw) = headers.get("x-opencodex-expected-pid") {
+        let pid = raw
+            .to_str()
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|n| *n > 0);
+        let Some(pid) = pid else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "Invalid expected bridge process ID",
+            );
+        };
+        if pid != std::process::id() {
+            return error(
+                StatusCode::CONFLICT,
+                "The bridge process changed; refresh the dashboard",
+            );
+        }
+    }
+    // This experiment has no service supervisor. Stop only this process through
+    // the same durable cleanup as an OS signal; never locate or stop a service.
+    let already_stopping = app.stopping.send_replace(true);
+    response(
+        StatusCode::OK,
+        json!({"success":true,"message":"Stopping this bridge","alreadyStopping":already_stopping}),
+    )
 }
 async fn activity(State(app): State<App>) -> Response {
     let Some(chats) = app.chats else {
@@ -294,6 +323,9 @@ async fn guard(State(app): State<App>, req: Request, next: Next) -> Response {
     };
     if !d.allows(&origin, req.headers(), req.method(), auth::now()) {
         return error(StatusCode::UNAUTHORIZED, "Dashboard session required");
+    }
+    if *app.stopping.borrow() && req.uri().path() != "/api/stop" {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "Bridge is stopping");
     }
     secure(next.run(req).await)
 }

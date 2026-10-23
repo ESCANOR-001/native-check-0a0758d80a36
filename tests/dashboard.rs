@@ -1111,3 +1111,79 @@ async fn stored_awake_preference_survives_restart_without_changing_phone_control
         false
     );
 }
+
+#[tokio::test]
+async fn stop_requires_local_csrf_rejects_stale_process_and_preserves_pairing() {
+    let f = setup();
+    let router = f.app.clone().router();
+    let (token, csrf) = session(router.clone()).await;
+    let headers = [
+        ("x-opencodex-api-key", token.as_str()),
+        ("x-opencodex-gui-origin", "http://localhost:18900"),
+        ("origin", "http://localhost:18900"),
+        ("x-opencodex-csrf-token", csrf.as_str()),
+    ];
+    for h in [
+        vec![],
+        vec![("authorization", f.phone.as_str())],
+        headers[..3].to_vec(),
+    ] {
+        assert_eq!(
+            call(router.clone(), "POST", "/api/stop", &h, json!({}))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(!*f.app.stopping.borrow());
+    }
+    for (pid, code) in [
+        ("invalid", StatusCode::BAD_REQUEST),
+        ("0", StatusCode::BAD_REQUEST),
+        ("4294967295", StatusCode::CONFLICT),
+    ] {
+        let mut h = headers.to_vec();
+        h.push(("x-opencodex-expected-pid", pid));
+        assert_eq!(
+            call(router.clone(), "POST", "/api/stop", &h, json!({}))
+                .await
+                .0,
+            code
+        );
+        assert!(!*f.app.stopping.borrow());
+    }
+    assert_eq!(
+        call(router.clone(), "GET", "/api/stop", &headers, Value::Null)
+            .await
+            .0,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    for already in [false, true] {
+        let (code, body) = call(router.clone(), "POST", "/api/stop", &headers, json!({})).await;
+        assert_eq!(code, StatusCode::OK);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["success"], true);
+        assert_eq!(v["alreadyStopping"], already);
+        assert!(*f.app.stopping.borrow());
+    }
+    for path in [
+        "/api/android-remote",
+        "/api/auth/session",
+        "/healthz",
+        "/api/system/memory",
+    ] {
+        assert_eq!(
+            call(router.clone(), "GET", path, &headers, Value::Null)
+                .await
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    let client = f.client;
+    assert!(f
+        .app
+        .auth
+        .call(move |a| a.authorized(&client, auth::now()))
+        .await
+        .unwrap()
+        .unwrap());
+}

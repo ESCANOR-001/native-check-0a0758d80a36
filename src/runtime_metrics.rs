@@ -59,20 +59,21 @@ fn memory() -> Option<(u64, Option<u64>)> {
 }
 #[cfg(target_os = "macos")]
 fn memory() -> Option<(u64, Option<u64>)> {
-    let mut info: libc::mach_task_basic_info = unsafe { std::mem::zeroed() };
-    let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
-    // Kernel writes exactly this ABI struct after checking the supplied count.
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // libproc returns the written byte count. Query this process only and reject
+    // partial structures; no Mach port or privileged task handle is needed.
     let result = unsafe {
-        libc::task_info(
-            libc::mach_task_self(),
-            libc::MACH_TASK_BASIC_INFO,
-            (&mut info as *mut libc::mach_task_basic_info).cast(),
-            &mut count,
+        libc::proc_pidinfo(
+            std::process::id() as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&mut info as *mut libc::proc_taskinfo).cast(),
+            size,
         )
     };
-    let rss = info.resident_size;
-    (result == libc::KERN_SUCCESS && count == libc::MACH_TASK_BASIC_INFO_COUNT && rss > 0)
-        .then_some((rss, None))
+    let rss = info.pti_resident_size;
+    (result == size && rss > 0).then_some((rss, None))
 }
 #[cfg(windows)]
 fn memory() -> Option<(u64, Option<u64>)> {

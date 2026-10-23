@@ -116,7 +116,8 @@ async fn phone_control_guard(
     next: axum::middleware::Next,
 ) -> Response {
     async fn available(app: &App) -> bool {
-        matches!(app.auth.call(|a| a.control_enabled()).await, Ok(Ok(true)))
+        !*app.stopping.borrow()
+            && matches!(app.auth.call(|a| a.control_enabled()).await, Ok(Ok(true)))
     }
     fn disabled() -> Response {
         // A disabled listener is temporary unavailability, never revocation.
@@ -154,10 +155,11 @@ fn descriptor() -> Value {
     json!({"policy":"remote-reachable","bootstrapMethods":["one-time-token"],
         "sessionMethods":["bearer-access-token"],"sessionCookieName":"ocx_android_session"})
 }
-async fn health() -> Json<Value> {
-    Json(
-        json!({"status":"running","service":"remodex-native-connect-experiment","version":"0.0.0-native-experiment","migrationComplete":false}),
-    )
+async fn health(State(app): State<App>) -> Response {
+    let stopping = *app.stopping.borrow();
+    (if stopping { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK }, Json(
+        json!({"status":if stopping {"stopping"} else {"running"},"service":"remodex-native-connect-experiment","version":"0.0.0-native-experiment","migrationComplete":false}),
+    )).into_response()
 }
 async fn environment(State(app): State<App>) -> Json<Value> {
     Json(environment_descriptor(&app))
@@ -421,6 +423,9 @@ async fn serve_socket(mut socket: WebSocket, app: App, client: String, agent: Ag
     let _online = crate::dashboard::Online::new(app.online.clone(), client.clone());
     let mut check = tokio::time::interval(Duration::from_secs(1));
     let mut stopping = app.stopping.subscribe();
+    if *stopping.borrow() {
+        return;
+    }
     let mut changes = app.chats.as_ref().map(Chats::subscribe);
     let mut subscription: Option<(Value, String, Value)> = None;
     loop {
@@ -556,6 +561,9 @@ pub(crate) async fn not_implemented() -> Response {
 }
 
 async fn authorized(app: &App, client: &str) -> bool {
+    if *app.stopping.borrow() {
+        return false;
+    }
     let client = client.to_owned();
     matches!(
         app.auth

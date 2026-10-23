@@ -45,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chats = app.chats.clone();
     let shutdown_chats = chats.clone();
     let shutdown_signal = app.stopping.clone();
+    let mut requested_stop = shutdown_signal.subscribe();
     println!(
         "{}",
         serde_json::json!({"ready":true,"address":listener.local_addr()?.to_string(),
@@ -56,7 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        stopping.await;
+        tokio::select! {
+            _ = stopping => {},
+            _ = requested_stop.wait_for(|requested| *requested) => {},
+        }
         shutdown_signal.send_replace(true);
         if let Some(chats) = shutdown_chats {
             let _ = chats
