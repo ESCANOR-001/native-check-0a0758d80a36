@@ -276,16 +276,16 @@ async fn status(State(app): State<App>) -> Response {
         .lock()
         .map(|v| v.keys().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
-    let state = app.auth.call(move |a| -> rusqlite::Result<(bool, Vec<Value>)> {
+    let state = app.auth.call(move |a| -> rusqlite::Result<(bool, bool, Vec<Value>)> {
         // Expired credentials still need a visible repair/revoke action. Never
         // hide the phone precisely when its authorization needs replacement.
         let mut stmt = a.store.db.prepare("SELECT id,label,os,created_at FROM clients ORDER BY created_at DESC LIMIT 128")?;
         let clients = stmt.query_map([], |r| { let id:String=r.get(0)?;let created:i64=r.get(3)?;
             Ok(json!({"id":id,"label":r.get::<_,String>(1)?,"os":r.get::<_,String>(2)?,"deviceType":"mobile", "createdAt":auth::timestamp(created),"scopes":auth::SCOPES.split(' ').collect::<Vec<_>>(),"online":online.contains(&id)}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((a.control_enabled()?, clients))
+        Ok((a.control_enabled()?, a.keep_awake()?, clients))
     }).await;
-    let Ok(Ok((enabled, clients))) = state else {
+    let Ok(Ok((enabled, keep_awake, clients))) = state else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "Pairing store unavailable");
     };
     let d = app.dashboard.as_ref().unwrap();
@@ -298,7 +298,7 @@ async fn status(State(app): State<App>) -> Response {
     };
     response(
         StatusCode::OK,
-        json!({"version":1,"controlEnabled":enabled,"keepAwake":false,"localNetworkEnabled":true,
+        json!({"version":1,"controlEnabled":enabled,"keepAwake":keep_awake,"localNetworkEnabled":true,
         "connectionChoice":"local","pairingAvailable":enabled,"gateway":{"status":if enabled {"ready"} else {"stopped"},"backgroundServer":"current-process","port":d.port},
         "reachableAddresses":[d.public_url],"tunnel":{"configuration":{"mode":"quick","hasNamedTunnelToken":false},"runtime":{"mode":"quick","status":"stopped","publicUrl":null,"error":null}},
         "desktop":{"id":"desktop","label":app.label,"platform":platform,"address":d.public_url,"online":true},"clients":clients}),
@@ -472,25 +472,28 @@ async fn settings(State(app): State<App>, Json(body): Json<Value>) -> Response {
     }
     // Validate the whole update before persisting anything. Unsupported actions
     // must not appear successful or partially disable a working phone.
-    if body["keepAwake"] == true
-        || body["localNetworkEnabled"] == false
+    if body["localNetworkEnabled"] == false
         || object.get("connectionChoice").is_some_and(|v| v != "local")
     {
         return error(
             StatusCode::NOT_IMPLEMENTED,
-            "Sleep prevention and tunnel settings are not migrated yet; no settings changed",
+            "Tunnel and local-network controls are not migrated yet; no settings changed",
         );
     }
-    if let Some(enabled) = body["controlEnabled"].as_bool() {
-        if !matches!(
-            app.auth.call(move |a| a.set_control_enabled(enabled)).await,
+    let enabled = body["controlEnabled"].as_bool();
+    let keep_awake = body["keepAwake"].as_bool();
+    if (enabled.is_some() || keep_awake.is_some())
+        && !matches!(
+            app.auth
+                .call(move |a| a.set_control_settings(enabled, keep_awake))
+                .await,
             Ok(Ok(()))
-        ) {
-            return error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Cannot save phone control settings",
-            );
-        }
+        )
+    {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Cannot save phone control settings",
+        );
     }
     status(State(app)).await
 }

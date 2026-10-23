@@ -262,28 +262,48 @@ impl Auth {
             .then_some(ticket.client))
     }
     pub fn control_enabled(&self) -> rusqlite::Result<bool> {
+        self.bool_setting("phone_control_enabled", true)
+    }
+    /// This matches the existing dashboard's stored preference. It does not
+    /// install an operating-system sleep inhibitor.
+    pub fn keep_awake(&self) -> rusqlite::Result<bool> {
+        self.bool_setting("keep_awake", false)
+    }
+    fn bool_setting(&self, key: &str, default: bool) -> rusqlite::Result<bool> {
         use rusqlite::OptionalExtension;
         let value: Option<String> = self
             .store
             .db
-            .query_row(
-                "SELECT value FROM metadata WHERE key='phone_control_enabled'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT value FROM metadata WHERE key=?1", [key], |r| {
+                r.get(0)
+            })
             .optional()?;
         match value.as_deref() {
-            None | Some("true") => Ok(true),
+            None => Ok(default),
+            Some("true") => Ok(true),
             Some("false") => Ok(false),
             _ => Err(rusqlite::Error::InvalidQuery),
         }
     }
     pub fn set_control_enabled(&mut self, enabled: bool) -> rusqlite::Result<()> {
-        self.store.db.execute(
-            "INSERT INTO metadata(key,value) VALUES ('phone_control_enabled',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [if enabled { "true" } else { "false" }],
-        )?;
-        if !enabled {
+        self.set_control_settings(Some(enabled), None)
+    }
+    pub fn set_control_settings(
+        &mut self,
+        enabled: Option<bool>,
+        keep_awake: Option<bool>,
+    ) -> rusqlite::Result<()> {
+        let tx = self.store.db.transaction()?;
+        for (key, value) in [
+            ("phone_control_enabled", enabled),
+            ("keep_awake", keep_awake),
+        ] {
+            if let Some(value) = value {
+                tx.execute("INSERT INTO metadata(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key, if value {"true"} else {"false"}])?;
+            }
+        }
+        tx.commit()?;
+        if enabled == Some(false) {
             self.invitations.clear();
             self.tickets.clear();
             self.recovery.clear();

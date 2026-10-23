@@ -635,7 +635,7 @@ async fn persisted_disable_revokes_pending_capabilities_without_erasing_paired_p
         .unwrap()
         .unwrap();
     for bad in [
-        json!({"controlEnabled":false,"keepAwake":true}),
+        json!({"controlEnabled":false,"keepAwake":true,"connectionChoice":"quick"}),
         json!({"controlEnabled":false,"connectionChoice":"named"}),
         json!({"controlEnabled":false,"localNetworkEnabled":false}),
     ] {
@@ -897,4 +897,83 @@ async fn disabling_phone_control_closes_live_socket_and_status_tracks_real_prese
         false
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn stored_awake_preference_survives_restart_without_changing_phone_control() {
+    let f = setup();
+    let router = f.app.clone().router();
+    let (token, csrf) = session(router.clone()).await;
+    let headers = [
+        ("x-opencodex-api-key", token),
+        ("x-opencodex-gui-origin", "http://localhost:18900".into()),
+        ("x-opencodex-csrf-token", csrf),
+        ("origin", "http://localhost:18900".into()),
+    ];
+    let h = headers
+        .iter()
+        .map(|(k, v)| (*k, v.as_str()))
+        .collect::<Vec<_>>();
+    let before = call(
+        router.clone(),
+        "GET",
+        "/api/android-remote",
+        &h,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(before.0, StatusCode::OK);
+    let before: Value = serde_json::from_str(&before.1).unwrap();
+    assert_eq!(before["keepAwake"], false);
+    let changed = call(
+        router.clone(),
+        "PUT",
+        "/api/android-remote/settings",
+        &h,
+        json!({"keepAwake":true}),
+    )
+    .await;
+    assert_eq!(changed.0, StatusCode::OK);
+    let changed: Value = serde_json::from_str(&changed.1).unwrap();
+    assert_eq!(changed["keepAwake"], true);
+    assert_eq!(changed["clients"], before["clients"]);
+    assert_eq!(changed["controlEnabled"], true);
+    let reopened = Auth::new(Store::open(&f._root.path().join("state")).unwrap());
+    assert!(reopened.keep_awake().unwrap());
+    assert!(reopened.control_enabled().unwrap());
+    // A storage failure must roll back the whole update, including auth state.
+    let disk =
+        rusqlite::Connection::open(f._root.path().join("state/native-connect.sqlite")).unwrap();
+    disk.execute_batch("CREATE TRIGGER fail_awake BEFORE UPDATE ON metadata WHEN NEW.key='keep_awake' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+    let failed = call(
+        router.clone(),
+        "PUT",
+        "/api/android-remote/settings",
+        &h,
+        json!({"controlEnabled":false,"keepAwake":false}),
+    )
+    .await;
+    assert_eq!(failed.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(f
+        .app
+        .auth
+        .call(|a| a.control_enabled())
+        .await
+        .unwrap()
+        .unwrap());
+    assert!(f.app.auth.call(|a| a.keep_awake()).await.unwrap().unwrap());
+    disk.execute_batch("DROP TRIGGER fail_awake").unwrap();
+    let reset = call(
+        router,
+        "PUT",
+        "/api/android-remote/settings",
+        &h,
+        json!({"keepAwake":false}),
+    )
+    .await;
+    assert_eq!(reset.0, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<Value>(&reset.1).unwrap()["keepAwake"],
+        false
+    );
 }
