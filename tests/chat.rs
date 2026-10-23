@@ -184,6 +184,200 @@ async fn idle_restart_reservation_rejects_active_or_queued_tasks_and_releases_on
     }
 }
 
+fn drain_app(t: &Test) -> remodex_connect_native::server::App {
+    use std::sync::{atomic::AtomicBool, Arc};
+    let mut app = remodex_connect_native::server::App::new(
+        Auth::new(Store::open(t.dir.path()).unwrap()),
+        "drain fixture",
+    )
+    .unwrap();
+    app.chats = Some(t.hub.clone());
+    app.restart = Some(Arc::new(AtomicBool::new(true)));
+    app
+}
+
+#[tokio::test]
+async fn draining_allows_approval_and_existing_queue_but_rejects_new_work() {
+    for hosted in [false, true] {
+        for a in [AgentKind::Codex, AgentKind::Claude] {
+            let t = if hosted {
+                Test::hosted().await
+            } else {
+                Test::new().await
+            };
+            t.create(a, "drain").await;
+            t.call(a, prompt("drain", "approval", "normal"))
+                .await
+                .unwrap();
+            let rid = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let d = t.detail(a, "drain").await;
+                    if let Some(v) = d["activities"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|v| v["kind"] == "approval.requested")
+                    {
+                        break v["payload"]["requestId"].clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            t.call(a, prompt("drain", "QUEUED_BEFORE_DRAIN", "queue"))
+                .await
+                .unwrap();
+            let (reservation, state) = t.hub.prepare_drain().await.unwrap();
+            assert_eq!(state["activeTurnCount"], 1);
+            assert_eq!(state["drainReady"], false);
+            assert!(t.hub.prepare_restart().await.is_err());
+            assert!(t.hub.prepare_drain().await.is_err());
+            for mode in ["normal", "queue", "steer"] {
+                assert!(t
+                    .call(a, prompt("drain", "FORBIDDEN_DURING_DRAIN", mode))
+                    .await
+                    .unwrap_err()
+                    .contains("restarting"));
+            }
+            let app = drain_app(&t);
+            let finishing = tokio::spawn(remodex_connect_native::restart_drain::finish(
+                app.clone(),
+                Some(reservation),
+                Duration::from_secs(8),
+            ));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!*app.stopping.borrow());
+            assert!(!finishing.is_finished());
+            t.call(a,json!({"type":"thread.approval.respond","threadId":"drain","commandId":"approve-drain","requestId":rid,"decision":"approved"})).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(7), finishing)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(*app.stopping.borrow());
+            let done = t.detail(a, "drain").await;
+            assert_eq!(done["session"]["status"], "ready");
+            let messages = done["messages"].as_array().unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|m| m["text"] == "QUEUED_BEFORE_DRAIN")
+                    .count(),
+                2
+            );
+            assert!(!messages
+                .iter()
+                .any(|m| m["text"] == "FORBIDDEN_DURING_DRAIN"));
+            t.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn drain_deadline_preserves_unattempted_queue_and_never_replays_on_reopen() {
+    for a in [AgentKind::Codex, AgentKind::Claude] {
+        let mut t = Test::new().await;
+        t.create(a, "deadline").await;
+        t.call(a, prompt("deadline", "hold", "normal"))
+            .await
+            .unwrap();
+        t.wait(a, "deadline", "running").await;
+        t.call(a, prompt("deadline", "KEEP_QUEUED", "queue"))
+            .await
+            .unwrap();
+        let (reservation, _) = t.hub.prepare_drain().await.unwrap();
+        let app = drain_app(&t);
+        let started = std::time::Instant::now();
+        remodex_connect_native::restart_drain::finish(
+            app.clone(),
+            Some(reservation),
+            Duration::from_millis(150),
+        )
+        .await;
+        assert!(*app.stopping.borrow());
+        assert!(started.elapsed() >= Duration::from_millis(140));
+        t.stop().await;
+        t.hub = Chats::start(t.db.clone(), t.config.clone()).await.unwrap();
+        let after = t.detail(a, "deadline").await;
+        assert_eq!(after["session"]["status"], "interrupted");
+        let messages = after["messages"].as_array().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m["role"] == "user" && m["phase"] != "queued")
+                .count(),
+            1
+        );
+        let queue = messages
+            .iter()
+            .filter(|m| m["phase"] == "queued")
+            .collect::<Vec<_>>();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0]["queueStatus"], "paused");
+        assert_eq!(queue[0]["text"], "KEEP_QUEUED");
+        let db = rusqlite::Connection::open(t.dir.path().join("native-connect.sqlite")).unwrap();
+        let sent=db.query_row("SELECT count(*) FROM chat_rows WHERE kind='messages' AND json_extract(data,'$.text')='KEEP_QUEUED'",[],|r|r.get::<_,i64>(0)).unwrap();
+        assert_eq!(sent, 0, "queued draft must never be sent during restart");
+        let queued = t
+            .hub
+            .call(
+                a,
+                "phone",
+                "orchestration.subscribeThread",
+                json!({"threadId":"deadline"}),
+            )
+            .await
+            .unwrap();
+        assert!(queued.to_string().contains("KEEP_QUEUED"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(t.detail(a, "deadline").await["messages"], after["messages"]);
+        t.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn stop_overrides_pending_drain_and_cancelled_reservation_reopens_admission() {
+    use std::sync::atomic::Ordering;
+    let t = Test::new().await;
+    let a = AgentKind::Codex;
+    t.create(a, "cancel-drain").await;
+    t.call(a, prompt("cancel-drain", "hold", "normal"))
+        .await
+        .unwrap();
+    t.wait(a, "cancel-drain", "running").await;
+    let (reservation, _) = t.hub.prepare_drain().await.unwrap();
+    drop(reservation);
+    let (reservation, _) = t.hub.prepare_drain().await.unwrap();
+    let app = drain_app(&t);
+    let finishing = tokio::spawn(remodex_connect_native::restart_drain::finish(
+        app.clone(),
+        Some(reservation),
+        Duration::from_secs(10),
+    ));
+    app.restart
+        .as_ref()
+        .unwrap()
+        .store(false, Ordering::Release);
+    app.stopping.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(1), finishing)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!app.restart.as_ref().unwrap().load(Ordering::Acquire));
+    // A cancelled drain guard cannot wedge admission. Stop remains explicit.
+    t.call(a, prompt("cancel-drain", "AFTER_CANCEL", "queue"))
+        .await
+        .unwrap();
+    t.call(
+        a,
+        json!({"type":"thread.turn.interrupt","threadId":"cancel-drain","commandId":"stop-drain"}),
+    )
+    .await
+    .unwrap();
+    t.wait(a, "cancel-drain", "interrupted").await;
+    t.stop().await;
+}
+
 fn alternate_claude(test: &Test) -> PathBuf {
     let folder = test.dir.path().join("CLI with spaces");
     std::fs::create_dir_all(&folder).unwrap();

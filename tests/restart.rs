@@ -219,10 +219,7 @@ async fn supervised_restart_keeps_pairing_identity_and_history_and_stop_exits_su
         .await
         .unwrap();
     assert_eq!(res.status(), 202);
-    assert_eq!(
-        res.json::<Value>().await.unwrap()["restartPolicy"],
-        "idle-only"
-    );
+    assert_eq!(res.json::<Value>().await.unwrap()["restartPolicy"], "drain");
     let second = ready(&mut reader).await;
     assert_ne!(first["pid"], second["pid"]);
     assert!(!PathBuf::from(first["invitationFile"].as_str().unwrap()).exists());
@@ -383,5 +380,198 @@ async fn supervisor_termination_closes_only_its_child_and_preserves_state() {
     exit(&mut child, true).await;
     assert!(!PathBuf::from(started["invitationFile"].as_str().unwrap()).exists());
     assert!(f.state.join("native-connect.sqlite").exists());
+    let _lock = remodex_connect_native::profile_lock::acquire(&f.state).unwrap();
+}
+
+async fn phone(f: &Fixture, ready: &Value, base: &str) -> String {
+    let invitation: Value =
+        serde_json::from_slice(&std::fs::read(ready["invitationFile"].as_str().unwrap()).unwrap())
+            .unwrap();
+    let token: Value = f
+        .http
+        .post(format!("{base}/oauth/token"))
+        .form(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+            ),
+            (
+                "subject_token_type",
+                "urn:t3:params:oauth:token-type:environment-bootstrap",
+            ),
+            (
+                "requested_token_type",
+                "urn:ietf:params:oauth:token-type:access_token",
+            ),
+            (
+                "subject_token",
+                invitation["pairingToken"].as_str().unwrap(),
+            ),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    token["access_token"].as_str().unwrap().into()
+}
+async fn dispatch(
+    f: &Fixture,
+    base: &str,
+    token: &str,
+    agent: &str,
+    command: Value,
+) -> reqwest::Response {
+    f.http
+        .post(format!("{base}/api/orchestration/dispatch{agent}"))
+        .bearer_auth(token)
+        .json(&command)
+        .send()
+        .await
+        .unwrap()
+}
+fn db(f: &Fixture) -> rusqlite::Connection {
+    rusqlite::Connection::open(f.state.join("native-connect.sqlite")).unwrap()
+}
+
+#[tokio::test]
+async fn supervised_busy_drain_keeps_approval_controls_and_queued_work_until_complete() {
+    let f = Fixture::new();
+    let mut child = f.launch("--supervise");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let first = ready(&mut reader).await;
+    let session = f.dashboard(&first).await;
+    let token = phone(&f, &first, &session.0).await;
+    for (agent, id) in [("", "codex"), ("?agent=claude-code", "claude")] {
+        for command in [
+            json!({"type":"thread.create","commandId":format!("create-{id}"),"threadId":id,"projectId":"native-test-project"}),
+            json!({"type":"thread.turn.start","commandId":format!("send-{id}"),"threadId":id,"message":{"messageId":format!("message-{id}"),"text":"approval","attachments":[]},"deliveryMode":"normal"}),
+        ] {
+            dispatch(&f, &session.0, &token, agent, command)
+                .await
+                .error_for_status()
+                .unwrap();
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(8),async {
+        loop {
+            let count:i64=db(&f).query_row("SELECT count(*) FROM chat_rows WHERE kind='activities' AND json_extract(data,'$.kind')='approval.requested'",[],|r|r.get(0)).unwrap();
+            if count==2 {break;}tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    }).await.unwrap();
+    for (agent, id) in [("", "codex"), ("?agent=claude-code", "claude")] {
+        dispatch(&f,&session.0,&token,agent,json!({"type":"thread.turn.start","commandId":format!("queue-{id}"),"threadId":id,"message":{"messageId":format!("queued-{id}"),"text":"DRAIN_QUEUED_OK","attachments":[]},"deliveryMode":"queue"})).await.error_for_status().unwrap();
+    }
+    let accepted = f
+        .action(
+            &session,
+            "/api/system/restart",
+            first["pid"].as_u64().unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 202);
+    let accepted: Value = accepted.json().await.unwrap();
+    assert_eq!(accepted["activeTurnCount"], 2);
+    assert_eq!(accepted["drainTimeoutMs"], 60000);
+    let duplicate: Value = f
+        .action(&session, "/api/restart", first["pid"].as_u64().unwrap())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(duplicate["alreadyDraining"], true);
+    let metrics: Value = f
+        .http
+        .get(format!("{}/api/system/memory", session.0))
+        .header("x-opencodex-api-key", &session.1)
+        .header("x-opencodex-gui-origin", &session.0)
+        .header("origin", &session.0)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(metrics["isDraining"], true);
+    assert_eq!(metrics["activeTurnCount"], 2);
+    for (agent, id) in [("", "codex"), ("?agent=claude-code", "claude")] {
+        let rejected=dispatch(&f,&session.0,&token,agent,json!({"type":"thread.turn.start","commandId":format!("rejected-{id}"),"threadId":id,"message":{"messageId":format!("rejected-message-{id}"),"text":"MUST_NOT_SEND","attachments":[]},"deliveryMode":"queue"})).await;
+        assert!(!rejected.status().is_success());
+        let request:String=db(&f).query_row("SELECT json_extract(data,'$.payload.requestId') FROM chat_rows WHERE chat=?1 AND kind='activities' AND json_extract(data,'$.kind')='approval.requested'",[id],|r|r.get(0)).unwrap();
+        dispatch(&f,&session.0,&token,agent,json!({"type":"thread.approval.respond","threadId":id,"commandId":format!("approve-{id}"),"requestId":request,"decision":"approved"})).await.error_for_status().unwrap();
+    }
+    let second = ready(&mut reader).await;
+    assert_ne!(first["pid"], second["pid"]);
+    let completed:i64=db(&f).query_row("SELECT count(*) FROM chat_rows WHERE kind='messages' AND json_extract(data,'$.text')='DRAIN_QUEUED_OK'",[],|r|r.get(0)).unwrap();
+    assert_eq!(completed, 4);
+    let rejected:i64=db(&f).query_row("SELECT count(*) FROM chat_rows WHERE kind='messages' AND json_extract(data,'$.text')='MUST_NOT_SEND'",[],|r|r.get(0)).unwrap();
+    assert_eq!(rejected, 0);
+    let next = f.dashboard(&second).await;
+    assert_eq!(
+        f.http
+            .get(format!("{}/api/auth/session", next.0))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    f.action(&next, "/api/stop", second["pid"].as_u64().unwrap())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    exit(&mut child, true).await;
+}
+
+#[tokio::test]
+async fn supervised_stop_during_drain_exits_instead_of_restarting() {
+    let f = Fixture::new();
+    let mut child = f.launch("--supervise");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let first = ready(&mut reader).await;
+    let session = f.dashboard(&first).await;
+    let token = phone(&f, &first, &session.0).await;
+    for command in [
+        json!({"type":"thread.create","commandId":"create","threadId":"hold","projectId":"native-test-project"}),
+        json!({"type":"thread.turn.start","commandId":"start","threadId":"hold","message":{"messageId":"hold-message","text":"hold","attachments":[]},"deliveryMode":"normal"}),
+    ] {
+        dispatch(&f, &session.0, &token, "", command)
+            .await
+            .error_for_status()
+            .unwrap();
+    }
+    assert_eq!(
+        f.action(&session, "/api/restart", first["pid"].as_u64().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+    assert_eq!(
+        f.action(&session, "/api/stop", first["pid"].as_u64().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    exit(&mut child, true).await;
+    let mut next = String::new();
+    assert_eq!(reader.read_line(&mut next).await.unwrap(), 0);
     let _lock = remodex_connect_native::profile_lock::acquire(&f.state).unwrap();
 }

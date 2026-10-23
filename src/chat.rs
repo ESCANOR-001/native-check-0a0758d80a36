@@ -431,6 +431,21 @@ impl Chats {
         .await?;
         Ok(reservation)
     }
+    /// Reserve admission while existing work drains. No new prompt, Steer,
+    /// setup or storage mutation may start; approvals and Stop remain usable.
+    pub async fn prepare_drain(&self) -> Result<(RestartReservation, Value), String> {
+        self.restart_gate
+            .compare_exchange(0, 3, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "A bridge restart or storage operation is already being prepared")?;
+        let reservation = RestartReservation {
+            gate: self.restart_gate.clone(),
+            committed: false,
+        };
+        let status = self
+            .call(AgentKind::Codex, "local", "native.restartStatus", json!({}))
+            .await?;
+        Ok((reservation, status))
+    }
     /// Hold admission through the blocking storage transaction, even if its HTTP
     /// caller goes away. Known chat histories are protected from archive cleanup.
     pub(crate) async fn prepare_storage(
@@ -1086,7 +1101,8 @@ impl Hub {
                 .shared_watches
                 .iter()
                 .filter(|(id, (_, due))| {
-                    !restart_pending
+                    restart_gate.load(Ordering::Acquire) != 1
+                        && restart_gate.load(Ordering::Acquire) != 2
                         && *due <= Instant::now()
                         && !self.active.contains_key(*id)
                         && !shared_reads.contains(*id)
@@ -1149,11 +1165,14 @@ impl Hub {
                     }
                     if matches!(r.method.as_str(),"native.prepareRestart"|"native.restartStatus") {
                         let busy=self.busy_count()>0 || !self.tool_controls.is_empty() || !clone_jobs.is_empty() || !worktree_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !tool_jobs.is_empty() || !shared_sends.is_empty() || self.chats.values().any(|c|!c.queue.is_empty() || matches!(s(&c.thread["session"]["status"]),"starting"|"running"|"stopping"));
-                        if r.method=="native.restartStatus" {let _=r.reply.send(Ok(json!({"ready":!busy && restart_gate.load(Ordering::Acquire)==0,"activeTurnCount":self.busy_count()})));continue;}
+                        if r.method=="native.restartStatus" {
+                            let drain_busy=self.busy_count()>0 || !self.tool_controls.is_empty() || !clone_jobs.is_empty() || !worktree_jobs.is_empty() || !file_jobs.is_empty() || !edit_jobs.is_empty() || !bootstrap_jobs.is_empty() || !tool_jobs.is_empty() || !shared_sends.is_empty() || self.chats.values().any(|c|!c.paused && !c.queue.is_empty());
+                            let _=r.reply.send(Ok(json!({"ready":!busy && restart_gate.load(Ordering::Acquire)==0,"drainReady":!drain_busy,"isDraining":restart_gate.load(Ordering::Acquire)==3,"activeTurnCount":self.busy_count()})));continue;
+                        }
                         let result=if restart_gate.load(Ordering::Acquire)==0 {Err("Restart reservation is no longer active".into())}else if busy {Err("Finish or stop active tasks and clear queued messages before restarting this bridge".into())}else {Ok(json!({"reserved":true}))};
                         let _=r.reply.send(result);continue;
                     }
-                    if restart_gate.load(Ordering::Acquire)!=0 {let message=if restart_gate.load(Ordering::Acquire)==2 {"Storage maintenance is in progress; retry shortly"}else{"Bridge is restarting; retry after it reconnects"};let _=r.reply.send(Err(message.into()));continue;}
+                    if restart_gate.load(Ordering::Acquire)!=0 && !(restart_gate.load(Ordering::Acquire)==3 && crate::restart_drain::allowed(&r.method,&r.params)) {let message=if restart_gate.load(Ordering::Acquire)==2 {"Storage maintenance is in progress; retry shortly"}else{"Bridge is restarting; retry after it reconnects"};let _=r.reply.send(Err(message.into()));continue;}
                     if r.method=="native.configureClaude" {
                         // Wait for bounded metadata/jobs rather than racing a configuration
                         // change against a CLI launched with the previous setup.
@@ -1505,9 +1524,9 @@ impl Hub {
                     if let Err(error)=result {self.end(&id,"error",Some(&error)).await;}
                 }
                 _=tick.tick()=>{
-                    if restart_pending {continue;}
+                    if matches!(restart_gate.load(Ordering::Acquire),1|2) {continue;}
                     self.expire_native_controls().await;
-                    self.reconnect_claude().await;
+                    if !restart_pending {self.reconnect_claude().await;}
                     previews.retain(|_,p|p.created.elapsed()<Duration::from_secs(60));
                     let expired:Vec<_>=shared_sends.iter().filter(|(_, (at,_,r))|at.elapsed()>Duration::from_secs(30) || r.reply.is_closed()).map(|(id,_)|id.clone()).collect();
                     for id in expired {if let Some((_,_,r))=shared_sends.remove(&id){self.tool_controls.remove(&id);let _=r.reply.send(Err("Shared history is still catching up. Your prompt was not sent; try again shortly.".into()));}}
@@ -1531,7 +1550,7 @@ impl Hub {
                     for id in expired_context {let _=self.report_usage(&id,true,None).await;}
                     let detached:Vec<_>=self.active.iter().filter(|(id,w)|!w.owns_turn && w.observer.is_none() && !self.shared_watches.contains_key(*id) && self.chats[*id].queue.is_empty() && w.steers.values().all(|v|*v)).map(|(id,_)|id.clone()).collect();
                     for id in detached {self.end(&id,"interrupted",Some("Shared viewer disconnected")).await;}
-                    if self.active.is_empty() && Instant::now() >= retention_due {
+                    if !restart_pending && self.active.is_empty() && Instant::now() >= retention_due {
                         let mut scan=std::mem::take(&mut retention);
                         if let Ok((scan,result))=self.db.call(move |a| {
                             let result=scan.step(&a.store,std::time::SystemTime::now());(scan,result)

@@ -299,39 +299,45 @@ async fn restart(State(app): State<App>, headers: HeaderMap) -> Response {
             "Restart requires starting this isolated candidate with --supervise",
         );
     };
-    if *app.stopping.borrow() {
-        return if restart.load(std::sync::atomic::Ordering::Acquire) {
-            response(
-                StatusCode::ACCEPTED,
-                json!({"success":true,"alreadyDraining":true,"activeTurnCount":0,"drainTimeoutMs":0,"restartPolicy":"idle-only"}),
-            )
-        } else {
-            error(StatusCode::CONFLICT, "Bridge is already stopping")
-        };
+    if *app.stopping.borrow() && !restart.load(std::sync::atomic::Ordering::Acquire) {
+        return error(StatusCode::CONFLICT, "Bridge is already stopping");
     }
-    let reservation = if let Some(chats) = &app.chats {
-        match chats.prepare_restart().await {
-            Ok(reservation) => Some(reservation),
+    if restart.load(std::sync::atomic::Ordering::Acquire) {
+        return response(
+            StatusCode::ACCEPTED,
+            json!({"success":true,"alreadyDraining":true,"drainTimeoutMs":60000,"restartPolicy":"drain"}),
+        );
+    }
+    let (reservation, state) = if let Some(chats) = &app.chats {
+        match chats.prepare_drain().await {
+            Ok((reservation, state)) => (Some(reservation), state),
             Err(e) => return error(StatusCode::CONFLICT, &e),
         }
     } else {
-        None
+        (None, json!({"drainReady":true,"activeTurnCount":0}))
     };
-    // No await between committing intent and stopping admission. A concurrent
-    // Stop can override restart, including while graceful cleanup is running.
     if *app.stopping.borrow() {
         return error(StatusCode::CONFLICT, "Bridge is already stopping");
     }
     restart.store(true, std::sync::atomic::Ordering::Release);
-    app.stopping.send_replace(true);
-    if let Some(reservation) = reservation {
-        reservation.commit();
+    if state["drainReady"] == true {
+        app.stopping.send_replace(true);
+        if let Some(reservation) = reservation {
+            reservation.commit();
+        }
+    } else {
+        tokio::spawn(crate::restart_drain::finish(
+            app.clone(),
+            reservation,
+            crate::restart_drain::TIMEOUT,
+        ));
     }
     response(
         StatusCode::ACCEPTED,
-        json!({"success":true,"message":"Restarting this idle bridge through its native supervisor","activeTurnCount":0,"drainTimeoutMs":0,"alreadyDraining":false,"restartPolicy":"idle-only"}),
+        json!({"success":true,"message":"Waiting up to 60 seconds for current work, then restarting this bridge","activeTurnCount":state["activeTurnCount"],"drainTimeoutMs":60000,"alreadyDraining":false,"restartPolicy":"drain"}),
     )
 }
+
 async fn activity(State(app): State<App>) -> Response {
     let Some(chats) = app.chats else {
         return error(
@@ -347,19 +353,16 @@ async fn activity(State(app): State<App>) -> Response {
 async fn memory(State(app): State<App>) -> Response {
     match app.metrics.read() {
         Some(mut value) => {
-            if app.restart.is_some() {
-                let idle = if let Some(chats) = &app.chats {
-                    matches!(chats.call(crate::chat::AgentKind::Codex,"local","native.restartStatus",json!({})).await, Ok(v) if v["ready"]==true)
+            if let Some(restart) = &app.restart {
+                let state = if let Some(chats) = &app.chats {
+                    crate::restart_drain::status(chats).await.ok()
                 } else {
-                    true
+                    Some(json!({"activeTurnCount":0}))
                 };
-                // Existing UI treats this field as a restart capability. Until
-                // active-task draining is supported, offer it only when idle;
-                // the POST still rechecks and atomically reserves admission.
-                value["restartPolicy"] = json!("idle-only");
-                if idle {
-                    value["activeTurnCount"] = json!(0);
-                    value["isDraining"] = json!(false);
+                if let Some(state) = state {
+                    value["restartPolicy"] = json!("drain");
+                    value["activeTurnCount"] = state["activeTurnCount"].clone();
+                    value["isDraining"] = json!(restart.load(std::sync::atomic::Ordering::Acquire));
                 }
             }
             response(StatusCode::OK, value)

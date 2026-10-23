@@ -21,6 +21,7 @@ pub mod claude_turns;
 pub mod dashboard;
 pub mod diagnostics;
 pub mod legacy_connection;
+pub mod restart_drain;
 pub mod server;
 pub mod store;
 

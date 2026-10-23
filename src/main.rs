@@ -47,7 +47,7 @@ async fn serve(
         return Ok(0);
     }
     if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
-        println!("Remodex native backend experiment\nUsage: remodex-connect-native ABSOLUTE_ISOLATED_STATE_DIR BIND_ADDRESS PUBLIC_URL [ISOLATED_CHAT_CONFIG_JSON [GUI_DIST_DIRECTORY]]\nOptional --supervise starts a native supervisor with idle-only dashboard restart.\nUse only an isolated state directory and test agent profiles.\nThis candidate does not install a service or migrate normal data. migrationComplete=false");
+        println!("Remodex native backend experiment\nUsage: remodex-connect-native ABSOLUTE_ISOLATED_STATE_DIR BIND_ADDRESS PUBLIC_URL [ISOLATED_CHAT_CONFIG_JSON [GUI_DIST_DIRECTORY]]\nOptional --supervise starts a native supervisor with bounded dashboard drain-and-restart.\nUse only an isolated state directory and test agent profiles.\nThis candidate does not install a service or migrate normal data. migrationComplete=false");
         return Ok(0);
     }
     if !(4..=6).contains(&args.len()) {
