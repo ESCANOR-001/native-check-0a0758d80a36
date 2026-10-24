@@ -156,6 +156,9 @@ async fn acquire_for(
     let until = tokio::time::Instant::now() + deadline;
     let mut started = false;
     loop {
+        if let Some(plan) = completed(&source, directory)? {
+            return Ok(plan);
+        }
         let method = if started {
             reqwest::Method::GET
         } else {
@@ -170,7 +173,7 @@ async fn acquire_for(
             .await;
         if let Ok(mut response) = response {
             if response.status() != reqwest::StatusCode::OK {
-                return Err(ERROR.into());
+                return completed(&source, directory)?.ok_or_else(|| ERROR.into());
             }
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|_| ERROR)? {

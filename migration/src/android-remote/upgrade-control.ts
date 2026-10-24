@@ -63,6 +63,11 @@ export async function startUpgradeControl(options: UpgradeControlOptions) {
           if (plan.version !== 1 || plan.closed_owner !== join(directory, 'export', 'closed-owner.json')) throw new Error(FAILURE);
           await writeNew(planPath, plan);
           phase = 'ready';
+          // Completion is durable. The launcher can recover it even if this
+          // process exits now; do not retain an idle TypeScript server after
+          // its workers and public listener have already been released.
+          await server.stop(true);
+          closed = true;
         })().catch(() => { phase = 'failed'; });
       }
       return Response.json({ version: 1, instance, phase }, { headers: { 'cache-control': 'no-store' } });
