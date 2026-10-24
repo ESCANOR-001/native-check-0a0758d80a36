@@ -1847,6 +1847,33 @@ async fn claude_background_tools_finish_before_queue_and_do_not_get_killed_at_fo
 }
 
 #[tokio::test]
+async fn completed_compaction_output_does_not_block_the_next_prompt() {
+    let t = Test::hosted().await;
+    let a = AgentKind::Claude;
+    t.create(a, "compact-output").await;
+    t.call(a, prompt("compact-output", "compact-output", "normal"))
+        .await
+        .unwrap();
+    t.wait(a, "compact-output", "ready").await;
+    // The native stdout frame follows completion, as in the live SDK stream.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    t.call(a, prompt("compact-output", "AFTER_COMPACT_OK", "normal"))
+        .await
+        .unwrap();
+    let next = t.wait(a, "compact-output", "ready").await;
+    assert_eq!(next["session"]["executionState"], "idle");
+    assert!(!next["messages"]
+        .to_string()
+        .contains("local-command-stdout"));
+    assert!(next["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["role"] == "assistant" && m["text"] == "AFTER_COMPACT_OK"));
+    t.stop().await;
+}
+
+#[tokio::test]
 async fn stopped_native_task_notice_does_not_hold_a_worker_or_become_a_user_prompt() {
     let t = Test::hosted().await;
     let a = AgentKind::Claude;

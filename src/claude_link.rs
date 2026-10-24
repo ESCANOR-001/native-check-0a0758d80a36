@@ -21,12 +21,34 @@ pub(crate) async fn is_proven_internal_input(
         return false;
     };
     let id = id.to_owned();
-    tokio::task::spawn_blocking(move || {
-        read_for_inputs(&profile, &workspace, &native, std::slice::from_ref(&id))
-            .is_ok_and(|link| link.internal_inputs.contains(&id))
-    })
-    .await
-    .unwrap_or(false)
+    // The SDK can echo this frame before its async transcript writer flushes
+    // the attestation. Keep the frame pending for a bounded grace period; never
+    // invent proof from its text or leave an unbounded retry in the event loop.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    for delay in [0, 40, 120, 240] {
+        if delay > 0 {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        let (profile, workspace, native, id) = (
+            profile.clone(),
+            workspace.clone(),
+            native.clone(),
+            id.clone(),
+        );
+        if tokio::task::spawn_blocking(move || {
+            read_for_inputs(&profile, &workspace, &native, std::slice::from_ref(&id))
+                .is_ok_and(|link| link.internal_inputs.contains(&id))
+        })
+        .await
+        .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -256,6 +278,16 @@ mod tests {
                 proven
             );
         }
+        std::fs::write(folder.join(format!("{native}.jsonl")), format!("{base}\n")).unwrap();
+        let late = folder.join(format!("{native}.jsonl"));
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(70)).await;
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(late).unwrap();
+            writeln!(f, "{proof}").unwrap();
+        });
+        assert!(is_proven_internal_input(profile, d.path().into(), native, &frame).await);
+        writer.await.unwrap();
     }
     #[test]
     fn internal_input_proof_is_bounded_to_matching_pending_main_session_rows() {

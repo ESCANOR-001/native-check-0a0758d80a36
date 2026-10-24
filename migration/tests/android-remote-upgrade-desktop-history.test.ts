@@ -30,7 +30,7 @@ for (const mode of ['settled','live','changed','foreign','cycle','missing-owner'
         }
         throw new Error('Mutating RPC is forbidden');
       }};
-      const result=readDesktopExportThread(client,'native',root,async()=>mode!=='missing-owner');
+      const result=readDesktopExportThread(client,'native',root,async()=>mode==='missing-owner'?null:true);
       if(mode==='settled'){
         const thread=await result;expect(thread.turns[0].items[0].content[0].text).toBe('Keep original prompt');
         expect(await readFile(path,'utf8')).toBe(source);

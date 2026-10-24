@@ -621,6 +621,17 @@ This came from another Claude session — not typed by your user, but very likel
                 out(json!({"type":"system","subtype":"status","status":"compacting"}));
                 continue;
             }
+            if text == "compact-output" {
+                out(json!({"type":"system","subtype":"status","status":"compacting"}));
+                out(
+                    json!({"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual"}}),
+                );
+                complete(false, "COMPACTED", &last);
+                out(
+                    json!({"type":"user","uuid":uuid::Uuid::new_v4().to_string(),"message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"}}),
+                );
+                continue;
+            }
             if text == "background-fixture" {
                 out(
                     json!({"type":"system","subtype":"task_started","task_id":"fixture-background","run_id":"001","is_backgrounded":true}),

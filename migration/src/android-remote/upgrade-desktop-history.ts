@@ -17,12 +17,13 @@ function cursor(v: unknown): string | null {
   if (typeof v !== 'string' || !v || v.length > 8192) throw new Error(UPGRADE_BUSY);
   return v;
 }
-async function lifecycle(path: string, native: string, deadline: number): Promise<{ turn: string; status: string } | null> {
+async function lifecycle(path: string, native: string, deadline: number): Promise<{ latest: { turn: string; status: string } | null; settings: Row | null }> {
   const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   try {
     const meta = await file.stat();
     if (!meta.isFile() || meta.nlink !== 1 || meta.size > 512 * 1024 * 1024) throw new Error(UPGRADE_BUSY);
     let pending = Buffer.alloc(0), first = true, latest: { turn: string; status: string } | null = null, bytes = 0;
+    let settings: Row | null = null;
     const chunk = Buffer.alloc(65536);
     for (;;) {
       if (Date.now() > deadline) throw new Error(UPGRADE_BUSY);
@@ -40,6 +41,15 @@ async function lifecycle(path: string, native: string, deadline: number): Promis
           if (row.type !== 'session_meta' || row.payload?.id !== native) throw new Error(UPGRADE_BUSY);
           first = false;
         }
+        if (row.type === 'turn_context') {
+          const p = row.payload;
+          if (!object(p)) throw new Error(UPGRADE_BUSY);
+          // Retain only last-used selections, never system/environment text.
+          settings = { model: p.model, cwd: p.cwd, effort: p.effort ?? p.collaboration_mode?.settings?.reasoning_effort ?? null,
+            serviceTier: p.service_tier ?? null, mode: p.collaboration_mode?.mode,
+            runtimeMode: p.approval_policy === 'never' && p.sandbox_policy?.type === 'danger-full-access'
+              ? 'full-access' : 'approval-required' };
+        }
         if (row.type !== 'event_msg') continue;
         const status = ({ task_started: 'inProgress', task_complete: 'completed', turn_aborted: 'interrupted' } as Row)[row.payload?.type];
         if (status) latest = { turn: id(row.payload.turn_id), status };
@@ -47,20 +57,21 @@ async function lifecycle(path: string, native: string, deadline: number): Promis
       if (pending.length > LINE) throw new Error(UPGRADE_BUSY);
     }
     if (first || pending.length || bytes !== meta.size) throw new Error(UPGRADE_BUSY);
-    return latest;
+    return { latest, settings };
   } finally { await file.close(); }
 }
 
 /** Cap every native page and the accumulated projection; reject partial exports
  * and racing remote prompts. Saved readers can falsely call a live turn stopped,
  * so the final native lifecycle event, not that projection, decides readiness. */
-export async function readDesktopExportThread(client: Client, native: string, profile: string, ownerConnected: () => Promise<boolean>): Promise<Row> {
-  if (!await ownerConnected()) throw new Error(UPGRADE_BUSY);
+export async function readDesktopExportThread(client: Client, native: string, profile: string, ownerConnected: () => Promise<boolean | null>): Promise<Row> {
+  const owner = await ownerConnected();
+  if (owner === null) throw new Error(UPGRADE_BUSY);
   const thread = (await client.request('thread/read', { threadId: native, includeTurns: false }))?.thread;
   if (!object(thread) || thread.id !== native || typeof thread.path !== 'string' || thread.turns?.length) throw new Error(UPGRADE_BUSY);
   const before = await transcriptFingerprint(profile, thread.path);
   const deadline = Date.now() + 120_000;
-  const latest = await lifecycle(thread.path, native, deadline);
+  const { latest } = await lifecycle(thread.path, native, deadline);
   if (latest?.status === 'inProgress') throw new Error(UPGRADE_BUSY);
   const turns: Row[] = [], ids = new Set<string>(), cursors = new Set<string>();
   let next: string | null = null, bytes = 0;
@@ -96,7 +107,31 @@ export async function readDesktopExportThread(client: Client, native: string, pr
     if (next) cursors.add(next);
   } while (next);
   if ((latest === null) !== (turns.length === 0) || latest && turns.at(-1)?.id !== latest.turn) throw new Error(UPGRADE_BUSY);
+  if (await ownerConnected() !== owner) throw new Error(UPGRADE_BUSY);
   const after = await transcriptFingerprint(profile, thread.path);
-  if (before.sha256 !== after.sha256 || before.bytes !== after.bytes || !await ownerConnected()) throw new Error(UPGRADE_BUSY);
+  if (before.sha256 !== after.sha256 || before.bytes !== after.bytes) throw new Error(UPGRADE_BUSY);
   return { ...thread, turns, status: { type: 'idle' } };
+}
+
+/** Unaliased Desktop chats keep the native UUID as their public ID. Capture
+ * actual last-used selections; never use the UI's fallback model for migration.
+ * Future turns inherit the live Desktop owner's settings through its IPC API. */
+export async function readDesktopExportHeader(client: Client, native: string, profile: string, ownerConnected: () => Promise<boolean | null>): Promise<Row> {
+  const owner = await ownerConnected();
+  if (owner === null) throw new Error(UPGRADE_BUSY);
+  const thread = (await client.request('thread/read', { threadId: native, includeTurns: false }))?.thread;
+  if (!object(thread) || thread.id !== native || typeof thread.path !== 'string'
+    || thread.turns?.length || !['openai', 'codex'].includes(thread.modelProvider)) throw new Error(UPGRADE_BUSY);
+  const before = await transcriptFingerprint(profile, thread.path);
+  const { latest, settings } = await lifecycle(thread.path, native, Date.now() + 120_000);
+  if (latest?.status === 'inProgress' || !settings || settings.cwd !== thread.cwd
+    || typeof settings.model !== 'string' || !settings.model || settings.model.length > 256
+    || !['default', 'plan'].includes(settings.mode)
+    || [settings.effort, settings.serviceTier].some(v => v !== null && (typeof v !== 'string' || !v || v.length > 128))) throw new Error(UPGRADE_BUSY);
+  if (await ownerConnected() !== owner) throw new Error(UPGRADE_BUSY);
+  const after = await transcriptFingerprint(profile, thread.path);
+  if (before.sha256 !== after.sha256 || before.bytes !== after.bytes) throw new Error(UPGRADE_BUSY);
+  return { ...thread, status: { type: 'idle' }, androidRemoteModel: settings.model,
+    androidRemoteRuntimeMode: settings.runtimeMode, androidRemoteInteractionMode: settings.mode,
+    androidRemoteNativeEffort: settings.effort, androidRemoteNativeServiceTier: settings.serviceTier };
 }

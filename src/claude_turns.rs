@@ -67,7 +67,7 @@ pub(crate) fn unproven_task_input(frame: &Value) -> Option<&str> {
     (frame["type"] == "user"
         && frame["message"]["role"] == "user"
         && frame["parent_tool_use_id"].is_null()
-        && frame["origin"].is_null()
+        && (frame["origin"].is_null() || frame["origin"]["kind"] == "task-notification")
         && frame["shouldQuery"] != false
         && task_notice_text(&frame["message"]["content"]).is_some())
     .then(|| frame["uuid"].as_str())
@@ -83,6 +83,8 @@ pub fn user_input(frame: &Value) -> Result<Option<(String, String)>, String> {
         || !frame["parent_tool_use_id"].is_null()
         || ((frame["isSynthetic"] == true || frame["isMeta"] == true) && peer_text(frame).is_none())
         || frame["shouldQuery"] == false
+        || frame["isCompactSummary"] == true
+        || frame["isVisibleInTranscriptOnly"] == true
         || frame["message"]["role"] != "user"
     {
         return Ok(None);
@@ -157,21 +159,11 @@ pub fn input_identity(frame: &Value) -> Result<Option<String>, String> {
     }
     let id = if frame["type"] == "command_lifecycle" && frame["state"] == "started" {
         &frame["command_uuid"]
-    } else if frame["type"] == "user"
-        && frame["message"]["role"] == "user"
-        && (frame["isSynthetic"] != true || peer_text(frame).is_some())
-        && frame["shouldQuery"] != false
-        && (frame["message"]["content"].is_string()
-            || frame["message"]["content"].as_array().is_some_and(|a| {
-                !a.is_empty()
-                    && a.iter().all(|b| {
-                        ["text", "image", "document"].contains(&b["type"].as_str().unwrap_or(""))
-                    })
-            }))
-    {
-        &frame["uuid"]
     } else {
-        return Ok(None);
+        // Use the same eligibility as the transcript. Local command stdout,
+        // compaction summaries and setup caveats never receive a native turn
+        // result; registering them would keep an idle worker busy forever.
+        return Ok(user_input(frame)?.map(|(id, _)| id));
     };
     let id = id.as_str().ok_or("Claude input has no identity")?;
     if id.len() != 36 || uuid::Uuid::parse_str(id).is_err() {
@@ -694,6 +686,27 @@ mod tests {
     const A: &str = "00000000-0000-4000-8000-000000000001";
     const B: &str = "00000000-0000-4000-8000-000000000002";
     const C: &str = "00000000-0000-4000-8000-000000000003";
+    #[test]
+    fn command_output_and_compaction_context_do_not_reserve_prompt_slots() {
+        for text in [
+            "<local-command-stdout>Compacted </local-command-stdout>",
+            "<local-command-stderr>Command failed</local-command-stderr>",
+            "<local-command-caveat>Context only</local-command-caveat>",
+        ] {
+            let frame = json!({"type":"user","uuid":A,"message":{"role":"user","content":text}});
+            assert!(input_identity(&frame).unwrap().is_none());
+        }
+        for flag in ["isMeta", "isCompactSummary", "isVisibleInTranscriptOnly"] {
+            let mut frame = json!({"type":"user","uuid":A,"message":{"role":"user","content":"Internal context"}});
+            frame[flag] = json!(true);
+            assert!(user_input(&frame).unwrap().is_none());
+            assert!(input_identity(&frame).unwrap().is_none());
+        }
+        let human = json!({"type":"user","uuid":A,"message":{"role":"user","content":"Explain what compaction does"}});
+        assert_eq!(input_identity(&human).unwrap().as_deref(), Some(A));
+        let lifecycle = json!({"type":"command_lifecycle","state":"started","command_uuid":A});
+        assert_eq!(input_identity(&lifecycle).unwrap().as_deref(), Some(A));
+    }
     #[test]
     fn internal_task_completion_is_not_input_and_repair_never_retires_human_work() {
         let text = "<task-notification>\n<task-id>task</task-id><status>completed</status>\n</task-notification>";
