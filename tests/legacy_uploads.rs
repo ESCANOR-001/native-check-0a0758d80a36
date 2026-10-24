@@ -232,10 +232,7 @@ fn projected_attachments_count_toward_page_bytes_without_skipping_the_prompt() {
     let mut tail = json!({"id":"later-reply","role":"assistant","text":"","turnId":"later-turn"});
     // The original rows fit, but the verified attachment descriptors require
     // a second page. This tests the byte boundary rather than the row count.
-    let padding = remodex_connect_native::chat_store::PAGE_BYTES
-        - old_bytes as usize
-        - tail.to_string().len()
-        - 1;
+    let padding = 160 * 1024 - old_bytes as usize - tail.to_string().len() - 1;
     tail["text"] = json!("x".repeat(padding));
     f.db.execute(
         "INSERT INTO chat_rows(chat,kind,id,turn,data) VALUES(?1,'messages','later-reply','later-turn',?2)",
