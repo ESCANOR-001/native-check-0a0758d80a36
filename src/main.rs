@@ -11,6 +11,39 @@ use std::{future::IntoFuture, path::PathBuf, time::Duration};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "--npm-upgrade") {
+        let root = args
+            .get(3)
+            .map(PathBuf::from)
+            .ok_or("An installation directory is required")?;
+        match (args.get(2).map(String::as_str), args.len()) {
+            (Some("prepare"), 5) => println!(
+                "{}",
+                remodex_connect_native::npm_upgrade::prepare(&root, &PathBuf::from(&args[4]))?
+            ),
+            (Some("run"), 5) => {
+                let code = remodex_connect_native::npm_upgrade::run(
+                    &root,
+                    &PathBuf::from(&args[4]),
+                    shutdown()?,
+                )
+                .await?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }
+            (Some("cancel"), 4) => {
+                println!("{}", remodex_connect_native::npm_upgrade::cancel(&root)?)
+            }
+            _ => {
+                return Err(
+                    "Usage: --npm-upgrade prepare|run INSTALL_DIR PLAN_JSON | cancel INSTALL_DIR"
+                        .into(),
+                )
+            }
+        }
+        return Ok(());
+    }
     if args.get(1).is_some_and(|a| a == "--background-service") {
         let operation = args.get(2).map(String::as_str).unwrap_or("");
         let report = if operation == "prepare" && args.len() == 5 {

@@ -9,6 +9,13 @@ import { dirname, join, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const VERSION = '0.0.0';
+// An explicit launch, never npm postinstall, performs the handoff. Arguments
+// remain an array on Windows as well as POSIX; no shell interprets paths.
+export function nativeArguments(args) {
+  if (args[0] !== 'upgrade') return args;
+  if (args.length !== 3) throw new Error('Usage: rmx-native-experiment upgrade INSTALL_DIR PLAN_JSON');
+  return ['--npm-upgrade', 'run', ...args.slice(1)];
+}
 export function platformKey(platform = process.platform, arch = process.arch, glibc = process.report?.getReport()?.header?.glibcVersionRuntime) {
   if (platform === 'linux' && arch === 'x64' && glibc) return 'linux-x64-gnu';
   if (platform === 'darwin' && arch === 'arm64') return 'darwin-arm64';
@@ -53,6 +60,7 @@ export async function verifyBinary(root, target, glibc = process.report?.getRepo
   return path;
 }
 export async function main(args = process.argv.slice(2)) {
+  args = nativeArguments(args);
   const key = platformKey();
   let root;
   try {

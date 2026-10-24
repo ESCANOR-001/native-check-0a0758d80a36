@@ -1238,6 +1238,159 @@ fn automatic_export_fixture() -> (Fixture, PathBuf, PathBuf) {
     );
     (f, receipt, config)
 }
+
+fn npm_upgrade_fixture() -> (Fixture, PathBuf, PathBuf, PathBuf) {
+    let (f, receipt, config) = automatic_export_fixture();
+    let mut owner = read(&receipt);
+    owner["profile_mode"] = json!("existing");
+    write(&receipt, &owner);
+    let gui = f._dir.path().join("gui");
+    fs::create_dir(&gui).unwrap();
+    fs::write(gui.join("index.html"), b"fixture").unwrap();
+    let plan = f._dir.path().join("npm-plan.json");
+    write(
+        &plan,
+        &json!({"version":1,"closed_owner":receipt,"configuration":config,
+        "bind":"127.0.0.1:18991","public_url":"http://127.0.0.1:18991","gui":gui}),
+    );
+    let root = f._dir.path().join("npm-install");
+    (f, root, plan, receipt)
+}
+
+#[test]
+fn npm_upgrade_selects_one_generation_and_preserves_original_profiles_on_retry() {
+    use remodex_connect_native::npm_upgrade;
+    let (f, root, plan, receipt) = npm_upgrade_fixture();
+    let owner = read(&receipt);
+    let codex = PathBuf::from(owner["profiles"]["codex"].as_str().unwrap());
+    let original = fs::read(codex.join("sessions/test.jsonl")).unwrap();
+    let report = npm_upgrade::prepare(&root, &plan).unwrap();
+    assert_eq!(report["phase"], "selected");
+    assert_eq!(report["attempt"], 1);
+    assert_eq!(npm_upgrade::prepare(&root, &plan).unwrap(), report);
+    let native = Connection::open(root.join("attempt-1/generation/native/handoff.sqlite")).unwrap();
+    let saved: String = native
+        .query_row("SELECT plan FROM handoff", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&saved).unwrap()["profile_mode"],
+        "existing"
+    );
+    assert_eq!(
+        fs::read(codex.join("sessions/test.jsonl")).unwrap(),
+        original
+    );
+    assert!(!root.join("attempt-2").exists());
+    let db = Connection::open(root.join("attempt-1/generation/bridge/state/native-connect.sqlite"))
+        .unwrap();
+    assert_eq!(rows(&db).len(), 2);
+    assert!(npm_upgrade::prepare(&f._dir.path().join("second-install"), &plan).is_err());
+    npm_upgrade::cancel(&root).unwrap();
+    npm_upgrade::cancel(&root).unwrap();
+    assert!(npm_upgrade::prepare(&root, &plan).is_err());
+    assert_eq!(
+        fs::read(codex.join("sessions/test.jsonl")).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn npm_upgrade_refuses_changed_inputs_and_never_restores_a_started_generation() {
+    use remodex_connect_native::npm_upgrade;
+    let (_f, root, plan, receipt) = npm_upgrade_fixture();
+    npm_upgrade::prepare(&root, &plan).unwrap();
+    let original = fs::read(&receipt).unwrap();
+    let mut changed = read(&receipt);
+    changed["environment"] = json!("another-owner");
+    write(&receipt, &changed);
+    assert!(npm_upgrade::prepare(&root, &plan).is_err());
+    fs::write(&receipt, original).unwrap();
+    let db = Connection::open(root.join("service/service.sqlite")).unwrap();
+    db.execute("UPDATE selection SET phase='started'", [])
+        .unwrap();
+    assert_eq!(
+        npm_upgrade::prepare(&root, &plan).unwrap()["phase"],
+        "started"
+    );
+    assert!(npm_upgrade::cancel(&root).is_err());
+    assert!(root
+        .join("attempt-1/generation/bridge/state/native-connect.sqlite")
+        .exists());
+}
+
+#[test]
+fn npm_upgrade_retains_partial_attempts_and_limits_automatic_retries() {
+    use remodex_connect_native::npm_upgrade;
+    let (_f, root, plan, receipt) = npm_upgrade_fixture();
+    let owner = read(&receipt);
+    let rollout =
+        PathBuf::from(owner["profiles"]["codex"].as_str().unwrap()).join("sessions/test.jsonl");
+    let original = fs::read(&rollout).unwrap();
+    fs::write(&rollout, b"changed rollout").unwrap();
+    assert!(npm_upgrade::prepare(&root, &plan).is_err());
+    assert!(root.join("attempt-1").exists());
+    fs::write(&rollout, original).unwrap();
+    assert_eq!(npm_upgrade::prepare(&root, &plan).unwrap()["attempt"], 2);
+    assert!(root.join("attempt-1").exists());
+    assert_eq!(npm_upgrade::prepare(&root, &plan).unwrap()["attempt"], 2);
+    assert!(!root.join("attempt-3").exists());
+}
+
+#[test]
+fn npm_upgrade_requires_existing_profiles_and_refuses_a_foreign_root() {
+    use remodex_connect_native::npm_upgrade;
+    let (f, root, plan, receipt) = npm_upgrade_fixture();
+    let mut owner = read(&receipt);
+    owner["profile_mode"] = json!("copy");
+    write(&receipt, &owner);
+    assert!(npm_upgrade::prepare(&root, &plan).is_err());
+    assert!(!root.exists());
+    owner["profile_mode"] = json!("existing");
+    write(&receipt, &owner);
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("important"), b"keep").unwrap();
+    assert!(npm_upgrade::prepare(&root, &plan).is_err());
+    assert_eq!(fs::read(root.join("important")).unwrap(), b"keep");
+    let lock_root = f._dir.path().join("locked-install");
+    let _lease = profile_lock::acquire(&lock_root).unwrap();
+    assert!(npm_upgrade::prepare(&lock_root, &plan).is_err());
+}
+
+#[test]
+fn npm_upgrade_caps_failed_exports_and_retains_each_attempt() {
+    use remodex_connect_native::npm_upgrade;
+    let (_f, root, plan, receipt) = npm_upgrade_fixture();
+    let owner = read(&receipt);
+    let rollout =
+        PathBuf::from(owner["profiles"]["codex"].as_str().unwrap()).join("sessions/test.jsonl");
+    let original = fs::read(&rollout).unwrap();
+    fs::write(&rollout, b"changed rollout").unwrap();
+    for attempt in 1..=3 {
+        assert!(npm_upgrade::prepare(&root, &plan).is_err());
+        assert!(root.join(format!("attempt-{attempt}")).exists());
+    }
+    fs::write(&rollout, &original).unwrap();
+    assert!(npm_upgrade::prepare(&root, &plan).is_err());
+    assert!(!root.join("attempt-4").exists());
+    assert!(!root.join("service").exists());
+    assert_eq!(fs::read(&rollout).unwrap(), original);
+}
+
+#[test]
+fn npm_upgrade_recovers_only_its_own_interrupted_cutover_intent() {
+    use remodex_connect_native::npm_upgrade;
+    let (_f, root, plan, _receipt) = npm_upgrade_fixture();
+    let selected = npm_upgrade::prepare(&root, &plan).unwrap();
+    let path = root.join("cutover.json");
+    let original = fs::read(&path).unwrap();
+    fs::write(&path, &original[..original.len() / 2]).unwrap();
+    assert_eq!(npm_upgrade::prepare(&root, &plan).unwrap(), selected);
+    assert_eq!(fs::read(&path).unwrap(), original);
+    fs::write(&path, b"different intent").unwrap();
+    assert!(npm_upgrade::prepare(&root, &plan).is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"different intent");
+    assert!(!root.join("attempt-2").exists());
+}
 #[test]
 fn automatic_export_prepares_original_identity_history_and_pairing_without_handmade_stage() {
     let (f, receipt, config) = automatic_export_fixture();

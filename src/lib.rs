@@ -22,6 +22,8 @@ mod claude_reconnect;
 pub mod claude_remote;
 pub mod claude_turns;
 pub mod dashboard;
+pub mod desktop_ipc;
+pub mod desktop_snapshot;
 pub mod diagnostics;
 mod handoff_codex;
 pub mod launch_config;
@@ -114,4 +116,5 @@ pub mod storage_cleanup;
 mod storage_native_schema_tests;
 
 pub mod export_recovery;
+pub mod npm_upgrade;
 mod source_hold;

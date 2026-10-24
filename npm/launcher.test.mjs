@@ -4,7 +4,15 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { platformKey, verifyBinary } from './launcher.mjs';
+import { platformKey, verifyBinary, nativeArguments } from './launcher.mjs';
+
+test('Upgrade runs the native coordinator only on explicit launch and keeps paths literal', () => {
+  assert.deepEqual(nativeArguments(['--version']), ['--version']);
+  assert.deepEqual(nativeArguments(['upgrade', 'C:\\Users\\A B\\install', 'C:\\$(literal)\\plan.json']),
+    ['--npm-upgrade', 'run', 'C:\\Users\\A B\\install', 'C:\\$(literal)\\plan.json']);
+  assert.throws(() => nativeArguments(['upgrade']), /Usage/);
+  assert.throws(() => nativeArguments(['upgrade', 'a', 'b', 'extra']), /Usage/);
+});
 
 test('Only qualified platforms are selected; non-glibc and unknown architectures fail clearly', () => {
   assert.equal(platformKey('linux', 'x64', '2.39'), 'linux-x64-gnu');
