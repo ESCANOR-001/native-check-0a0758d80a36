@@ -488,3 +488,52 @@ async fn runtime_uses_only_handed_off_profiles_and_holds_lease_through_setup() {
     }
     f.original_intact();
 }
+
+#[test]
+fn selected_existing_profile_snapshots_keep_unrelated_live_data_out_of_migration() {
+    use remodex_connect_native::migration_snapshot;
+    let t = tempfile::tempdir().unwrap();
+    let source = t.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(source.join("sessions")).unwrap();
+    std::fs::write(source.join("sessions/chat.jsonl"), b"original chat\n").unwrap();
+    std::fs::write(source.join("auth.json"), b"DO NOT COPY").unwrap();
+    #[cfg(unix)]
+    let _socket = std::os::unix::net::UnixListener::bind(source.join("ipc.sock")).unwrap();
+    let snapshot = t.path().join("snapshot");
+    let environment = "01234567-1234-4234-8234-123456789abc";
+    let report = migration_snapshot::capture_selected(
+        &source,
+        &snapshot,
+        environment,
+        &["sessions/chat.jsonl".into()],
+    )
+    .unwrap();
+    assert_eq!(report.files, 1);
+    assert!(migration_snapshot::is_selected(&snapshot, environment).unwrap());
+    std::fs::write(source.join("auth.json"), b"AUTH STAYS LIVE IN PLACE").unwrap();
+    migration_snapshot::verify_source_entries(&snapshot, &source, environment).unwrap();
+    let restored = t.path().join("restored");
+    migration_snapshot::restore(&snapshot, &restored, environment).unwrap();
+    assert!(!restored.join("data/auth.json").exists());
+    std::fs::write(restored.join("data/unexpected"), b"must invalidate restore").unwrap();
+    assert!(migration_snapshot::verify_restored(&restored, environment).is_err());
+    std::fs::write(source.join("sessions/chat.jsonl"), b"new original chat\n").unwrap();
+    assert!(migration_snapshot::verify_source_entries(&snapshot, &source, environment).is_err());
+    assert_eq!(
+        std::fs::read(source.join("auth.json")).unwrap(),
+        b"AUTH STAYS LIVE IN PLACE"
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source.join("auth.json"), source.join("sessions/link.jsonl"))
+            .unwrap();
+        assert!(migration_snapshot::capture_selected(
+            &source,
+            &t.path().join("bad"),
+            environment,
+            &["sessions/link.jsonl".into()]
+        )
+        .is_err());
+    }
+}

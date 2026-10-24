@@ -670,6 +670,7 @@ mod tests {
             claude_permission_rules: vec![],
             remote_identity: None,
             external_claude: false,
+            external_codex: false,
             external_stop: None,
             native_control: None,
             fork_from: None,

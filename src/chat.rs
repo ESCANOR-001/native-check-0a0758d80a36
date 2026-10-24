@@ -143,6 +143,27 @@ impl Config {
             .validate(&self.workspace, &self.claude.profile)?;
         Ok(())
     }
+    pub(crate) fn desktop_endpoint(&self) -> bool {
+        matches!(
+            self.codex.shared_server,
+            Some(crate::agent::SharedServer::Desktop { .. })
+        )
+    }
+    fn shared_codex(&self, chat: &Chat) -> bool {
+        chat.agent == AgentKind::Codex
+            && self.codex.shared_server.is_some()
+            && (!self.desktop_endpoint() || chat.external_codex)
+    }
+    fn for_chat(&self, chat: &Chat) -> Result<AgentConfig, String> {
+        if chat.external_codex && !self.desktop_endpoint() {
+            return Err("Connect this chat through its original Codex Desktop owner; no replacement CLI was started".into());
+        }
+        let mut config = self.provider(chat.agent).clone();
+        if chat.agent == AgentKind::Codex && self.desktop_endpoint() && !chat.external_codex {
+            config.shared_server = None;
+        }
+        Ok(config)
+    }
     fn provider(&self, agent: AgentKind) -> &AgentConfig {
         if agent == AgentKind::Codex {
             &self.codex
@@ -165,6 +186,8 @@ pub(crate) struct Chat {
     pub remote_identity: Option<crate::claude_host::Identity>,
     #[serde(default)]
     pub external_claude: bool,
+    #[serde(default)]
+    pub external_codex: bool,
     #[serde(default)]
     pub external_stop: Option<StopIntent>,
     #[serde(default)]
@@ -198,6 +221,7 @@ impl Chat {
         self.claude_permission_rules.clear();
         self.remote_identity = None;
         self.external_claude = false;
+        self.external_codex = false;
         self.external_stop = None;
         self.native_control = None;
         self.fork_from = None;
@@ -254,16 +278,15 @@ impl Chats {
         })
         .await??;
         let profile_handoff = if let Some(root) = config.native_profile_handoff.clone() {
-            if config.codex.shared_server.is_some() {
+            if config.codex.shared_server.is_some() && !config.desktop_endpoint() {
                 return Err("Shared Codex ownership must be handed off by its original server; a copied profile cannot adopt that transport".into());
             }
             let external = db
                 .call(|a| -> rusqlite::Result<bool> {
                     a.store.init_chats()?;
-                    Ok(a.store
-                        .chat_headers()?
-                        .iter()
-                        .any(|chat| chat["external_claude"] == true))
+                    Ok(a.store.chat_headers()?.iter().any(|chat| {
+                        chat["external_claude"] == true || chat["external_codex"] == true
+                    }))
                 })
                 .await?
                 .map_err(|_| "Cannot verify native profile ownership")?;
@@ -279,7 +302,7 @@ impl Chats {
             .await
             .map_err(|_| "Native profile handoff check failed")??;
             if external && !session.retains_original_profiles() {
-                return Err("Externally owned Claude chats must remain with their original profile; automatic profile handoff was refused".into());
+                return Err("Externally owned chats must remain with their original profile; automatic profile handoff was refused".into());
             }
             let migration_config = config.clone();
             db.call(move |a| a.store.complete_migration_activation(&migration_config))
@@ -333,7 +356,7 @@ impl Chats {
             }
             // Prior delivery may have reached the model. Never replay it.
             let recover_shared = chat.agent == AgentKind::Codex
-                && config.codex.shared_server.is_some()
+                && config.shared_codex(&chat)
                 && !chat.native_id.is_empty()
                 && chat.thread["deletedAt"].is_null()
                 && chat.thread["archivedAt"].is_null()
@@ -822,7 +845,9 @@ impl Hub {
                 .count()
     }
     fn detached_shared_task(&self, id: &str) -> bool {
-        self.config.codex.shared_server.is_some()
+        self.chats
+            .get(id)
+            .is_some_and(|chat| self.config.shared_codex(chat))
             && !self.active.contains_key(id)
             && self.chats.get(id).is_some_and(|chat| {
                 chat.agent == AgentKind::Codex
@@ -842,7 +867,7 @@ impl Hub {
         if self.busy(id) || other_busy >= self.config.max_active_chats {
             return Ok(());
         }
-        let config = &self.config.codex;
+        let config = self.config.for_chat(&self.chats[id])?;
         let connection = config
             .shared_server
             .as_ref()
@@ -1219,7 +1244,9 @@ impl Hub {
                     continue;
                 };
                 let native = chat.native_id.clone();
-                let config = self.config.codex.clone();
+                let Ok(config) = self.config.for_chat(chat) else {
+                    continue;
+                };
                 let db = self.db.clone();
                 let send_epoch = shared_sends.get(&id).map(|(_, epoch, _)| *epoch);
                 shared_reads.insert(id.clone());
@@ -1242,7 +1269,10 @@ impl Hub {
                     .pop()
                     .filter(|a| *a != AgentKind::Claude || self.claude_enabled)
                 {
-                    let config = self.config.provider(agent).clone();
+                    let mut config = self.config.provider(agent).clone();
+                    if agent == AgentKind::Codex && self.config.desktop_endpoint() {
+                        config.shared_server = None;
+                    }
                     let cwd = self.config.workspace.clone();
                     discovery.spawn(async move {
                         (agent, crate::discovery::discover(agent, config, &cwd).await)
@@ -1286,7 +1316,7 @@ impl Hub {
                     }
                     if r.method=="native.watchShared" {
                         let id=s(&r.params["threadId"]).to_owned();
-                        if r.agent==AgentKind::Codex && self.config.codex.shared_server.is_some() && self.checked(r.agent,&id).is_ok() && (self.shared_watches.len()<64 || self.shared_watches.contains_key(&id)) {
+                        if r.agent==AgentKind::Codex && self.checked(r.agent,&id).is_ok_and(|c|self.config.shared_codex(c)) && (self.shared_watches.len()<64 || self.shared_watches.contains_key(&id)) {
                             let watch=self.shared_watches.entry(id).or_insert((Instant::now(),Instant::now()));watch.0=Instant::now()+Duration::from_secs(3);
                         }
                         let _=r.reply.send(Ok(json!({})));continue;
@@ -1323,7 +1353,7 @@ impl Hub {
                         });
                         continue;
                     }
-                    if r.method=="orchestration.dispatchCommand" && r.params["type"]=="thread.turn.start" && r.params.get("promptEdit").is_none() && r.params.get("bootstrap").is_none() && r.agent==AgentKind::Codex && self.config.codex.shared_server.is_some() {
+                    if r.method=="orchestration.dispatchCommand" && r.params["type"]=="thread.turn.start" && r.params.get("promptEdit").is_none() && r.params.get("bootstrap").is_none() && r.agent==AgentKind::Codex && self.chats.get(s(&r.params["threadId"])).is_some_and(|c|self.config.shared_codex(c)) {
                         let id=s(&r.params["threadId"]).to_owned();
                         if self.checked(r.agent,&id).is_ok_and(|c|!c.native_id.is_empty()) && !self.active.contains_key(&id) {
                             if self.tool_controls.contains(&id) || shared_sends.contains_key(&id) || shared_sends.len()>=4 {let _=r.reply.send(Err("Wait for this chat's current history check".into()));continue;}
@@ -2731,6 +2761,7 @@ impl Hub {
             claude_permission_rules: vec![],
             remote_identity: None,
             external_claude: false,
+            external_codex: false,
             external_stop: None,
             native_control: None,
             fork_from: None,
@@ -3517,7 +3548,7 @@ impl Hub {
         {
             return Err("Claude connection is waiting for an available worker".into());
         }
-        let p = self.config.provider(chat.agent);
+        let p = self.config.for_chat(chat)?;
         let mut env = crate::discovery::environment(chat.agent, &p.profile);
         let mut args = crate::discovery::isolated_args(chat.agent);
         if chat.agent == AgentKind::Claude {
@@ -3910,7 +3941,7 @@ impl Hub {
             }
             _ => {
                 if self.chats[&id].agent == AgentKind::Codex
-                    && self.config.codex.shared_server.is_some()
+                    && self.config.shared_codex(&self.chats[&id])
                     && !w.native_turn.is_empty()
                 {
                     self.detach_shared_connection(&id).await?;
@@ -4005,7 +4036,7 @@ impl Hub {
             if !w.native_turn.is_empty() && turn.is_some_and(|turn| turn != w.native_turn) {
                 return Ok(());
             }
-            if self.config.codex.shared_server.is_some()
+            if self.config.shared_codex(&self.chats[&id])
                 && (s(&v["method"]).starts_with("item/")
                     || s(&v["method"]).starts_with("turn/")
                     || s(&v["method"]).starts_with("mcpServer/elicitation/"))
@@ -4439,7 +4470,7 @@ impl Hub {
                     .send(&json!({"id":"quota","method":"account/rateLimits/read","params":{}}))
                     .await
                     .map_err(|_| "CLI disconnected")?;
-                if self.config.codex.shared_server.is_some() && !chat.native_id.is_empty() {
+                if self.config.shared_codex(chat) && !chat.native_id.is_empty() {
                     w.connection.send(&json!({"id":"shared-check","method":"thread/read","params":{"threadId":chat.native_id,"includeTurns":false}})).await.map_err(|_| "Shared Codex state check disconnected")?;
                     w.stage = "shared-check";
                 } else {
@@ -4553,9 +4584,7 @@ impl Hub {
             }
         }
         if codex && response == "thread" && w.stage == "thread" {
-            if self.config.codex.shared_server.is_some()
-                && v["result"]["thread"]["status"]["type"] != "idle"
-            {
+            if self.config.shared_codex(chat) && v["result"]["thread"]["status"]["type"] != "idle" {
                 return Err("Shared Codex chat is not idle. The new prompt was not delivered; its existing task was left running.".into());
             }
             chat.native_id = s(&v["result"]["thread"]["id"]).into();
@@ -4758,7 +4787,7 @@ impl Hub {
             }
             // Native IDs restart with each worker. Public IDs must remain unique
             // across the durable transcript, including older pages.
-            let prior = if codex && self.config.codex.shared_server.is_some() {
+            let prior = if codex && self.config.shared_codex(chat) {
                 let cid = id.clone();
                 let turn = s(&chat.thread["latestTurn"]["turnId"]).to_owned();
                 let native = v["id"].clone();
@@ -4834,7 +4863,7 @@ impl Hub {
         // reports the unsupported size explicitly instead of silently clipping.
         let mut projected = chat.clone();
         if codex
-            && self.config.codex.shared_server.is_some()
+            && self.config.shared_codex(chat)
             && ["item/started", "item/completed"].contains(&s(&v["method"]))
             && v["params"]["item"]["type"] == "userMessage"
         {
@@ -5227,6 +5256,13 @@ impl Hub {
         self.save(id, None).await
     }
     async fn end(&mut self, id: &str, state: &str, error: Option<&str>) {
+        // A follower failure cannot cancel the Desktop owner's live work, even
+        // when the latest prompt originated on this phone. Explicit Stop has
+        // its own original-owner command and confirmation path.
+        if error.is_some() && self.chats.get(id).is_some_and(|c| c.external_codex) {
+            let _ = self.detach_shared_connection(id).await;
+            return;
+        }
         if self.chats.get(id).is_some_and(|c| c.external_claude) {
             self.detach_external_claude(id, error).await;
             return;
@@ -5275,8 +5311,9 @@ impl Hub {
             return;
         }
         if self.chats[&id].agent == AgentKind::Codex
-            && self.config.codex.shared_server.is_some()
+            && self.config.shared_codex(&self.chats[&id])
             && state != "completed"
+            && !self.chats[&id].external_codex
             && w.owns_turn
             && !w.native_turn.is_empty()
         {
@@ -5394,4 +5431,55 @@ fn consumed(v: &Value) -> Vec<String> {
         }
     }
     ids
+}
+
+#[cfg(test)]
+mod desktop_routing_tests {
+    use super::*;
+    fn chat(external: bool) -> Chat {
+        serde_json::from_value(json!({"agent":"codex","thread":{},"native_id":"native","resumed":true,"external_codex":external})).unwrap()
+    }
+    #[test]
+    fn desktop_endpoint_never_adopts_an_owned_chat_and_missing_owner_never_falls_back() {
+        let provider = AgentConfig {
+            executable: "/fixture/cli".into(),
+            profile: "/fixture/profile".into(),
+            model: "fixture".into(),
+            tools: Default::default(),
+            shared_server: None,
+            remote_control: false,
+        };
+        let mut config = Config {
+            native_profile_handoff: None,
+            storage: Default::default(),
+            max_active_chats: 1,
+            workspace: "/fixture/workspace".into(),
+            codex: provider.clone(),
+            claude: provider,
+        };
+        assert!(config.for_chat(&chat(true)).is_err());
+        config.codex.shared_server = Some(crate::agent::SharedServer::Desktop {
+            desktop_endpoint: crate::desktop_ipc::Endpoint {
+                path: "/fixture/profile/ipc.sock".into(),
+            },
+            reader_executable: "/fixture/cli".into(),
+            reader_workspace: "/fixture/workspace".into(),
+        });
+        assert!(config
+            .for_chat(&chat(false))
+            .unwrap()
+            .shared_server
+            .is_none());
+        assert!(!config.shared_codex(&chat(false)));
+        assert!(config
+            .for_chat(&chat(true))
+            .unwrap()
+            .shared_server
+            .is_some());
+        assert!(config.shared_codex(&chat(true)));
+        let mut branch = chat(true);
+        branch.detach_native_session();
+        assert!(!branch.external_codex);
+        assert!(config.for_chat(&branch).unwrap().shared_server.is_none());
+    }
 }

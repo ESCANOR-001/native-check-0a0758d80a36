@@ -187,6 +187,7 @@ impl Prepared {
                     Some("approval-required" | "auto-accept-edits" | "full-access")
                 )
                 || !matches!(alias["interactionMode"].as_str(), Some("default" | "plan"))
+                || (!alias["externalCodex"].is_null() && !alias["externalCodex"].is_boolean())
                 || (!alias["workspaceKind"].is_null() && alias["workspaceKind"] != "projectless")
                 || (alias["workspaceKind"] == "projectless" && project != "codex-project-chats")
             {
@@ -231,6 +232,7 @@ impl Prepared {
                 claude_permission_rules: vec![],
                 remote_identity: None,
                 external_claude: false,
+                external_codex: alias["externalCodex"] == true,
                 external_stop: None,
                 native_control: None,
                 fork_from: None,

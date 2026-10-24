@@ -299,8 +299,11 @@ impl Journal {
             if running_existing {
                 continue;
             }
-            migration_snapshot::verify_tree(&input.snapshot, &input.original_profile, &plan.environment)
-                .map_err(|_| "The original native profile changed after export. Handoff was stopped to avoid losing or splitting history; both copies are intact".to_owned())?;
+            (if plan.profile_mode == ProfileMode::Existing {
+                migration_snapshot::verify_source_entries(&input.snapshot, &input.original_profile, &plan.environment)
+            } else {
+                migration_snapshot::verify_tree(&input.snapshot, &input.original_profile, &plan.environment)
+            }).map_err(|_| "The original native profile changed after export. Handoff was stopped to avoid losing or splitting history; both copies are intact".to_owned())?;
         }
         Ok(())
     }
@@ -332,6 +335,12 @@ fn validate(plan: &Plan, root: &Path) -> Result<()> {
     }
     for input in [&plan.codex, &plan.claude] {
         isolated(&input.original_profile)?;
+        if plan.profile_mode == ProfileMode::Copy
+            && migration_snapshot::is_selected(&input.snapshot, &plan.environment)
+                .map_err(|_| ERROR)?
+        {
+            return Err(ERROR.into());
+        }
         if plan.profile_mode == ProfileMode::Existing
             && input.original_profile.canonicalize().map_err(|_| ERROR)? != input.original_profile
         {

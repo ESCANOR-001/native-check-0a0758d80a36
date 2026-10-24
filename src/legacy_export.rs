@@ -124,7 +124,9 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
     config.validate()?;
     if receipt.version != 1
         || receipt.chats.len() > 10_000
-        || config.codex.shared_server.is_some()
+        || (config.codex.shared_server.is_some()
+            && !(config.desktop_endpoint()
+                && receipt.profile_mode == profile_handoff::ProfileMode::Existing))
         || config.claude.shared_server.is_some()
         || config.codex.profile != receipt.profiles.codex
         || config.claude.profile != receipt.profiles.claude
@@ -216,11 +218,26 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
         ("codex", &receipt.profiles.codex),
         ("claude", &receipt.profiles.claude),
     ] {
-        profile_handoff::capture_export(
-            profile,
-            &source.join(format!("{agent}-native")),
-            &receipt.environment,
-        )?;
+        let destination = source.join(format!("{agent}-native"));
+        if receipt.profile_mode == profile_handoff::ProfileMode::Existing {
+            let files: Vec<_> = receipt
+                .chats
+                .iter()
+                .filter(|c| c.agent == agent)
+                .map(|c| c.transcript.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            migration_snapshot::capture_selected(
+                profile,
+                &destination,
+                &receipt.environment,
+                &files,
+            )
+            .map_err(|_| ERROR)?;
+        } else {
+            profile_handoff::capture_export(profile, &destination, &receipt.environment)?;
+        }
     }
     for (name, input) in [
         ("connection.json", &receipt.connection),

@@ -115,7 +115,10 @@ pub mod storage_cleanup;
 #[cfg(test)]
 mod storage_native_schema_tests;
 
+pub mod codex_history_reader;
 pub mod export_recovery;
 pub mod npm_upgrade;
 mod source_hold;
 pub mod upgrade_source;
+
+pub(crate) mod codex_lifecycle;

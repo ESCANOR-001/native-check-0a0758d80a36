@@ -241,6 +241,7 @@ impl Prepared {
             claude_plan_access: plan,
             remote_identity: identity,
             external_claude: optional_bool(&root["external"])?,
+            external_codex: false,
             external_stop: None,
             native_control: None,
             fork_from: None,

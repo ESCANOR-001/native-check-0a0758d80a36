@@ -196,6 +196,8 @@ struct Manifest {
     version: u32,
     environment: String,
     entries: Vec<Entry>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    selected_files: bool,
 }
 /// Safe for diagnostics: counts only, no paths, prompts or credential contents.
 #[derive(Debug, PartialEq, Eq)]
@@ -259,10 +261,77 @@ pub fn capture(
 ) -> io::Result<Report> {
     capture_inner(source, destination, original_environment, || Ok(()))
 }
+/// Snapshot only explicitly inventoried native transcripts. Live profiles stay
+/// in place; sockets, logs, credentials and unrelated sessions are not copied.
+pub fn capture_selected(
+    source: &Path,
+    destination: &Path,
+    environment: &str,
+    files: &[String],
+) -> io::Result<Report> {
+    capture_scoped(source, destination, environment, Some(files), || Ok(()))
+}
+pub fn is_selected(snapshot: &Path, environment: &str) -> io::Result<bool> {
+    verify_inner(snapshot, environment).map(|(m, _)| m.selected_files)
+}
+fn selected_inventory(
+    root: &Path,
+    files: &[String],
+    deadline: Instant,
+) -> io::Result<BTreeMap<String, Observed>> {
+    open(root, true)?;
+    if files.len() > MAX_ENTRIES {
+        return Err(invalid());
+    }
+    let mut result = BTreeMap::new();
+    let mut chosen = BTreeSet::new();
+    let mut bytes = 0u64;
+    for name in files {
+        budget(deadline)?;
+        if !valid_name(name) || !chosen.insert(name) {
+            return Err(invalid());
+        }
+        let parts: Vec<_> = name.split('/').collect();
+        let mut relative = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                relative.push('/');
+            }
+            relative.push_str(part);
+            let is_dir = i + 1 < parts.len();
+            if let Some(old) = result.get(&relative) {
+                let old: &Observed = old;
+                if old.directory != is_dir {
+                    return Err(invalid());
+                }
+                continue;
+            }
+            let mut observed = Observed::read(&root.join(&relative), is_dir)?;
+            if is_dir {
+                observed.modified = SystemTime::UNIX_EPOCH;
+            }
+            bytes = bytes.checked_add(observed.bytes).ok_or_else(invalid)?;
+            if bytes > MAX_BYTES || result.len() >= MAX_ENTRIES {
+                return Err(invalid());
+            }
+            result.insert(relative.clone(), observed);
+        }
+    }
+    Ok(result)
+}
 fn capture_inner(
     source: &Path,
     destination: &Path,
     original_environment: &str,
+    copied: impl FnOnce() -> io::Result<()>,
+) -> io::Result<Report> {
+    capture_scoped(source, destination, original_environment, None, copied)
+}
+fn capture_scoped(
+    source: &Path,
+    destination: &Path,
+    original_environment: &str,
+    files: Option<&[String]>,
     copied: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<Report> {
     if !source.is_absolute() || !destination.is_absolute() || !environment(original_environment) {
@@ -278,7 +347,11 @@ fn capture_inner(
     if parent.starts_with(&source) || source.starts_with(&destination) {
         return Err(invalid());
     }
-    let before = inventory(&source, deadline)?;
+    let inventory_source = || match files {
+        Some(files) => selected_inventory(&source, files, deadline),
+        None => inventory(&source, deadline),
+    };
+    let before = inventory_source()?;
     directory(&destination)?; // Atomic refusal of an existing file/directory/link.
     directory(&destination.join("objects"))?;
     let mut entries = Vec::new();
@@ -321,7 +394,11 @@ fn capture_inner(
             }
         }
     }
-    if before != inventory(&source, deadline)? || root_before != Observed::read(&source, true)? {
+    let root_after = Observed::read(&source, true)?;
+    if before != inventory_source()?
+        || root_before.identity != root_after.identity
+        || (files.is_none() && root_before != root_after)
+    {
         return Err(invalid());
     }
     sync_directory(&destination.join("objects"))?;
@@ -329,6 +406,7 @@ fn capture_inner(
         version: 1,
         environment: original_environment.into(),
         entries,
+        selected_files: files.is_some(),
     };
     commit_manifest(&destination, MANIFEST, &manifest)?;
     verify(&destination, original_environment)
@@ -348,6 +426,47 @@ pub fn verify_tree(snapshot: &Path, data: &Path, original_environment: &str) -> 
         return Err(invalid());
     }
     verify_data(data, &manifest, Instant::now() + TIMEOUT)?;
+    Ok(report)
+}
+/// Verify selected source files without classifying a running profile's
+/// unrelated files as migrated. Restore and rollback of copied data remain exact.
+pub fn verify_source_entries(
+    snapshot: &Path,
+    data: &Path,
+    environment: &str,
+) -> io::Result<Report> {
+    let (manifest, report) = verify_inner(snapshot, environment)?;
+    if !manifest.selected_files {
+        return verify_tree(snapshot, data, environment);
+    }
+    if !data.is_absolute() {
+        return Err(invalid());
+    }
+    let deadline = Instant::now() + TIMEOUT;
+    let files: Vec<_> = manifest
+        .entries
+        .iter()
+        .filter(|e| !e.directory)
+        .map(|e| e.name.clone())
+        .collect();
+    let before = selected_inventory(data, &files, deadline)?;
+    if before.len() != manifest.entries.len() {
+        return Err(invalid());
+    }
+    for entry in &manifest.entries {
+        let observed = before.get(&entry.name).ok_or_else(invalid)?;
+        if observed.directory != entry.directory || observed.bytes != entry.bytes {
+            return Err(invalid());
+        }
+        if let Some(hash) = &entry.sha256 {
+            if stream(&data.join(&entry.name), entry.bytes, None, deadline)? != *hash {
+                return Err(invalid());
+            }
+        }
+    }
+    if before != selected_inventory(data, &files, deadline)? {
+        return Err(invalid());
+    }
     Ok(report)
 }
 fn read_manifest(directory: &Path, name: &str) -> io::Result<Manifest> {

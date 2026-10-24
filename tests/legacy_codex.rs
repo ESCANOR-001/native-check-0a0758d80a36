@@ -677,3 +677,16 @@ fn desktop_header_transcript_migration_pages_history_and_orders_restarted_sequen
     store.rollback_legacy_codex_headers().unwrap();
     store.rollback_legacy_connection().unwrap();
 }
+
+#[test]
+fn desktop_owner_marker_survives_import_and_rejects_ambiguous_types() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut input = source(cwd.path());
+    input["threadAliases"][0]["externalCodex"] = json!(true);
+    let (_dir, mut store, db, _) = setup(&input);
+    store.prepare_legacy_codex().unwrap();
+    assert_eq!(state(&db)["external_codex"], true);
+    input["threadAliases"][0]["externalCodex"] = json!("true");
+    let (_dir, mut store, _, _) = setup(&input);
+    assert!(store.prepare_legacy_codex().is_err());
+}

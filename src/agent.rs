@@ -7,6 +7,8 @@ use tokio::{
     process::{Child, Command},
     sync::{mpsc, oneshot, watch},
 };
+#[path = "desktop_connection.rs"]
+mod desktop_connection;
 
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 /// Input may contain Android’s bounded 40 MiB of base64 images.
@@ -26,6 +28,11 @@ pub struct Launch {
 #[derive(Clone, serde::Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum SharedServer {
+    Desktop {
+        desktop_endpoint: crate::desktop_ipc::Endpoint,
+        reader_executable: PathBuf,
+        reader_workspace: PathBuf,
+    },
     Capability {
         address: std::net::SocketAddr,
         token_file: PathBuf,
@@ -37,6 +44,20 @@ pub enum SharedServer {
 impl SharedServer {
     pub fn validate(&self, profile: &std::path::Path) -> Result<(), String> {
         match self {
+            Self::Desktop {
+                desktop_endpoint,
+                reader_executable,
+                reader_workspace,
+            } => {
+                if !reader_executable.is_absolute()
+                    || !reader_executable.is_file()
+                    || !reader_workspace.is_absolute()
+                    || !reader_workspace.is_dir()
+                {
+                    return Err("The Desktop history reader needs explicit existing paths".into());
+                }
+                desktop_endpoint.validate(profile)
+            }
             Self::Capability { .. } => self.open_token(profile).map(|_| ()),
             Self::Unix { socket_path } => validate_socket(profile, socket_path).map(|_| ()),
         }
@@ -114,6 +135,21 @@ impl SharedServer {
         Ok(handle)
     }
     pub async fn connect(&self, profile: &std::path::Path) -> Result<Connection, String> {
+        if let Self::Desktop {
+            desktop_endpoint,
+            reader_executable,
+            reader_workspace,
+        } = self
+        {
+            self.validate(profile)?;
+            return Connection::connect_desktop(
+                desktop_endpoint.clone(),
+                profile.to_owned(),
+                reader_executable.clone(),
+                reader_workspace.clone(),
+            )
+            .await;
+        }
         if let Self::Unix { socket_path } = self {
             let resolved = validate_socket(profile, socket_path)?;
             return Connection::connect_unix(&resolved)

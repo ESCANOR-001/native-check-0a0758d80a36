@@ -129,7 +129,7 @@ pub(crate) async fn read(
             Ok(v)=>v,
             Err(error)=>{
                 let cid=chat.clone();let nid=native.clone();
-                if !explicit_send || error["message"]!=format!("thread not loaded: {native}")
+                if matches!(config.shared_server, Some(crate::agent::SharedServer::Desktop { .. })) || !explicit_send || error["message"]!=format!("thread not loaded: {native}")
                     || !db.call(move|a|a.store.empty_shared_session(&cid,&nid)).await?.map_err(|_|"Cannot verify the empty session")? {
                     return Err("Shared history read failed (thread/read); existing history is intact".into());
                 }

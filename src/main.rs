@@ -11,6 +11,23 @@ use std::{future::IntoFuture, path::PathBuf, time::Duration};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "--capture-codex-history") {
+        if args.len() != 5 {
+            return Err(
+                "Usage: --capture-codex-history CONFIG_JSON NATIVE_ID NEW_OUTPUT_JSONL".into(),
+            );
+        }
+        println!(
+            "{}",
+            remodex_connect_native::codex_history_reader::capture_from_config(
+                &PathBuf::from(&args[2]),
+                &args[3],
+                &PathBuf::from(&args[4])
+            )
+            .await?
+        );
+        return Ok(());
+    }
     if args.get(1).is_some_and(|a| a == "--npm-upgrade") {
         let root = args
             .get(3)

@@ -86,6 +86,9 @@ fn parse(raw: &[u8], root: &Value) -> Result<Vec<Value>, String> {
             return Err(INVALID.into());
         }
         let mut alias = alias.clone();
+        // Headers recovered outside the old bridge's owned aliases remain
+        // attached to their Desktop owner. Import must never claim them.
+        alias["externalCodex"] = json!(true);
         for key in ["archivedAt", "deletedAt", "branch"] {
             if alias.get(key).is_some_and(|v| v != &row[key]) {
                 return Err(INVALID.into());

@@ -17,7 +17,9 @@ const ERROR:&str="This migration is not ready to activate; original installation
 
 fn binding(config: &Config) -> Result<String, String> {
     config.validate()?;
-    if config.codex.shared_server.is_some() || config.claude.shared_server.is_some() {
+    if (config.codex.shared_server.is_some() && !config.desktop_endpoint())
+        || config.claude.shared_server.is_some()
+    {
         return Err("Shared owners require their existing connection; this owned-profile migration cannot take them over".into());
     }
     let root = config
@@ -26,7 +28,16 @@ fn binding(config: &Config) -> Result<String, String> {
         .ok_or(ERROR)?
         .canonicalize()
         .map_err(|_| ERROR)?;
-    Ok(crate::auth::digest(&json!({"root":root,"codex":config.codex.profile.canonicalize().map_err(|_|ERROR)?,"claude":config.claude.profile.canonicalize().map_err(|_|ERROR)?,"workspace":config.workspace.canonicalize().map_err(|_|ERROR)?}).to_string()))
+    let mut value = json!({"root":root,"codex":config.codex.profile.canonicalize().map_err(|_|ERROR)?,"claude":config.claude.profile.canonicalize().map_err(|_|ERROR)?,"workspace":config.workspace.canonicalize().map_err(|_|ERROR)?});
+    if let Some(crate::agent::SharedServer::Desktop {
+        desktop_endpoint,
+        reader_executable,
+        reader_workspace,
+    }) = &config.codex.shared_server
+    {
+        value["desktopOwner"] = json!({"endpoint":desktop_endpoint.path,"reader":reader_executable.canonicalize().map_err(|_|ERROR)?,"workspace":reader_workspace.canonicalize().map_err(|_|ERROR)?});
+    }
+    Ok(crate::auth::digest(&value.to_string()))
 }
 fn transcript(profile: &Path, relative: &str, report: &str) -> Result<(), String> {
     let report: Value = serde_json::from_str(report).map_err(|_| ERROR)?;
@@ -209,7 +220,7 @@ impl Store {
             if !known {
                 return Err(ERROR.into());
             }
-            let external = value["external_claude"] == true;
+            let external = value["external_claude"] == true || value["external_codex"] == true;
             value["thread"]["session"]["status"] =
                 json!(if external { "disconnected" } else { "ready" });
             value["thread"]["session"]["statusConfidence"] =
@@ -306,7 +317,9 @@ pub fn run(directory: &Path, config_path: &Path) -> Result<Value, String> {
     }
     for (id, agent, raw) in &chats {
         let chat: Value = serde_json::from_str(raw).map_err(|_| ERROR)?;
-        if (chat["external_claude"] == true && !session.retains_original_profiles())
+        if ((chat["external_claude"] == true || chat["external_codex"] == true)
+            && !session.retains_original_profiles())
+            || (chat["external_codex"] == true && !config.desktop_endpoint())
             || chat["thread"]["session"]["activeTurnId"].is_string()
         {
             return Err(ERROR.into());

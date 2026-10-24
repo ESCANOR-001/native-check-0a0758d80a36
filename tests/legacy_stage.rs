@@ -1785,3 +1785,62 @@ fn source_lease_prevents_export_preparation_during_service_recovery() {
     assert!(remodex_connect_native::legacy_export::run(&root, &receipt, &config).is_err());
     assert!(!root.exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn desktop_owned_upgrade_retains_original_profiles_and_never_activates_as_a_cli_owner() {
+    use remodex_connect_native::{legacy_activation, legacy_export};
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    let (f, receipt, config) = automatic_export_fixture();
+    let mut cfg = read(&config);
+    let codex = PathBuf::from(cfg["codex"]["profile"].as_str().unwrap());
+    let socket = codex.join("ipc.sock");
+    let _listener = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    cfg["codex"]["shared_server"] = json!({"desktop_endpoint":{"path":socket},"reader_executable":std::env::current_exe().unwrap(),"reader_workspace":f._dir.path()});
+    write(&config, &cfg);
+    let owner = receipt.parent().unwrap();
+    let connection = owner.join("connection.json");
+    let mut conn = read(&connection);
+    conn["threadAliases"][0]["externalCodex"] = json!(true);
+    write(&connection, &conn);
+    let root = f._dir.path().join("desktop-automatic");
+    assert!(
+        legacy_export::run(&root, &receipt, &config).is_err(),
+        "copy mode must never detach a Desktop chat"
+    );
+    assert!(!root.exists());
+    let mut receipt_value = read(&receipt);
+    receipt_value["profile_mode"] = json!("existing");
+    write(&receipt, &receipt_value);
+    legacy_export::run(&root, &receipt, &config).unwrap();
+    let state = root.join("generation/bridge/state");
+    let migrated_config = root.join("configuration.json");
+    let before = fs::read(codex.join("sessions/test.jsonl")).unwrap();
+    legacy_activation::run(&state, &migrated_config).unwrap();
+    let db = Connection::open(state.join("native-connect.sqlite")).unwrap();
+    let raw: String = db
+        .query_row("SELECT data FROM chats WHERE id='codex'", [], |r| r.get(0))
+        .unwrap();
+    let chat: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(chat["external_codex"], true);
+    assert_eq!(chat["native_id"], CODEX);
+    assert_eq!(chat["thread"]["session"]["statusConfidence"], "unknown");
+    assert_eq!(fs::read(codex.join("sessions/test.jsonl")).unwrap(), before);
+    assert_eq!(
+        read(&migrated_config)["codex"]["profile"],
+        cfg["codex"]["profile"]
+    );
+    let mut wrong = read(&migrated_config);
+    wrong["codex"]
+        .as_object_mut()
+        .unwrap()
+        .remove("shared_server");
+    let wrong_path = root.join("wrong-owner.json");
+    write(&wrong_path, &wrong);
+    assert!(
+        legacy_activation::run(&state, &wrong_path).is_err(),
+        "restoring config must not take over the Desktop chat"
+    );
+    legacy_activation::run(&state, &migrated_config).unwrap();
+}

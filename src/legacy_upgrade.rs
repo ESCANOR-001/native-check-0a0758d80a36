@@ -169,7 +169,9 @@ pub fn run(operation: &str, root: &Path, plan_file: &Path) -> Result<Value, Stri
     if plan.version != 1
         || native.version != 1
         || native.environment != plan.environment
-        || config.codex.shared_server.is_some()
+        || (config.codex.shared_server.is_some()
+            && !(config.desktop_endpoint()
+                && native.profile_mode == profile_handoff::ProfileMode::Existing))
         || config.claude.shared_server.is_some()
     {
         return Err(ERROR.into());
