@@ -731,6 +731,36 @@ pub fn verify_restored(destination: &Path, original_environment: &str) -> io::Re
     Ok(report)
 }
 
+/// Exact files retained by a completed restore. Used only by offline rollback;
+/// unknown/partial files are preserved and prevent clearing the connection.
+pub(crate) fn retained_asset_rows(
+    destination: &Path,
+    original_environment: &str,
+) -> io::Result<BTreeMap<String, i64>> {
+    verify_restored(destination, original_environment)?;
+    if read_manifest(destination, RESTORED)? != read_manifest(destination, RESTORE_PLAN)? {
+        return Err(invalid());
+    }
+    let found = inventory(destination, Instant::now() + TIMEOUT)?;
+    let mut rows = BTreeMap::new();
+    for (name, observed) in found {
+        if observed.directory {
+            if name != "data" && name != "copying" && !name.starts_with("data/") {
+                return Err(invalid());
+            }
+        } else {
+            if name != RESTORED && name != RESTORE_PLAN && !name.starts_with("data/") {
+                return Err(invalid());
+            }
+            rows.insert(
+                destination.join(name).to_str().ok_or_else(invalid)?.into(),
+                i64::try_from(observed.bytes).map_err(|_| invalid())?,
+            );
+        }
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

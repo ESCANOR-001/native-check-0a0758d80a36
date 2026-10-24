@@ -248,8 +248,12 @@ pub(crate) fn rollback(db: &rusqlite::Connection, id: &str) -> Result<(), String
 }
 /// Retained, already-rolled-back blobs remain accounted for. A connection
 /// rollback may leave these exact copies in place, but no unrelated asset rows.
-pub(crate) fn retained_assets(db: &rusqlite::Connection) -> Result<i64, String> {
-    let mut expected = BTreeMap::new();
+pub(crate) fn retained_assets(
+    db: &rusqlite::Connection,
+    directory: &Path,
+    environment: &str,
+) -> Result<i64, String> {
+    let mut expected = crate::legacy_uploads::retained_asset_rows(db, directory, environment)?;
     if table(db)? {
         let mut q = db
             .prepare("SELECT data FROM legacy_claude_assets WHERE phase='rolled-back' LIMIT 10001")

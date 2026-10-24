@@ -845,3 +845,92 @@ fn native_attachment_proof_and_alias_commit_atomically_and_retry_retained_copy()
     assert_eq!(fs::read(f.path(0)).unwrap(), f.files[0].1);
     assert_eq!(f.rows(), before);
 }
+
+#[test]
+fn connection_rollback_retains_verified_upload_bundles_after_chat_rollback() {
+    for scenario in 0..3 {
+        let mut f = match scenario {
+            0 => Fixture::new("codex"),
+            1 => Fixture::new("claude"),
+            _ => Fixture::native(|_| {}),
+        };
+        f.prepare().unwrap();
+        let files = [f.path(0), f.path(1)];
+        let storage = f.store.storage_status().unwrap();
+        assert!(f.store.rollback_legacy_connection().is_err());
+        f.rollback().unwrap();
+        f.store.rollback_legacy_connection().unwrap();
+        f.store.rollback_legacy_connection().unwrap();
+        assert!(f.store.assert_migration_ready().is_err());
+        assert!(f.rows().is_empty());
+        for (i, path) in files.iter().enumerate() {
+            assert_eq!(fs::read(path).unwrap(), f.files[i].1);
+        }
+        assert_eq!(
+            f.store.storage_status().unwrap()["assetBytes"],
+            storage["assetBytes"]
+        );
+        let mut reopened = Store::open(f.dir.path()).unwrap();
+        reopened.rollback_legacy_connection().unwrap();
+        assert_eq!(
+            reopened.storage_status().unwrap()["assetBytes"],
+            storage["assetBytes"]
+        );
+        assert!(!f.old.exists());
+    }
+}
+
+#[test]
+fn changed_or_unclassified_retained_uploads_refuse_connection_rollback_without_clearing_state() {
+    for scenario in 0..6 {
+        let mut f = Fixture::native(|_| {});
+        f.prepare().unwrap();
+        let path = f.path(0);
+        let bundle = path.ancestors().nth(4).unwrap().to_path_buf();
+        f.rollback().unwrap();
+        match scenario {
+            0 => fs::write(&path, b"CHANGED_COPY_MUST_SURVIVE").unwrap(),
+            1 => {
+                f.db.execute("UPDATE legacy_uploads SET source_hash='changed'", [])
+                    .unwrap();
+            }
+            2 => {
+                f.db.execute(
+                    "INSERT INTO legacy_upload_display VALUES('another-chat','orphan','hash','[]')",
+                    [],
+                )
+                .unwrap();
+            }
+            3 => fs::write(bundle.join("unknown-file"), b"KEEP_UNKNOWN").unwrap(),
+            4 => fs::write(bundle.join("copying/unknown.copy"), b"KEEP_PARTIAL").unwrap(),
+            _ => {
+                f.db.execute("UPDATE storage_assets SET bytes=bytes+1", [])
+                    .unwrap();
+            }
+        }
+        let bytes = fs::read(&path).unwrap();
+        let metadata: i64 =
+            f.db.query_row("SELECT count(*) FROM metadata", [], |r| r.get(0))
+                .unwrap();
+        assert!(metadata > 0);
+        assert!(
+            f.store.rollback_legacy_connection().is_err(),
+            "scenario {scenario}"
+        );
+        assert_eq!(
+            f.db.query_row("SELECT count(*) FROM metadata", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            metadata
+        );
+        assert_eq!(
+            f.db.query_row("SELECT phase FROM legacy_connection_import", [], |r| r
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+            "prepared"
+        );
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        assert!(f.store.assert_migration_ready().is_err());
+    }
+}

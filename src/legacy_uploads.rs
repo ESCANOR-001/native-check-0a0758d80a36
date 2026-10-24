@@ -255,6 +255,95 @@ pub(crate) fn rollback(
     }
     Ok(())
 }
+
+/// Retain verified recovery copies after child-chat rollback. This grants no
+/// resource access and never reads the original upload directory.
+pub(crate) fn retained_asset_rows(
+    db: &rusqlite::Connection,
+    directory: &Path,
+    environment: &str,
+) -> Result<BTreeMap<String, i64>, String> {
+    let mut result = BTreeMap::new();
+    if !table(db)? {
+        return Ok(result);
+    }
+    let mut query = db
+        .prepare("SELECT chat FROM legacy_uploads ORDER BY chat LIMIT 1025")
+        .map_err(|_| INVALID)?;
+    let ids = query
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|_| INVALID)?;
+    let mut bundles = BTreeSet::new();
+    let deadline = Instant::now() + Duration::from_secs(300);
+    for (count, id) in ids.enumerate() {
+        if count >= 1024 || Instant::now() >= deadline {
+            return Err(INVALID.into());
+        }
+        let id = id.map_err(|_| INVALID)?;
+        let (hash, root, bundle, raw, phase) = receipt(db, &id)?.ok_or(INVALID)?;
+        if phase != "rolled-back" || !digest(&bundle) {
+            return Err(INVALID.into());
+        }
+        let mut source = None;
+        for (table, key, claude) in [
+            ("legacy_codex_history", "chat", false),
+            ("legacy_claude_import", "id", true),
+        ] {
+            if !crate::legacy_codex_headers::table(db, table)? {
+                continue;
+            }
+            let saved: Option<(String,Vec<u8>)> = db.query_row(
+                &format!("SELECT digest,raw FROM {table} WHERE {key}=?1 AND phase='rolled-back' AND length(raw)<=16777216"),
+                [&id], |r| Ok((r.get(0)?,r.get(1)?)),
+            ).optional().map_err(|_|INVALID)?;
+            if let Some((digest, bytes)) = saved {
+                if source.is_some()
+                    || digest != hash
+                    || auth::digest(std::str::from_utf8(&bytes).map_err(|_| INVALID)?) != hash
+                {
+                    return Err(INVALID.into());
+                }
+                let mut v: Value = serde_json::from_slice(&bytes).map_err(|_| INVALID)?;
+                source = Some(if claude { v["thread"].take() } else { v });
+            }
+        }
+        let files = plan(&raw, Path::new(&root), &source.ok_or(INVALID)?)?;
+        let path = directory.join("legacy-uploads").join(&bundle);
+        if manifest(&path.join("restored.json"))? != bundle {
+            return Err(INVALID.into());
+        }
+        for file in &files {
+            checked(directory, &path.join("data").join(&file.relative), file)?;
+        }
+        if bundles.insert(bundle) {
+            for (path, bytes) in
+                migration_snapshot::retained_asset_rows(&path, environment).map_err(|_| INVALID)?
+            {
+                if result.insert(path, bytes).is_some() || result.len() > 20_000 {
+                    return Err(INVALID.into());
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+pub(crate) fn inactive_metadata(db: &rusqlite::Connection, name: &str) -> Result<bool, String> {
+    if !matches!(
+        name,
+        "legacy_upload_evidence" | "legacy_upload_display" | "legacy_upload_display_import"
+    ) {
+        return Ok(false);
+    }
+    if !table(db)? {
+        return Ok(false);
+    }
+    let orphan:bool = db.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {name} d LEFT JOIN legacy_uploads u ON u.chat=d.chat WHERE u.chat IS NULL OR u.phase<>'rolled-back')"),
+        [], |r|r.get(0),
+    ).map_err(|_|INVALID)?;
+    Ok(!orphan)
+}
 impl Store {
     pub fn read_legacy_upload_text(
         &self,

@@ -232,7 +232,7 @@ impl Store {
             if !intact {
                 return Err(INVALID.into());
             }
-            verify(&tx, prepared)?;
+            verify(&tx, prepared, &self.directory)?;
             return Ok(prepared.summary());
         }
         let occupied: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM clients) OR EXISTS(SELECT 1 FROM metadata) OR EXISTS(SELECT 1 FROM storage_assets)",[],|r|r.get(0)).map_err(|_|INVALID)?;
@@ -305,7 +305,7 @@ impl Store {
                     |r| r.get(0),
                 )
                 .map_err(|_| INVALID)?;
-            crate::legacy_claude_assets::retained_assets(&tx)?;
+            crate::legacy_claude_assets::retained_assets(&tx, &self.directory, &environment)?;
             if occupied || has_chats(&tx)? {
                 return Err(CONFLICT.into());
             }
@@ -313,7 +313,7 @@ impl Store {
             if phase != "prepared" {
                 return Err(CONFLICT.into());
             }
-            verify(&tx, &prepared)?;
+            verify(&tx, &prepared, &self.directory)?;
             tx.execute("DELETE FROM clients", []).map_err(|_| INVALID)?;
             tx.execute("DELETE FROM metadata", [])
                 .map_err(|_| INVALID)?;
@@ -351,6 +351,7 @@ fn has_chats(db: &rusqlite::Connection) -> Result<bool, String> {
                 | "legacy_codex_headers"
                 | "legacy_codex_history"
                 | "legacy_preferences_import"
+                | "legacy_uploads"
         ) {
             let active: bool = db.query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM {name} WHERE COALESCE(phase,'')<>'rolled-back')"), [], |r|r.get(0)
@@ -358,6 +359,9 @@ fn has_chats(db: &rusqlite::Connection) -> Result<bool, String> {
             if active {
                 return Ok(true);
             }
+            continue;
+        }
+        if crate::legacy_uploads::inactive_metadata(db, &name)? {
             continue;
         }
         if [
@@ -385,8 +389,13 @@ fn has_chats(db: &rusqlite::Connection) -> Result<bool, String> {
     Ok(false)
 }
 
-fn verify(db: &rusqlite::Connection, prepared: &Prepared) -> Result<(), String> {
-    let retained = crate::legacy_claude_assets::retained_assets(db)?;
+fn verify(
+    db: &rusqlite::Connection,
+    prepared: &Prepared,
+    directory: &std::path::Path,
+) -> Result<(), String> {
+    let retained =
+        crate::legacy_claude_assets::retained_assets(db, directory, &prepared.environment)?;
     let counts:(i64,i64,i64)=db.query_row("SELECT (SELECT count(*) FROM clients),(SELECT count(*) FROM metadata),(SELECT count(*) FROM storage_assets)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|_|INVALID)?;
     if counts != (prepared.clients.len() as i64, KEYS.len() as i64, retained) || has_chats(db)? {
         return Err(CONFLICT.into());
