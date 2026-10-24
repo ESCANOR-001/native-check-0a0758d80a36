@@ -314,8 +314,13 @@ pub fn run(directory: &Path, config_path: &Path) -> Result<Value, String> {
         } else if agent == "claude" {
             crate::legacy_claude_native::verify(&store.db, directory, id)?;
             crate::legacy_claude_resume::verify(&store.db, id)?;
-            let resumed:bool=store.db.query_row("SELECT EXISTS(SELECT 1 FROM legacy_claude_resume WHERE chat=?1 AND phase='prepared')",[id],|r|r.get(0)).map_err(|_|ERROR)?;
-            if !resumed || !config.claude.remote_control {
+            let resumed = table(&store.db, "legacy_claude_resume")?
+                && store.db.query_row("SELECT EXISTS(SELECT 1 FROM legacy_claude_resume WHERE chat=?1 AND phase='prepared')",[id],|r|r.get::<_,bool>(0)).map_err(|_|ERROR)?;
+            // Older CLI-only chats have a native session but no shared link.
+            // Their complete native export is sufficient for owned resumption;
+            // do not invent a relay identity or cursor just to activate them.
+            let linked = !chat["remote_identity"].is_null();
+            if (linked && (!resumed || !config.claude.remote_control)) || (!linked && resumed) {
                 return Err(ERROR.into());
             }
             ("legacy_claude_native", &claude)

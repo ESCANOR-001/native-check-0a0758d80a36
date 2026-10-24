@@ -23,10 +23,16 @@ struct Fixture {
 }
 impl Fixture {
     fn activation_config(&self) -> PathBuf {
+        self.activation_config_using(None)
+    }
+    fn activation_config_using(&self, existing_claude: Option<PathBuf>) -> PathBuf {
         use remodex_connect_native::profile_handoff::{self, Input, Plan};
-        let claude = self._dir.path().join("claude-profile");
-        fs::create_dir(&claude).unwrap();
-        fs::write(claude.join("settings.json"), b"{}").unwrap();
+        let claude = existing_claude.unwrap_or_else(|| {
+            let path = self._dir.path().join("claude-profile");
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("settings.json"), b"{}").unwrap();
+            path
+        });
         let claude_snapshot = self._dir.path().join("claude-profile-export");
         migration_snapshot::capture(&claude, &claude_snapshot, ENV).unwrap();
         let codex = self._dir.path().join("codex-export");
@@ -677,6 +683,73 @@ fn rollback_accepts_an_alias_of_the_generation_parent_without_reindexing() {
     assert!(legacy_rollback::run(&root, false).is_err());
     assert_eq!(rows(&db), before);
     assert_eq!(assets(&db), changed);
+}
+
+#[test]
+fn owned_cli_only_claude_activates_without_inventing_a_shared_link_or_cursor() {
+    use remodex_connect_native::legacy_activation;
+    for (linked, remote_control) in [(false, false), (false, true), (true, false), (true, true)] {
+        let f = Fixture::new(1);
+        f.codex_native_export(|_| {});
+        let mut public = read(&f.source.join("claude-0.json"));
+        if linked {
+            public["bridgeId"] = json!("cse_saved_link_requires_its_cursor");
+            write(&f.source.join("claude-0.json"), &public);
+        }
+        let native = public["nativeId"].as_str().unwrap();
+        let profile = f._dir.path().join("claude-export");
+        fs::create_dir_all(profile.join("projects/fixture")).unwrap();
+        fs::write(profile.join("settings.json"), b"{}").unwrap();
+        let transcript = format!("projects/fixture/{native}.jsonl");
+        let user = json!({"type":"user","uuid":PROMPT,"sessionId":native,"parentUuid":null,"message":{"role":"user","content":public["thread"]["messages"][0]["text"]}});
+        let reply = json!({"type":"assistant","uuid":"00000000-0000-4000-8000-000000000002","sessionId":native,"parentUuid":PROMPT,"message":{"id":"reply","role":"assistant","content":[{"type":"text","text":"Keep reply"}]}});
+        let original = format!("{user}\n{reply}\n");
+        fs::write(profile.join(&transcript), &original).unwrap();
+        migration_snapshot::capture(&profile, &f.source.join("native"), ENV).unwrap();
+        let mut plan = read(&f.source.join("stage.json"));
+        plan["claude"][0]["native"] = json!({"snapshot":"native","transcript":transcript});
+        write(&f.source.join("stage.json"), &plan);
+        f.capture();
+        f.run().unwrap();
+        let config = f.activation_config_using(Some(profile.clone()));
+        let mut value = read(&config);
+        value["claude"]["remote_control"] = json!(remote_control);
+        write(&config, &value);
+        let before = rows(&f.db());
+        let result = legacy_activation::run(&f.generation.join("state"), &config);
+        assert_eq!(
+            result.is_ok(),
+            !linked,
+            "A linked chat still requires a verified saved cursor"
+        );
+        assert_eq!(rows(&f.db()), before);
+        assert_eq!(
+            fs::read_to_string(profile.join(&transcript)).unwrap(),
+            original
+        );
+        let db = f.db();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM native_sync", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let saved: Value = serde_json::from_str(
+            &db.query_row("SELECT data FROM chats WHERE id='claude-0'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["remote_identity"].is_null(), !linked);
+        assert_eq!(saved["native_id"], native);
+        legacy_rollback::run(&f.generation.join("state"), true).unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM chats", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
 }
 
 #[test]
