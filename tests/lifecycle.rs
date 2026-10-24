@@ -145,6 +145,8 @@ async fn help_and_version_do_not_create_profiles_or_start_agents() {
         if flag == "--version" {
             let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
             assert_eq!(v["runtime"], "rust");
+            assert_eq!(v["configurationVersion"], 1);
+            assert_eq!(v["storageFormatVersion"], 1);
             assert_eq!(v["migrationComplete"], false);
             assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         } else {

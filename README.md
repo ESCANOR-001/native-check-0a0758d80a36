@@ -56,6 +56,17 @@ Implemented here:
   It does not replace the ordinary bridge, enable system-wide services, or activate the
   published npm entrypoint. Windows/macOS registration remains unqualified and is
   explicitly refused; source-only CI is not a physical Desktop integration test.
+- Stopped Linux service replacement: after preparing a separate registration,
+  `--background-service replace NEW_REGISTRATION_DIR PREVIOUS_REGISTRATION_DIR`
+  changes only their exact shared service unit. Both private runtimes must pass
+  hash checks and declare supported configuration and native-storage formats.
+  Unknown older runtimes remain gated. Active/foreign services and changed units
+  are refused. Durable intent and atomic unit replacement support same-input
+  retries; start reloads systemd's cached unit before launching. Replacement never
+  starts/stops a process or restores a data snapshot. To roll back a compatible
+  executable after a safe stop, reverse the registration arguments: current chat
+  data and both runtime copies remain intact. This does not replace a legacy
+  TypeScript service or establish compatibility with arbitrary future schemas.
 - Owned-install preparation coordinator: `--legacy-upgrade prepare|check|rollback
   ABSOLUTE_NEW_ROOT PLAN_JSON` combines verified staging, copied native profiles,
   activation and the atomic rollback check. The version-1 plan contains

@@ -11,6 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "service_replacement.rs"]
+mod replacement;
+pub use replacement::replace;
+
 const ERROR: &str = "Background registration is unavailable or changed; existing services and chat data were retained";
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -285,6 +289,23 @@ fn verify_file(path: &Path, expected: &[u8]) -> Result<(), String> {
     }
     Ok(())
 }
+fn unit_directory() -> Result<PathBuf, String> {
+    let config = if let Some(p) = std::env::var_os("XDG_CONFIG_HOME").filter(|p| !p.is_empty()) {
+        PathBuf::from(p)
+    } else {
+        PathBuf::from(std::env::var_os("HOME").ok_or(ERROR)?).join(".config")
+    };
+    let config = canonical(&config, true)?;
+    let systemd = config.join("systemd");
+    let units = systemd.join("user");
+    for path in [&systemd, &units] {
+        if !path.try_exists().map_err(|_| ERROR)? {
+            fs::create_dir(path).map_err(|_| ERROR)?;
+        }
+        canonical(path, true)?;
+    }
+    Ok(units)
+}
 /// The systemd user directory is resolved from the user's ordinary configuration
 /// root; no system-wide service, sudo, or shell command is used.
 pub async fn run(operation: &str, root: &Path) -> Result<Value, String> {
@@ -299,21 +320,8 @@ pub async fn run(operation: &str, root: &Path) -> Result<Value, String> {
     let unit_name = name(&plan.service)?;
     let bytes = unit(&plan)?;
     verify_file(&root.join(&unit_name), &bytes)?;
-    let config = if let Some(p) = std::env::var_os("XDG_CONFIG_HOME").filter(|p| !p.is_empty()) {
-        PathBuf::from(p)
-    } else {
-        PathBuf::from(std::env::var_os("HOME").ok_or(ERROR)?).join(".config")
-    };
-    let config = canonical(&config, true)?;
-    let systemd = config.join("systemd");
-    let units = systemd.join("user");
     // Do not chmod shared user configuration directories or follow linked units.
-    for path in [&systemd, &units] {
-        if !path.try_exists().map_err(|_| ERROR)? {
-            fs::create_dir(path).map_err(|_| ERROR)?;
-        }
-        canonical(path, true)?;
-    }
+    let units = unit_directory()?;
     let path = units.join(&unit_name);
     let state = status(&unit_name).await?;
     own_status(&state, &path)?;
@@ -383,6 +391,13 @@ pub async fn run(operation: &str, root: &Path) -> Result<Value, String> {
     if !exists || state.get("FragmentPath").map(String::as_str) != path.to_str() {
         return Err(ERROR.into());
     }
+    // An interrupted replacement can leave the old command cached in systemd.
+    // Always reload the verified on-disk unit before starting it.
+    if systemctl(&["daemon-reload"]).await?.code != 0 {
+        return Err(ERROR.into());
+    }
+    verify_file(&path, &bytes)?;
+    own_status(&status(&unit_name).await?, &path)?;
     let output = systemctl(&["start", &unit_name]).await?;
     if output.code != 0 {
         return Err(ERROR.into());

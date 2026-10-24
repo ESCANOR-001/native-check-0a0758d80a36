@@ -19,13 +19,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &PathBuf::from(&args[4]),
                 &std::env::current_exe()?,
             )?
+        } else if operation == "replace" && args.len() == 5 {
+            remodex_connect_native::service_registration::replace(
+                &PathBuf::from(&args[3]),
+                &PathBuf::from(&args[4]),
+            )
+            .await?
         } else if matches!(operation, "install" | "start" | "status" | "uninstall")
             && args.len() == 4
         {
             remodex_connect_native::service_registration::run(operation, &PathBuf::from(&args[3]))
                 .await?
         } else {
-            return Err("Usage: --background-service prepare REGISTRATION_DIR CUTOVER_DIR | install|start|status|uninstall REGISTRATION_DIR".into());
+            return Err("Usage: --background-service prepare REGISTRATION_DIR CUTOVER_DIR | install|start|status|uninstall REGISTRATION_DIR | replace NEW_REGISTRATION_DIR PREVIOUS_REGISTRATION_DIR".into());
         };
         println!("{report}");
         return Ok(());
@@ -205,7 +211,7 @@ async fn serve(
     if args.len() == 2 && args[1] == "--version" {
         println!(
             "{}",
-            serde_json::json!({"name":"remodex-connect-native","version":env!("CARGO_PKG_VERSION"),"runtime":"rust","configurationVersion":1,"migrationComplete":false})
+            serde_json::json!({"name":"remodex-connect-native","version":env!("CARGO_PKG_VERSION"),"runtime":"rust","configurationVersion":1,"storageFormatVersion":1,"migrationComplete":false})
         );
         return Ok(0);
     }
