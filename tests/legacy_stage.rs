@@ -1349,6 +1349,41 @@ fn service_selection_is_bound_exclusive_and_cancellable_only_before_native_start
 }
 
 #[test]
+fn background_registration_requires_the_selected_idle_generation() {
+    use remodex_connect_native::{legacy_export, service_cutover, service_registration};
+    let (f, receipt, config) = automatic_export_fixture();
+    let root = f._dir.path().join("automatic");
+    legacy_export::run(&root, &receipt, &config).unwrap();
+    let service = f._dir.path().join("service");
+    let plan = f._dir.path().join("service-plan.json");
+    write(
+        &plan,
+        &json!({"version":1,"export_root":root,"bind":"127.0.0.1:18991","public_url":"http://127.0.0.1:18991","gui":f._dir.path()}),
+    );
+    service_cutover::select(&service, &plan).unwrap();
+    let registration = f._dir.path().join("registration");
+    let executable = std::env::current_exe().unwrap();
+    let lease = profile_lock::acquire(&service).unwrap();
+    assert!(service_registration::prepare(&registration, &service, &executable).is_err());
+    assert!(!registration.exists());
+    drop(lease);
+    let result = service_registration::prepare(&registration, &service, &executable).unwrap();
+    assert_eq!(result["serviceStarted"], false);
+    assert!(registration
+        .join(result["unit"].as_str().unwrap())
+        .is_file());
+    assert_eq!(
+        read(&registration.join("registration.json"))["service"],
+        json!(service.canonicalize().unwrap())
+    );
+    assert!(service_registration::prepare(&registration, &service, &executable).is_err());
+    service_cutover::cancel(&service).unwrap();
+    let other = f._dir.path().join("cancelled-registration");
+    assert!(service_registration::prepare(&other, &service, &executable).is_err());
+    assert!(!other.exists());
+}
+
+#[test]
 fn cancelled_service_recovers_each_release_boundary_without_erasing_newer_handoffs() {
     use remodex_connect_native::{legacy_export, legacy_upgrade, service_cutover};
     for boundary in [

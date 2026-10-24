@@ -52,6 +52,7 @@ pub mod profile_handoff;
 pub mod restart_drain;
 pub mod server;
 pub mod service_cutover;
+pub mod service_registration;
 pub mod store;
 
 pub mod attachments;

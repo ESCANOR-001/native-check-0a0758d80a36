@@ -11,6 +11,25 @@ use std::{future::IntoFuture, path::PathBuf, time::Duration};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "--background-service") {
+        let operation = args.get(2).map(String::as_str).unwrap_or("");
+        let report = if operation == "prepare" && args.len() == 5 {
+            remodex_connect_native::service_registration::prepare(
+                &PathBuf::from(&args[3]),
+                &PathBuf::from(&args[4]),
+                &std::env::current_exe()?,
+            )?
+        } else if matches!(operation, "install" | "start" | "status" | "uninstall")
+            && args.len() == 4
+        {
+            remodex_connect_native::service_registration::run(operation, &PathBuf::from(&args[3]))
+                .await?
+        } else {
+            return Err("Usage: --background-service prepare REGISTRATION_DIR CUTOVER_DIR | install|start|status|uninstall REGISTRATION_DIR".into());
+        };
+        println!("{report}");
+        return Ok(());
+    }
     if args.get(1).is_some_and(|a| a == "--service-cutover") {
         let operation = args.get(2).map(String::as_str).unwrap_or("");
         if !matches!(

@@ -211,6 +211,21 @@ pub fn cancel(directory: &Path) -> Result<Value, String> {
     crate::source_hold::release(&hold, directory)?;
     Ok(json!({"phase":"cancelled","sourceServiceTouched":false,"migrationComplete":false}))
 }
+/// Registration is allowed only for a selected, currently stopped owner. This
+/// is deliberately not a general-purpose service launcher or PID adoption API.
+pub(crate) fn registration(directory: &Path) -> Result<(), String> {
+    let selection = Selection::open(directory, false)?;
+    let (raw, digest, phase) = selection.saved()?.ok_or(ERROR)?;
+    if !matches!(phase.as_str(), "selected" | "started") {
+        return Err(ERROR.into());
+    }
+    let (_, _, current, hold) = inputs(&raw, true)?;
+    let _source = crate::source_hold::lease(&hold)?;
+    if digest != current {
+        return Err(ERROR.into());
+    }
+    crate::source_hold::claim(&hold, directory)
+}
 pub async fn run(
     directory: &Path,
     stop: impl std::future::Future<Output = ()>,
