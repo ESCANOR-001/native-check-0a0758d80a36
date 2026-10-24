@@ -251,9 +251,7 @@ impl Store {
         };
         let raw = raw.ok_or(INVALID)?;
         let canonical = stored_message(&self.db, chat, id)?;
-        if hash != auth::digest(&canonical.to_string())
-            || message["text"] != canonical["text"]
-            || message["turnId"] != canonical["turnId"]
+        if hash != auth::digest(&canonical.to_string()) || message["turnId"] != canonical["turnId"]
         {
             return Err(INVALID.into());
         }
@@ -261,7 +259,7 @@ impl Store {
         if descriptors.len() > MAX_DESCRIPTORS {
             return Err(INVALID.into());
         }
-        let mut attachments = message["attachments"]
+        let mut attachments = canonical["attachments"]
             .as_array()
             .cloned()
             .unwrap_or_default();
@@ -285,7 +283,7 @@ impl Store {
             {
                 return Err(INVALID.into());
             }
-            if crate::legacy_uploads::referenced(message, &d.path)
+            if crate::legacy_uploads::referenced(&canonical, &d.path)
                 || attachments.iter().any(|a| a["path"] == d.path)
             {
                 continue;
@@ -295,9 +293,20 @@ impl Store {
         if attachments.len() > MAX_DESCRIPTORS {
             return Err(INVALID.into());
         }
-        if !attachments.is_empty() {
-            message["attachments"] = Value::Array(attachments)
+        // Android's typed attachment objects require an asset ID. These old
+        // uploads have verified workspace paths, not asset-service IDs. Project
+        // them through the same Markdown-link route as new native uploads.
+        let added: Vec<_> = attachments
+            .into_iter()
+            .skip(canonical["attachments"].as_array().map_or(0, Vec::len))
+            .collect();
+        let projected = crate::attachments::display_message(
+            &serde_json::json!({"text":canonical["text"],"attachments":added}),
+        );
+        if message["text"] != canonical["text"] && message["text"] != projected {
+            return Err(INVALID.into());
         }
+        message["text"] = Value::String(projected);
         Ok(())
     }
 }

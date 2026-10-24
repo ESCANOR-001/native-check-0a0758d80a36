@@ -259,10 +259,11 @@ fn projected_attachments_count_toward_page_bytes_without_skipping_the_prompt() {
     assert_eq!(second["messages"].as_array().unwrap().len(), 1);
     assert_eq!(second["messages"][0]["role"], "user");
     assert_eq!(
-        second["messages"][0]["attachments"]
-            .as_array()
+        second["messages"][0]["text"]
+            .as_str()
             .unwrap()
-            .len(),
+            .matches("](<")
+            .count(),
         2
     );
     assert_eq!(second["pageInfo"]["hasOlder"], false);
@@ -283,28 +284,28 @@ fn native_only_attachments_render_without_reading_bytes_or_rewriting_history() {
     }
     let page = f.store.history_page_display(CHAT, None, None).unwrap();
     let mut message = page["messages"][0].clone();
-    assert_eq!(message["text"], "Inspect these attachments.");
-    let attachments = message["attachments"].as_array().unwrap();
-    assert_eq!(attachments.len(), 2);
-    assert_eq!(attachments[0]["type"], "file");
-    assert_eq!(attachments[1]["type"], "image");
-    assert_eq!(attachments[1]["mimeType"], "image/png");
-    for (i, a) in attachments.iter().enumerate() {
-        assert_eq!(a["path"], f.old.join(&f.files[i].0).to_str().unwrap());
-        assert_eq!(a["sizeBytes"], f.files[i].1.len());
-        assert!(a.get("dataUrl").is_none());
-        assert!(a.get("base64").is_none());
+    let text = message["text"].as_str().unwrap();
+    assert!(text.starts_with("Inspect these attachments."));
+    assert!(message["attachments"].is_null());
+    for (i, file) in f.files.iter().enumerate() {
+        let path = f.old.join(&file.0);
+        assert!(text.contains(&format!("](<{}>)", path.display())));
+        if i == 1 {
+            assert!(text.contains("!["));
+        }
     }
+    assert!(!text.contains("data:image"));
+    let projected = message.clone();
     f.store.present_legacy_uploads(CHAT, &mut message).unwrap();
-    assert_eq!(message["attachments"].as_array().unwrap().len(), 2);
+    assert_eq!(message, projected);
     assert_eq!(f.rows(), before);
-    assert!(f.store.load_chat(CHAT).unwrap()["thread"]["messages"][0]["attachments"].is_null());
     assert_eq!(
-        f.store.load_chat_display(CHAT, &[]).unwrap()["thread"]["messages"][0]["attachments"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
+        f.store.load_chat(CHAT).unwrap()["thread"]["messages"][0]["text"],
+        "Inspect these attachments."
+    );
+    assert_eq!(
+        f.store.load_chat_display(CHAT, &[]).unwrap()["thread"]["messages"][0],
+        message
     );
     assert!(f
         .store
@@ -380,10 +381,11 @@ fn old_prepared_uploads_add_presentation_only_after_storage_capacity_check() {
     f.store.configure_storage(Default::default()).unwrap();
     f.prepare().unwrap();
     assert_eq!(
-        f.store.history_page_display(CHAT, None, None).unwrap()["messages"][0]["attachments"]
-            .as_array()
+        f.store.history_page_display(CHAT, None, None).unwrap()["messages"][0]["text"]
+            .as_str()
             .unwrap()
-            .len(),
+            .matches("](<")
+            .count(),
         2
     );
     assert_eq!(f.rows(), before);
