@@ -3962,6 +3962,23 @@ impl Hub {
                 return Ok(());
             }
         };
+        if self.chats[&id].agent == AgentKind::Claude
+            && crate::claude_turns::unproven_task_input(&v).is_some_and(|native| {
+                self.active[&id]
+                    .claude_router
+                    .as_ref()
+                    .is_none_or(|router| !router.pending().any(|i| i.native == native && i.local))
+            })
+            && crate::claude_link::is_proven_internal_input(
+                self.config.claude.profile.clone(),
+                self.config.workspace.clone(),
+                self.chats[&id].native_id.clone(),
+                &v,
+            )
+            .await
+        {
+            v["shouldQuery"] = json!(false);
+        }
         if let Some(w) = self.active.get_mut(&id) {
             if let Some(router) = w.claude_router.as_mut() {
                 router.filter_interruption_notice(&mut v, w.stopping);

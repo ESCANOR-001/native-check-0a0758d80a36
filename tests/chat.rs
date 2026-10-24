@@ -1847,6 +1847,34 @@ async fn claude_background_tools_finish_before_queue_and_do_not_get_killed_at_fo
 }
 
 #[tokio::test]
+async fn stopped_native_task_notice_does_not_hold_a_worker_or_become_a_user_prompt() {
+    let t = Test::hosted().await;
+    let a = AgentKind::Claude;
+    t.create(a, "notice-stop").await;
+    t.call(a, prompt("notice-stop", "task-notice-hold", "normal"))
+        .await
+        .unwrap();
+    t.wait(a, "notice-stop", "running").await;
+    t.call(a, json!({"type":"thread.turn.interrupt","threadId":"notice-stop","commandId":"notice-stop-once"})).await.unwrap();
+    let stopped = t.wait(a, "notice-stop", "interrupted").await;
+    assert_eq!(stopped["session"]["executionState"], "paused");
+    assert!(!stopped["messages"]
+        .to_string()
+        .contains("<task-notification>"));
+    t.call(a, prompt("notice-stop", "AFTER_STOP_OK", "normal"))
+        .await
+        .unwrap();
+    let next = t.wait(a, "notice-stop", "ready").await;
+    assert_eq!(next["session"]["executionState"], "idle");
+    assert!(next["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["role"] == "assistant" && m["text"] == "AFTER_STOP_OK"));
+    t.stop().await;
+}
+
+#[tokio::test]
 async fn claude_stop_ends_background_task_without_releasing_queue_or_waiting_for_notification() {
     for hosted in [false, true] {
         let t = if hosted {

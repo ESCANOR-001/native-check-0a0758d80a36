@@ -11,6 +11,24 @@ use std::{
 const FILE_LIMIT: u64 = 512 * 1024 * 1024;
 const LINE_LIMIT: usize = 8 * 1024 * 1024;
 
+pub(crate) async fn is_proven_internal_input(
+    profile: PathBuf,
+    workspace: PathBuf,
+    native: String,
+    frame: &Value,
+) -> bool {
+    let Some(id) = crate::claude_turns::unproven_task_input(frame) else {
+        return false;
+    };
+    let id = id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        read_for_inputs(&profile, &workspace, &native, std::slice::from_ref(&id))
+            .is_ok_and(|link| link.internal_inputs.contains(&id))
+    })
+    .await
+    .unwrap_or(false)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Link {
     pub identity: Identity,
@@ -107,11 +125,25 @@ pub(crate) fn read_for_inputs(
         if row["sessionId"] != native || row["isSidechain"] == true {
             continue;
         }
-        if let Some(id) = row["uuid"]
+        let attachment = &row["attachment"];
+        let queued_notice = row["type"] == "attachment"
+            && row["renderedRole"] == "system"
+            && attachment["type"] == "queued_command"
+            && attachment["commandMode"] == "task-notification"
+            && attachment["runId"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty() && s.len() <= 256)
+            && crate::claude_turns::task_notice_text(&attachment["prompt"]).is_some();
+        let input_id = if queued_notice {
+            &attachment["source_uuid"]
+        } else {
+            &row["uuid"]
+        };
+        if let Some(id) = input_id
             .as_str()
             .filter(|id| pending.iter().any(|p| p == id))
         {
-            if crate::claude_turns::internal_task_input(&row)
+            if (queued_notice || crate::claude_turns::internal_task_input(&row))
                 && !internal_inputs.iter().any(|p| p == id)
             {
                 internal_inputs.push(id.to_owned());
@@ -166,6 +198,65 @@ pub(crate) fn read_for_inputs(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[tokio::test]
+    async fn unmarked_sdk_notice_requires_original_native_attachment_proof() {
+        let d = tempfile::tempdir().unwrap();
+        let profile = d.path().join("profile");
+        let folder = profile.join("projects/p");
+        std::fs::create_dir_all(&folder).unwrap();
+        let native = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::new_v4().to_string();
+        let text =
+            "<task-notification><task-id>t</task-id><status>killed</status></task-notification>";
+        let frame = json!({"type":"user","uuid":id,"message":{"role":"user","content":[{"type":"text","text":text}]}});
+        let base = json!({"type":"bridge-session","sessionId":native,"cwd":d.path(),"bridgeSessionId":"cse_fixture"});
+        let proof = json!({"type":"attachment","sessionId":native,"renderedRole":"system","attachment":{"type":"queued_command","source_uuid":id,"commandMode":"task-notification","runId":"run","prompt":text}});
+        for variant in [
+            "matching",
+            "different-session",
+            "different-input",
+            "sidechain",
+            "human-role",
+            "human-origin",
+            "no-proof",
+        ] {
+            let mut row = proof.clone();
+            let mut input = frame.clone();
+            match variant {
+                "different-session" => row["sessionId"] = json!("other"),
+                "different-input" => {
+                    row["attachment"]["source_uuid"] = json!(uuid::Uuid::new_v4().to_string())
+                }
+                "sidechain" => row["isSidechain"] = json!(true),
+                "human-role" => row["renderedRole"] = json!("user"),
+                "human-origin" => input["origin"] = json!({"kind":"human"}),
+                "no-proof" => row = Value::Null,
+                _ => (),
+            }
+            std::fs::write(
+                folder.join(format!("{native}.jsonl")),
+                format!("{base}\n{row}\n"),
+            )
+            .unwrap();
+            let proven =
+                is_proven_internal_input(profile.clone(), d.path().into(), native.clone(), &input)
+                    .await;
+            assert_eq!(proven, variant == "matching", "{variant}");
+            if proven {
+                input["shouldQuery"] = json!(false);
+            }
+            assert_eq!(
+                crate::claude_turns::input_identity(&input)
+                    .unwrap()
+                    .is_none(),
+                proven
+            );
+            assert_eq!(
+                crate::claude_turns::user_input(&input).unwrap().is_none(),
+                proven
+            );
+        }
+    }
     #[test]
     fn internal_input_proof_is_bounded_to_matching_pending_main_session_rows() {
         let d = tempfile::tempdir().unwrap();

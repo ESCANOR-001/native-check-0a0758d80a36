@@ -328,6 +328,27 @@ impl Observer {
                 }
             }
         }
+        // Keep incoming across this await; cancellation must not drop a durable
+        // event. Only the original native file can classify an unmarked notice.
+        if let (Some((profile, workspace)), Some(frame)) = (
+            &self.link_source,
+            self.incoming
+                .as_ref()
+                .filter(|e| e.source == "worker")
+                .and_then(|e| e.payload.as_ref()),
+        ) {
+            if crate::claude_link::is_proven_internal_input(
+                profile.clone(),
+                workspace.clone(),
+                self.link.identity.native_session.clone(),
+                frame,
+            )
+            .await
+            {
+                self.incoming.as_mut().unwrap().payload.as_mut().unwrap()["shouldQuery"] =
+                    json!(false);
+            }
+        }
         let mut envelope = self.incoming.take().unwrap();
         if !self.read_receipts {
             envelope.deliveries.clear();

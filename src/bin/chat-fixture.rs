@@ -106,6 +106,7 @@ fn main() {
     let mut waiting_steer: Option<(String, String)> = None;
     let mut control_loop = false;
     let mut hosted = false;
+    let mut task_notice_hold = false;
     let mut host_inputs: Vec<String> = vec![];
     let mut host_waiting: Option<String> = None;
     for line in io::stdin().lock().lines() {
@@ -525,6 +526,28 @@ This came from another Claude session — not typed by your user, but very likel
                         json!({"type":"command_lifecycle","state":"cancelled","command_uuid":waiting}),
                     );
                 } else if hosted {
+                    if task_notice_hold {
+                        let args: Vec<_> = std::env::args().collect();
+                        let at = args.iter().position(|a| a == "--session-id").unwrap();
+                        let native = &args[at + 1];
+                        let id = uuid::Uuid::new_v4().to_string();
+                        let text = "<task-notification><task-id>test-tool</task-id><status>killed</status></task-notification>";
+                        let profile = std::path::PathBuf::from(
+                            std::env::var_os("CLAUDE_CONFIG_DIR").unwrap(),
+                        );
+                        let folder = profile.join("projects/fixture");
+                        std::fs::create_dir_all(&folder).unwrap();
+                        let binding = json!({"type":"bridge-session","sessionId":native,"cwd":std::env::current_dir().unwrap(),"bridgeSessionId":"cse_fixture"});
+                        let proof = json!({"type":"attachment","sessionId":native,"renderedRole":"system","attachment":{"type":"queued_command","source_uuid":id,"commandMode":"task-notification","runId":"run","prompt":text}});
+                        std::fs::write(
+                            folder.join(format!("{native}.jsonl")),
+                            format!("{binding}\n{proof}\n"),
+                        )
+                        .unwrap();
+                        out(
+                            json!({"type":"user","uuid":id,"message":{"role":"user","content":text}}),
+                        );
+                    }
                     out(
                         json!({"type":"user","uuid":uuid::Uuid::new_v4().to_string(),"message":{"role":"user","content":[{"type":"tool_result","is_error":true,"tool_use_id":"held-tool","content":"The user doesn't want to proceed with this tool use. The tool use was rejected."}]}}),
                     );
@@ -557,6 +580,7 @@ This came from another Claude session — not typed by your user, but very likel
                 writeln!(log, "{}", json!({"uuid":v["uuid"],"text":text})).unwrap();
             }
             last = v["uuid"].as_str().unwrap().to_owned();
+            task_notice_hold = text == "task-notice-hold";
             context_unsupported = text == "hold-no-context";
             capability_hang = text == "hold-capabilities";
             if text == "crash" {
@@ -686,7 +710,11 @@ This came from another Claude session — not typed by your user, but very likel
                 out(
                     json!({"type":"control_response","response":{"subtype":"error","request_id":"fixture-error","error":"large failure ".repeat(50000)}}),
                 );
-            } else if text != "hold" && text != "hold-no-context" && text != "hold-capabilities" {
+            } else if !task_notice_hold
+                && text != "hold"
+                && text != "hold-no-context"
+                && text != "hold-capabilities"
+            {
                 complete(false, text, &last);
             }
         } else if v["type"] == "control_response" {

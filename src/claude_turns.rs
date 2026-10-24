@@ -39,14 +39,17 @@ pub(crate) fn internal_task_input(frame: &Value) -> bool {
     {
         return false;
     }
-    let content = &frame["message"]["content"];
+    task_notice_text(&frame["message"]["content"]).is_some()
+}
+
+pub(crate) fn task_notice_text(content: &Value) -> Option<&str> {
     let text = content.as_str().or_else(|| {
         content
             .as_array()
             .filter(|a| a.len() == 1 && a[0]["type"] == "text")
             .and_then(|a| a[0]["text"].as_str())
     });
-    text.is_some_and(|text| {
+    text.filter(|text| {
         let trim = text.trim();
         trim.starts_with("<task-notification>")
             && trim.ends_with("</task-notification>")
@@ -56,6 +59,20 @@ pub(crate) fn internal_task_input(frame: &Value) -> bool {
                 .iter()
                 .any(|s| trim.contains(&format!("<status>{s}</status>")))
     })
+}
+
+/// SDK streams sometimes omit origin metadata for a native queued task notice.
+/// Its text alone is never proof: the matching native transcript must attest it.
+pub(crate) fn unproven_task_input(frame: &Value) -> Option<&str> {
+    (frame["type"] == "user"
+        && frame["message"]["role"] == "user"
+        && frame["parent_tool_use_id"].is_null()
+        && frame["origin"].is_null()
+        && frame["shouldQuery"] != false
+        && task_notice_text(&frame["message"]["content"]).is_some())
+    .then(|| frame["uuid"].as_str())
+    .flatten()
+    .filter(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
 }
 
 /// Display only actual root user input. Desktop's internal leading reminder
