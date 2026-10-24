@@ -397,3 +397,113 @@ fn stage_limits_refuse_before_copying_files() {
         0
     );
 }
+
+#[test]
+fn retained_copies_consume_upload_capacity_after_restart_and_rollback() {
+    let mut f = Fixture::new("claude");
+    f.prepare().unwrap();
+    let saved = f.store.storage_status().unwrap();
+    assert_eq!(saved["assetFiles"], 5); // two uploads, unknown metadata, two manifests
+    assert!(
+        saved["assetBytes"].as_u64().unwrap() > f.files.iter().map(|(_, b)| b.len() as u64).sum()
+    );
+    f.rollback().unwrap();
+    let mut reopened = Store::open(f.dir.path()).unwrap();
+    assert_eq!(
+        reopened.storage_status().unwrap()["assetBytes"],
+        saved["assetBytes"]
+    );
+    assert_eq!(
+        reopened.storage_status().unwrap()["assetFiles"],
+        saved["assetFiles"]
+    );
+    reopened
+        .configure_storage(remodex_connect_native::storage::Limits {
+            asset_bytes: saved["assetBytes"].as_u64().unwrap() + 3,
+            ..Default::default()
+        })
+        .unwrap();
+    let upload = |data: &str| json!([{"type":"file","name":"new.txt","mimeType":"text/plain","dataUrl":format!("data:text/plain;base64,{data}")}]);
+    assert!(reopened.stage_uploads(upload("MTIzNA==")).is_err());
+    reopened.stage_uploads(upload("MTIz")).unwrap();
+    assert_eq!(
+        reopened.storage_status().unwrap()["assetBytes"],
+        saved["assetBytes"].as_u64().unwrap() + 3
+    );
+}
+
+#[test]
+fn partial_bundles_count_before_admitting_another_import_and_never_get_deleted() {
+    for files_limit in [false, true] {
+        let mut f = Fixture::new("claude");
+        let partial = f.dir.path().join("legacy-uploads/partial/data");
+        fs::create_dir_all(&partial).unwrap();
+        fs::write(partial.join("keep"), [1u8; 1000]).unwrap();
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(f.snapshot.join("snapshot.json")).unwrap()).unwrap();
+        let summary = migration_snapshot::verify(&f.snapshot, ENV).unwrap();
+        let complete = summary.bytes + manifest.to_string().len() as u64 * 2;
+        f.store
+            .configure_storage(remodex_connect_native::storage::Limits {
+                asset_bytes: if files_limit {
+                    2 * 1024 * 1024 * 1024
+                } else {
+                    complete + 999
+                },
+                asset_files: if files_limit { 5 } else { 65_536 },
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(f.prepare().is_err());
+        assert_eq!(fs::read(partial.join("keep")).unwrap(), [1u8; 1000]);
+        assert_eq!(f.store.storage_status().unwrap()["assetFiles"], 1);
+        assert_eq!(f.store.storage_status().unwrap()["assetBytes"], 1000);
+        assert_eq!(
+            fs::read_dir(f.dir.path().join("legacy-uploads"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn failed_alias_receipt_counts_files_and_retry_does_not_charge_for_a_second_copy() {
+    let mut f = Fixture::new("claude");
+    f.db.execute_batch("CREATE TABLE legacy_uploads(chat TEXT PRIMARY KEY,source_hash TEXT NOT NULL,original_root TEXT NOT NULL,bundle TEXT NOT NULL,plan BLOB NOT NULL,phase TEXT NOT NULL); CREATE TRIGGER fail_upload BEFORE INSERT ON legacy_uploads BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+    assert!(f.prepare().is_err());
+    let saved = f.store.storage_status().unwrap();
+    assert_eq!(saved["assetFiles"], 5);
+    f.store
+        .configure_storage(remodex_connect_native::storage::Limits {
+            asset_bytes: saved["assetBytes"].as_u64().unwrap(),
+            asset_files: 5,
+            ..Default::default()
+        })
+        .unwrap();
+    f.db.execute_batch("DROP TRIGGER fail_upload;").unwrap();
+    f.prepare().unwrap();
+    assert_eq!(
+        f.store.storage_status().unwrap()["assetBytes"],
+        saved["assetBytes"]
+    );
+    assert_eq!(f.store.storage_status().unwrap()["assetFiles"], 5);
+    assert_eq!(fs::read(f.path(0)).unwrap(), f.files[0].1);
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_copy_index_refuses_symlinks_without_changing_its_last_committed_totals() {
+    let mut f = Fixture::new("claude");
+    f.prepare().unwrap();
+    let saved = f.store.storage_status().unwrap();
+    let outside = f.export.path().join("outside-index");
+    fs::write(&outside, b"KEEP_OUTSIDE").unwrap();
+    std::os::unix::fs::symlink(&outside, f.dir.path().join("legacy-uploads/link")).unwrap();
+    assert!(Store::open(f.dir.path()).is_err());
+    assert_eq!(
+        f.store.storage_status().unwrap()["assetBytes"],
+        saved["assetBytes"]
+    );
+    assert_eq!(fs::read(outside).unwrap(), b"KEEP_OUTSIDE");
+}

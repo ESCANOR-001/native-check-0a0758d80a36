@@ -190,9 +190,12 @@ fn checked(root: &Path, path: &Path, file: &File) -> Result<(), String> {
     Ok(())
 }
 fn manifest(path: &Path) -> Result<String, String> {
+    Ok(auth::digest(&manifest_json(path)?))
+}
+fn manifest_json(path: &Path) -> Result<String, String> {
     let bytes = profile_snapshot::bytes(path, 8 * 1024 * 1024).map_err(|_| INVALID)?;
     let v: Value = serde_json::from_slice(&bytes).map_err(|_| INVALID)?;
-    Ok(auth::digest(&v.to_string()))
+    Ok(v.to_string())
 }
 type Receipt = (String, String, String, Vec<u8>, String);
 fn receipt(db: &rusqlite::Connection, id: &str) -> Result<Option<Receipt>, String> {
@@ -319,6 +322,7 @@ impl Store {
         let parent = self.directory.join("legacy-uploads");
         crate::private_directory::prepare(&parent).map_err(|_| INVALID)?;
         let destination = parent.join(&bundle);
+        self.reindex_legacy_uploads()?;
         // Count partial restores too; a failed copy cannot evade the budget.
         let retained = crate::legacy_claude_native::staged_bytes(&parent)?;
         let other = if destination.exists() {
@@ -334,14 +338,27 @@ impl Store {
         if required > 2 * 1024 * 1024 * 1024 {
             return Err("Legacy attachment copies exceed the 2 GiB staging budget".into());
         }
-        self.check_assets(summary.bytes.saturating_mul(2), summary.files as u64)?;
-        if destination.exists() {
+        // Both restore manifests are retained alongside the data. Charge old
+        // bundles and interrupted copies too, but do not double-charge the
+        // verified destination when resuming a prior failed import.
+        let manifest_bytes = manifest_json(&snapshot.join("snapshot.json"))?.len() as u64;
+        let (present_bytes, present_files) = self.legacy_upload_bundle_usage(&destination)?;
+        self.check_assets(
+            summary
+                .bytes
+                .saturating_add(manifest_bytes * 2)
+                .saturating_sub(present_bytes),
+            (summary.files as u64 + 2).saturating_sub(present_files),
+        )?;
+        let copied = if destination.exists() {
             migration_snapshot::resume_restore(snapshot, &destination, &environment)
-                .map_err(|_| INVALID)?;
         } else {
             migration_snapshot::restore(snapshot, &destination, &environment)
-                .map_err(|_| INVALID)?;
-        }
+        };
+        // A failed restore may leave a recovery copy. It consumes capacity even
+        // though it has no alias receipt and cannot be opened by a phone.
+        self.reindex_legacy_uploads()?;
+        copied.map_err(|_| INVALID)?;
         for f in &files {
             checked(
                 &self.directory,

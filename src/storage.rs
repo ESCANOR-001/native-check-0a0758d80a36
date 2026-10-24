@@ -97,6 +97,7 @@ impl Store {
                 }
             }
         }
+        crate::migration_assets::index(&tx, &self.directory)?;
         tx.commit().map_err(|_| failure())?;
         self.configure_storage(Limits::default())
     }
