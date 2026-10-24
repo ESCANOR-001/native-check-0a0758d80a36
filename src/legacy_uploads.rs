@@ -17,12 +17,12 @@ const MAX_PLAN: usize = 2 * 1024 * 1024;
 const MAX_FILES: usize = 2048;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct File {
-    message: String,
-    original: String,
-    relative: String,
-    sha256: String,
-    bytes: u64,
+pub(crate) struct File {
+    pub(crate) message: String,
+    pub(crate) original: String,
+    pub(crate) relative: String,
+    pub(crate) sha256: String,
+    pub(crate) bytes: u64,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,7 +108,7 @@ fn source(db: &rusqlite::Connection, id: &str) -> Result<(String, Value), String
         },
     ))
 }
-fn referenced(message: &Value, original: &str) -> bool {
+pub(crate) fn referenced(message: &Value, original: &str) -> bool {
     message["attachments"]
         .as_array()
         .is_some_and(|rows| rows.iter().any(|r| r["path"] == original))
@@ -135,11 +135,7 @@ fn plan(raw: &[u8], root: &Path, thread: &Value) -> Result<Vec<File>, String> {
     let mut paths = BTreeSet::new();
     for f in &p.files {
         shape(f, root)?;
-        if !paths.insert(&f.original)
-            || !messages
-                .get(f.message.as_str())
-                .is_some_and(|m| referenced(m, &f.original))
-        {
+        if !paths.insert(&f.original) || !messages.contains_key(f.message.as_str()) {
             return Err(INVALID.into());
         }
     }
@@ -225,6 +221,7 @@ pub(crate) fn verify(db: &rusqlite::Connection, directory: &Path, id: &str) -> R
         return Err(INVALID.into());
     }
     let files = plan(&raw, Path::new(&root), &thread)?;
+    crate::legacy_upload_native::verify(db, directory, id, &thread, &files)?;
     let path = directory.join("legacy-uploads").join(&bundle);
     let environment: String = db
         .query_row(
@@ -302,6 +299,8 @@ impl Store {
             _ => return Err(INVALID.into()),
         }
         let files = plan(raw, original_root, &thread)?;
+        let evidence =
+            crate::legacy_upload_native::collect(&self.db, &self.directory, id, &thread, &files)?;
         let environment = self.environment_id().map_err(|_| INVALID)?;
         let summary = migration_snapshot::verify(snapshot, &environment).map_err(|_| INVALID)?;
         let bundle = manifest(&snapshot.join("snapshot.json"))?;
@@ -371,20 +370,27 @@ impl Store {
         if current != hash {
             return Err(INVALID.into());
         }
-        self.check_history((raw.len() as u64).saturating_add(8192))?;
+        self.check_history(
+            (raw.len() as u64)
+                .saturating_add(crate::legacy_upload_native::storage_bytes(&evidence))
+                .saturating_add(8192),
+        )?;
         self.db.execute_batch("CREATE TABLE IF NOT EXISTS legacy_uploads(chat TEXT PRIMARY KEY,source_hash TEXT NOT NULL,original_root TEXT NOT NULL,bundle TEXT NOT NULL,plan BLOB NOT NULL,phase TEXT NOT NULL);").map_err(|_|INVALID)?;
-        self.db
-            .execute(
-                "INSERT INTO legacy_uploads VALUES(?1,?2,?3,?4,?5,'prepared')",
-                params![
-                    id,
-                    hash,
-                    original_root.to_str().ok_or(INVALID)?,
-                    bundle,
-                    raw
-                ],
-            )
-            .map_err(|_| INVALID)?;
+        let tx = self.db.transaction().map_err(|_| INVALID)?;
+        crate::legacy_upload_native::save(&tx, id, &evidence)?;
+        tx.execute(
+            "INSERT INTO legacy_uploads VALUES(?1,?2,?3,?4,?5,'prepared')",
+            params![
+                id,
+                hash,
+                original_root.to_str().ok_or(INVALID)?,
+                bundle,
+                raw
+            ],
+        )
+        .map_err(|_| INVALID)?;
+        verify(&tx, &self.directory, id)?;
+        tx.commit().map_err(|_| INVALID)?;
         Ok(json!({"phase":"uploads-prepared","files":files.len(),"migrationComplete":false}))
     }
     /// Resolve only one exact historical link for this chat. No original path
@@ -443,7 +449,9 @@ impl Store {
         shape(f, Path::new(&root))?;
         let raw: String = self.db.query_row("SELECT data FROM chat_rows WHERE chat=?1 AND kind='messages' AND id=?2 AND length(data)<=?3",params![id,f.message,crate::chat_store::ROW_BYTES as i64],|r|r.get(0)).map_err(|_|INVALID)?;
         let message: Value = serde_json::from_str(&raw).map_err(|_| INVALID)?;
-        if !referenced(&message, original) {
+        if !referenced(&message, original)
+            && !crate::legacy_upload_native::allows(&self.db, id, f, &message)?
+        {
             return Err(INVALID.into());
         }
         let path = self

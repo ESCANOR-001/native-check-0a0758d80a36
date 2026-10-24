@@ -6,6 +6,7 @@ const ENV: &str = "opencodex-0123456789abcdef01234567";
 const NATIVE: &str = "00000000-0000-4000-8000-000000000001";
 const CHAT: &str = "old-public-chat";
 const TIME: &str = "2026-01-01T12:00:00Z";
+type NativeChange<'a> = Option<Box<dyn FnOnce(&mut Value) + 'a>>;
 struct Fixture {
     dir: tempfile::TempDir,
     export: tempfile::TempDir,
@@ -21,7 +22,17 @@ impl Fixture {
     fn new(agent: &'static str) -> Self {
         Self::with_text(agent, b"OLD_FILE_MARKER".to_vec())
     }
+    fn native(change: impl FnOnce(&mut Value)) -> Self {
+        Self::build(
+            "claude",
+            b"NATIVE_ONLY_FILE".to_vec(),
+            Some(Box::new(change)),
+        )
+    }
     fn with_text(agent: &'static str, text: Vec<u8>) -> Self {
+        Self::build(agent, text, None)
+    }
+    fn build<'a>(agent: &'static str, text: Vec<u8>, native: NativeChange<'a>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let export = tempfile::tempdir().unwrap();
         let old = dir.path().join("original-not-accessed");
@@ -48,10 +59,20 @@ impl Fixture {
         fs::write(source.join("unknown-future-metadata"), b"KEEP_UNKNOWN").unwrap();
         let snapshot = export.path().join("snapshot");
         migration_snapshot::capture(&source, &snapshot, ENV).unwrap();
-        let messages = json!([
+        let mut messages = json!([
             {"id":"prompt","turnId":"old-turn","role":"user","text":format!("See [note](<{}>)",old.join(&files[0].0).display()),"createdAt":TIME,"updatedAt":TIME,"streaming":false,"attachments":[{"path":old.join(&files[1].0),"type":"image"}]},
             {"id":"reply","turnId":"old-turn","role":"assistant","text":"Original reply","createdAt":TIME,"updatedAt":TIME,"streaming":false}
         ]);
+        let prompt_id = if native.is_some() {
+            "00000000-0000-4000-8000-000000000024"
+        } else {
+            "prompt"
+        };
+        if native.is_some() {
+            messages[0]["id"] = json!(prompt_id);
+            messages[0]["text"] = json!("Inspect these attachments.");
+            messages[0].as_object_mut().unwrap().remove("attachments");
+        }
         let mut store = Store::open(dir.path()).unwrap();
         let connection = json!({"version":1,"settings":{"controlEnabled":false,"tunnelMode":"quick"},"clients":[],"taskSelections":[],"threadAliases":if agent == "codex" {json!([{"remoteThreadId":CHAT,"nativeThreadId":NATIVE,"projectId":"project","title":"Old chat","cwd":dir.path(),"instanceId":"openai","model":"model","nativeModelProvider":"openai","runtimeMode":"approval-required","interactionMode":"default","createdAt":TIME,"updatedAt":TIME}])} else {json!([])}});
         store
@@ -71,7 +92,22 @@ impl Fixture {
                 .prepare_legacy_codex_history(CHAT, raw.to_string().as_bytes())
                 .unwrap();
         }
-        let plan = json!({"version":1,"files":files.iter().map(|(relative,bytes)| json!({"message":"prompt","original":old.join(relative),"relative":relative,"sha256":format!("{:x}",Sha256::digest(bytes)),"bytes":bytes.len()})).collect::<Vec<_>>()});
+        if let Some(change) = native {
+            use base64::Engine;
+            let profile = export.path().join("native-profile");
+            let transcript = format!("projects/fixture/{NATIVE}.jsonl");
+            fs::create_dir_all(profile.join("projects/fixture")).unwrap();
+            let mut prompt = json!({"type":"user","uuid":prompt_id,"parentUuid":null,"sessionId":NATIVE,"message":{"role":"user","content":[{"type":"text","text":format!("Inspect these attachments.\n\nAttached files on this PC:\n{}",old.join(&files[0].0).display())},{"type":"image","source":{"type":"base64","media_type":"image/png","data":base64::engine::general_purpose::STANDARD.encode(&files[1].1)}}]}});
+            change(&mut prompt);
+            let reply = json!({"type":"assistant","uuid":"00000000-0000-4000-8000-000000000028","parentUuid":prompt_id,"sessionId":NATIVE,"message":{"id":"reply","role":"assistant","content":[{"type":"text","text":"Original reply"}]}});
+            fs::write(profile.join(&transcript), format!("{prompt}\n{reply}\n")).unwrap();
+            let snapshot = export.path().join("native-snapshot");
+            migration_snapshot::capture(&profile, &snapshot, ENV).unwrap();
+            store
+                .prepare_legacy_claude_native(CHAT, &snapshot, &transcript)
+                .unwrap();
+        }
+        let plan = json!({"version":1,"files":files.iter().map(|(relative,bytes)| json!({"message":prompt_id,"original":old.join(relative),"relative":relative,"sha256":format!("{:x}",Sha256::digest(bytes)),"bytes":bytes.len()})).collect::<Vec<_>>()});
         let db = rusqlite::Connection::open(dir.path().join("native-connect.sqlite")).unwrap();
         Self {
             dir,
@@ -506,4 +542,119 @@ fn retained_copy_index_refuses_symlinks_without_changing_its_last_committed_tota
         saved["assetBytes"]
     );
     assert_eq!(fs::read(outside).unwrap(), b"KEEP_OUTSIDE");
+}
+
+#[test]
+fn native_only_claude_files_and_images_preserve_history_and_survive_restart() {
+    let mut f = Fixture::native(|_| {});
+    let before = f.rows();
+    f.prepare().unwrap();
+    for i in 0..2 {
+        assert_eq!(fs::read(f.path(i)).unwrap(), f.files[i].1);
+    }
+    let path = f.path(0);
+    assert_eq!(f.rows(), before);
+    assert!(!f.old.exists());
+    f.prepare().unwrap();
+    let reopened = Store::open(f.dir.path()).unwrap();
+    assert_eq!(
+        reopened
+            .resolve_legacy_upload(CHAT, f.old.join(&f.files[0].0).to_str().unwrap())
+            .unwrap(),
+        Some(path.clone())
+    );
+    assert!(reopened
+        .resolve_legacy_upload(
+            "different-chat",
+            f.old.join(&f.files[0].0).to_str().unwrap()
+        )
+        .unwrap()
+        .is_none());
+    drop(reopened);
+    f.rollback().unwrap();
+    assert!(path.exists());
+    assert!(f
+        .store
+        .resolve_legacy_upload(CHAT, f.old.join(&f.files[0].0).to_str().unwrap())
+        .unwrap()
+        .is_none());
+    assert!(f.store.assert_migration_ready().is_err());
+}
+#[test]
+fn native_attachment_evidence_rejects_changed_prompt_wrong_file_and_wrong_image() {
+    for scenario in 0..4 {
+        let mut f = Fixture::native(move |v| match scenario {
+            0 => v["message"]["content"][0]["text"] = json!("Another prompt entirely"),
+            1 => {
+                v["message"]["content"][0]["text"] = json!(
+                    "Inspect these attachments.\n\nAttached files on this PC:\n/another/file.txt"
+                )
+            }
+            2 => v["message"]["content"][1]["source"]["data"] = json!("bm90LXRoZS1pbWFnZQ=="),
+            _ => v["message"]["content"][1]["source"]["type"] = json!("url"),
+        });
+        let before = f.rows();
+        assert!(f.prepare().is_err(), "scenario {scenario}");
+        assert_eq!(f.rows(), before);
+        assert!(f.store.assert_migration_ready().is_err());
+    }
+}
+#[test]
+fn native_attachment_proof_is_bound_to_unchanged_public_message_and_native_receipt() {
+    for native in [false, true] {
+        let mut f = Fixture::native(|_| {});
+        f.prepare().unwrap();
+        if native {
+            f.db.execute(
+                "UPDATE legacy_claude_native SET report=json_set(report,'$.bytes',1)",
+                [],
+            )
+            .unwrap();
+        } else {
+            f.db.execute("UPDATE chat_rows SET data=json_set(data,'$.text','Changed') WHERE kind='messages' AND json_extract(data,'$.role')='user'",[]).unwrap();
+        }
+        assert!(f
+            .store
+            .resolve_legacy_upload(CHAT, f.old.join(&f.files[0].0).to_str().unwrap())
+            .is_err());
+        assert!(f.prepare().is_err());
+        let reopened = Store::open(f.dir.path()).unwrap();
+        assert!(reopened
+            .resolve_legacy_upload(CHAT, f.old.join(&f.files[0].0).to_str().unwrap())
+            .is_err());
+        assert!(reopened.assert_migration_ready().is_err());
+        assert!(!f.old.exists());
+    }
+}
+#[test]
+fn a_public_unreferenced_file_cannot_acquire_native_evidence_without_a_verified_profile() {
+    let mut f = Fixture::new("claude");
+    f.plan["files"][0]["message"] = json!("reply");
+    assert!(f.prepare().is_err());
+    assert!(f.store.assert_migration_ready().is_err());
+}
+
+#[test]
+fn native_attachment_proof_and_alias_commit_atomically_and_retry_retained_copy() {
+    let mut f = Fixture::native(|_| {});
+    let before = f.rows();
+    f.db.execute_batch("CREATE TABLE legacy_uploads(chat TEXT PRIMARY KEY,source_hash TEXT NOT NULL,original_root TEXT NOT NULL,bundle TEXT NOT NULL,plan BLOB NOT NULL,phase TEXT NOT NULL); CREATE TRIGGER reject_upload BEFORE INSERT ON legacy_uploads BEGIN SELECT RAISE(FAIL,'fixture interruption'); END;").unwrap();
+    assert!(f.prepare().is_err());
+    let count: i64 =
+        f.db.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name='legacy_upload_evidence'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0); // The proof table and grants rolled back with the receipt.
+    assert!(f
+        .store
+        .resolve_legacy_upload(CHAT, f.old.join(&f.files[0].0).to_str().unwrap())
+        .unwrap()
+        .is_none());
+    f.db.execute_batch("DROP TRIGGER reject_upload").unwrap();
+    f.prepare().unwrap();
+    assert_eq!(fs::read(f.path(0)).unwrap(), f.files[0].1);
+    assert_eq!(f.rows(), before);
 }
