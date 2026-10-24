@@ -288,7 +288,11 @@ impl Client {
     }
     /// Observe only the discovered owner's live phase. Frames are bounded before
     /// decoding; the thin projection drops all message and tool content.
-    pub async fn compacting(&mut self, owner: &Owner) -> Result<Option<(String, String)>, String> {
+    pub async fn compacting(
+        &mut self,
+        owner: &Owner,
+        current_turn: &str,
+    ) -> Result<Option<(String, String)>, String> {
         if self.poisoned || owner.connection != self.generation {
             return Err(UNAVAILABLE.into());
         }
@@ -336,7 +340,7 @@ impl Client {
                 return Err(UNAVAILABLE.into());
             }
         }
-        Ok(self.phase.compacting())
+        Ok(self.phase.compacting(current_turn))
     }
     async fn action(
         &mut self,

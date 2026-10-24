@@ -144,7 +144,11 @@ impl Desktop {
         thread["status"] = json!({"type":state});
         if state == "active" {
             let owner = self.client.owner(native).await?;
-            if let Some((turn, item)) = self.client.compacting(&owner).await? {
+            if let Some((turn, item)) = self
+                .client
+                .compacting(&owner, page["data"][0]["id"].as_str().ok_or(ERROR)?)
+                .await?
+            {
                 if page["data"][0]["id"] == turn {
                     thread["remodexLiveCompaction"] = json!({"turnId":turn,"itemId":item});
                 }

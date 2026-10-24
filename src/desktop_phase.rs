@@ -31,7 +31,7 @@ fn items(value: &Value) -> Result<BTreeMap<usize, String>, String> {
         .collect())
 }
 fn turn(v: &Value) -> Result<Turn, String> {
-    if !v.is_object() {
+    if !v.is_object() || (v["status"] == "inProgress" && !v["items"].is_array()) {
         return Err(INVALID.into());
     }
     Ok(Turn {
@@ -39,6 +39,7 @@ fn turn(v: &Value) -> Result<Turn, String> {
             .get("turnId")
             .or_else(|| v.get("id"))
             .and_then(Value::as_str)
+            .filter(|id| id.len() <= 256)
             .map(str::to_owned),
         running: v["status"] == "inProgress",
         compact: if v["items"].is_null() {
@@ -58,10 +59,10 @@ impl Phase {
     pub(super) fn ready(&self) -> bool {
         self.revision.is_some()
     }
-    pub(super) fn compacting(&self) -> Option<(String, String)> {
+    pub(super) fn compacting(&self, current_turn: &str) -> Option<(String, String)> {
         self.turns.values().find_map(|t| {
             let id = t.id.as_ref()?;
-            (t.running && uuid::Uuid::parse_str(id).is_ok())
+            (id == current_turn && t.running && uuid::Uuid::parse_str(id).is_ok())
                 .then(|| {
                     t.compact
                         .values()
@@ -73,6 +74,9 @@ impl Phase {
     }
     pub(super) fn apply(&mut self, change: &Value, native: &str) -> Result<(), String> {
         let revision = change["revision"].as_u64().ok_or(INVALID)?;
+        if self.revision.is_some_and(|old| revision < old) {
+            return Err(INVALID.into());
+        }
         if change["type"] == "snapshot" {
             let state = &change["conversationState"];
             if state["id"] != native || state["hostId"] != "local" {
@@ -245,7 +249,7 @@ mod tests {
         p.apply(&json!({"type":"snapshot","revision":1,"conversationState":{"id":N,"hostId":"local","turns":[],"turnHistory":{"history":{"entitiesByKey":{}}}}}),N).unwrap();
         let patch = |base, fields: Value, value: Value| json!({"type":"patches","baseRevision":base,"revision":base+1,"patches":[{"op":"add","path":fields,"value":value}]});
         p.apply(&patch(1,json!(["turnHistory","history","entitiesByKey","tail"]),json!({"turnId":null,"status":"inProgress","params":{"input":"PRIVATE"},"items":[{"type":"contextCompaction","id":"compact","completed":false}]})),N).unwrap();
-        assert_eq!(p.compacting(), None);
+        assert_eq!(p.compacting(T), None);
         p.apply(
             &patch(
                 2,
@@ -255,7 +259,7 @@ mod tests {
             N,
         )
         .unwrap();
-        assert_eq!(p.compacting(), Some((T.into(), "compact".into())));
+        assert_eq!(p.compacting(T), Some((T.into(), "compact".into())));
         p.apply(
             &patch(
                 3,
@@ -273,7 +277,8 @@ mod tests {
             N,
         )
         .unwrap();
-        assert_eq!(p.compacting(), None);
+        assert_eq!(p.compacting(T), None);
+        assert!(p.apply(&json!({"type":"snapshot","revision":1,"conversationState":{"id":N,"hostId":"local","turns":[]}}),N).is_err());
         assert!(p
             .apply(
                 &patch(1, json!(["threadRuntimeStatus"]), json!({"type":"active"})),
@@ -287,7 +292,7 @@ mod tests {
         let snapshot = json!({"type":"snapshot","revision":1,"conversationState":{"id":N,"hostId":"local","turns":[{"id":T,"status":"completed","items":[{"type":"contextCompaction","id":"compact","completed":false}]}]}});
         p.apply(&snapshot, N).unwrap();
         assert!(p.ready());
-        assert_eq!(p.compacting(), None);
+        assert_eq!(p.compacting(T), None);
         assert!(p.apply(&snapshot, T).is_err());
     }
 
@@ -313,7 +318,7 @@ mod tests {
             N,
         )
         .unwrap();
-        assert_eq!(p.compacting(), Some((T.into(), "compact".into())));
+        assert_eq!(p.compacting(T), Some((T.into(), "compact".into())));
         p.apply(
             &patch(
                 2,
@@ -331,7 +336,7 @@ mod tests {
             N,
         )
         .unwrap();
-        assert_eq!(p.compacting(), Some((T.into(), "compact".into())));
+        assert_eq!(p.compacting(T), Some((T.into(), "compact".into())));
         p.apply(
             &patch(
                 3,
@@ -350,6 +355,21 @@ mod tests {
             N,
         )
         .unwrap();
-        assert_eq!(p.compacting(), None);
+        assert_eq!(p.compacting(T), None);
+    }
+
+    #[test]
+    fn stale_compaction_cannot_mask_the_current_turn_and_missing_active_items_are_unknown() {
+        let mut p = Phase::default();
+        let old = "33333333-3333-4333-8333-333333333333";
+        let snapshot = json!({"type":"snapshot","revision":1,"conversationState":{"id":N,"hostId":"local",
+            "turns":[{"id":old,"status":"inProgress","items":[{"type":"contextCompaction","id":"old","completed":false}]},
+                     {"id":T,"status":"inProgress","items":[{"type":"contextCompaction","id":"current","completed":false}]}]}});
+        p.apply(&snapshot, N).unwrap();
+        assert_eq!(p.compacting(T), Some((T.into(), "current".into())));
+        assert_eq!(p.compacting(N), None);
+        let mut incomplete = snapshot;
+        incomplete["conversationState"]["turns"][1]["items"] = Value::Null;
+        assert!(p.apply(&incomplete, N).is_err());
     }
 }
