@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { exportOwnedUpgrade, transcriptFingerprint } from '../src/android-remote/upgrade-export';
@@ -54,7 +54,7 @@ for (const mode of ['okay', 'changed', 'missing'] as const) test(`owned export r
     if (mode === 'okay') {
       const result = await run();
       const receipt = JSON.parse(await readFile(result.receipt, 'utf8'));
-      expect(receipt.source_hold).toBe(join(source, SOURCE_HOLD));
+      expect(receipt.source_hold).toBe(join(await realpath(source), SOURCE_HOLD));
       expect(await readFile(join(output, 'uploads-0/phone/00000000-0000-4000-8000-000000000001/note.txt'), 'utf8')).toBe('KEEP FILE');
       expect(await readFile(join(output, 'images-0', bucket, `${hash}.png`))).toEqual(png);
       expect(JSON.parse(await readFile(join(output, 'claude-0.json'), 'utf8'))).toEqual(history);
