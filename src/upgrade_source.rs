@@ -28,7 +28,7 @@ fn same_path(left: &Path, right: &Path) -> bool {
     #[cfg(windows)]
     {
         fn normalized(p: &Path) -> String {
-            let s = p.to_string_lossy();
+            let s = p.to_string_lossy().replace('/', r"\");
             if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
                 format!(r"\\{unc}")
             } else {
@@ -117,7 +117,7 @@ fn completed(source: &Source, directory: &Path) -> Result<Option<PathBuf>, Strin
         return Ok(None);
     }
     let plan: Value = serde_json::from_slice(&private_bytes(&path, 32768)?).map_err(|_| ERROR)?;
-    let receipt = directory.join("export/closed-owner.json");
+    let receipt = directory.join("export").join("closed-owner.json");
     if plan["version"] != 1 || !json_path(&plan["closed_owner"], &receipt) {
         return Err(ERROR.into());
     }
@@ -231,6 +231,22 @@ mod tests {
             Arc,
         },
     };
+    #[cfg(windows)]
+    #[test]
+    fn node_and_native_receipts_accept_only_equivalent_windows_spellings() {
+        assert!(same_path(
+            Path::new(r"C:\Users\test\export/closed-owner.json"),
+            Path::new(r"\\?\C:\Users\test\export\closed-owner.json")
+        ));
+        assert!(same_path(
+            Path::new(r"//server/share/export/closed-owner.json"),
+            Path::new(r"\\?\UNC\server\share\export\closed-owner.json")
+        ));
+        assert!(!same_path(
+            Path::new(r"C:\Users\other\export/closed-owner.json"),
+            Path::new(r"C:\Users\test\export\closed-owner.json")
+        ));
+    }
     fn write(path: &Path, value: &Value) {
         fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
         #[cfg(unix)]
