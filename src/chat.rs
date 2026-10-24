@@ -2373,15 +2373,27 @@ impl Hub {
                 Ok(json!({"status":if context_available{"ready"}else{"unavailable"}}))
             }
             "filesystem.readTextFile" => {
-                let chat = self.checked(agent, s(&p["threadId"]))?;
+                let id = s(&p["threadId"]).to_owned();
+                let chat = self.checked(agent, &id)?;
                 let workspace = PathBuf::from(s(&chat.thread["worktreePath"]));
                 let path = s(&p["path"]).to_owned();
+                let old_path = path.clone();
+                let migrated = self
+                    .db
+                    .call(move |a| a.store.read_legacy_upload_text(&id, &old_path))
+                    .await??;
                 // An existing Desktop chat may be outside the bridge's default
                 // new-project directory. Use its saved, verified workspace,
                 // never a cwd supplied by the phone.
-                tokio::task::spawn_blocking(move || crate::workspace::read_chat(&workspace, &path))
-                    .await
-                    .map_err(|_| "File service stopped")?
+                tokio::task::spawn_blocking(move || {
+                    if let Some(result) = migrated {
+                        Ok(result)
+                    } else {
+                        crate::workspace::read_chat(&workspace, &path)
+                    }
+                })
+                .await
+                .map_err(|_| "File service stopped")?
             }
             "projects.listEntries" | "projects.searchEntries" | "projects.readFile" => {
                 // Read-only browsing may follow a registered project or a
@@ -2489,11 +2501,13 @@ impl Hub {
                 let path = PathBuf::from(s(&r["path"]));
                 let workspace = PathBuf::from(s(&self.chats[&id].thread["worktreePath"]));
                 self.db.call(move |a| -> Result<Value,String> {
-                    let base=workspace.canonicalize().map_err(|_|"Workspace unavailable")?;
-                    let file=if path.is_absolute() {path} else {base.join(path)}.canonicalize().map_err(|_|"Image unavailable")?;
+                    let migrated=a.store.resolve_legacy_upload(&id,path.to_str().ok_or("Image unavailable")?)?;
+                    let base=if migrated.is_some() {workspace} else {workspace.canonicalize().map_err(|_|"Workspace unavailable")?};
+                    let is_migrated=migrated.is_some();
+                    let file=if let Some(file)=migrated {file} else {if path.is_absolute() {path} else {base.join(path)}.canonicalize().map_err(|_|"Image unavailable")?};
                     let uploaded=file.starts_with(a.store.directory.join("uploads"));
                     let referenced=uploaded && a.store.db.query_row("SELECT EXISTS(SELECT 1 FROM chat_rows WHERE chat=?1 AND kind='messages' AND instr(data,?2)>0) OR EXISTS(SELECT 1 FROM chats WHERE id=?1 AND instr(data,?2)>0)",rusqlite::params![id,file.to_string_lossy()],|r|r.get::<_,bool>(0)).map_err(|_|"History unavailable")?;
-                    if !file.starts_with(&base) && !referenced && !a.store.owns_tool_image(&id,&file) {return Err("Image is outside this chat's workspace and uploads".into());}
+                    if !is_migrated && !file.starts_with(&base) && !referenced && !a.store.owns_tool_image(&id,&file) {return Err("Image is outside this chat's workspace and uploads".into());}
                     let mut handle=crate::attachments::open_image(&file)?;
                     use std::io::Read;
                     let mut header=[0u8;16];let count=handle.read(&mut header).map_err(|_|"Image unavailable")?;

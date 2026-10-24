@@ -397,6 +397,7 @@ impl Store {
         verify_inactive(&tx, id)?;
         if phase == "prepared" {
             verify(&tx, &p, &self.directory)?;
+            crate::legacy_uploads::rollback(&tx, &self.directory, id)?;
             crate::legacy_claude_assets::rollback(&tx, id)?;
             crate::legacy_claude_resume::rollback(&tx, id)?;
             crate::legacy_claude_bindings::rollback(&tx, id)?;
@@ -467,6 +468,7 @@ fn verify(
     directory: &std::path::Path,
 ) -> Result<(), String> {
     let id = p.state["thread"]["id"].as_str().unwrap();
+    crate::legacy_uploads::verify(db, directory, id)?;
     crate::legacy_claude_native::verify(db, directory, id)?;
     let state = crate::legacy_claude_assets::project(db, directory, &p.state)?;
     let mut header = state.clone();

@@ -34,6 +34,7 @@ mod legacy_codex_headers;
 mod legacy_codex_history;
 pub mod legacy_connection;
 mod legacy_preferences;
+mod legacy_uploads;
 pub mod migration_snapshot;
 pub mod restart_drain;
 pub mod server;

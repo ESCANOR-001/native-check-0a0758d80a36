@@ -321,6 +321,7 @@ impl Store {
             return Err(CONFLICT.into());
         }
         p.verify(&self.db)?;
+        crate::legacy_uploads::verify(&self.db, &self.directory, id)?;
         p.states
             .into_iter()
             .find(|s| s["thread"]["id"] == id)
@@ -385,6 +386,11 @@ impl Store {
         if phase == "prepared" {
             p.verify(&tx)?;
             for state in &p.states {
+                crate::legacy_uploads::rollback(
+                    &tx,
+                    &self.directory,
+                    state["thread"]["id"].as_str().ok_or(INVALID)?,
+                )?;
                 crate::legacy_codex_history::rollback(&tx, state)?;
                 tx.execute(
                     "DELETE FROM chats WHERE id=?1",

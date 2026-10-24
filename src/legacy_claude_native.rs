@@ -238,7 +238,7 @@ fn exists(db: &rusqlite::Connection) -> Result<bool, String> {
 }
 // Include incomplete copies left by a crash, not only committed receipts.
 // This staging area cannot grow without bounds across failed imports.
-fn staged_bytes(root: &Path) -> Result<u64, String> {
+pub(crate) fn staged_bytes(root: &Path) -> Result<u64, String> {
     let mut pending = vec![(root.to_owned(), 0)];
     let mut bytes = 0u64;
     let mut entries = 0usize;
