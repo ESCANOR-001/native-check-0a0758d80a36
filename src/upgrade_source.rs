@@ -18,17 +18,15 @@ struct Source {
     endpoint: String,
     token: String,
 }
-fn canonical_spelling(path: &Path) -> Result<bool, String> {
-    let actual = path.canonicalize().map_err(|_| ERROR)?;
+// Compare Node DOS spellings and Rust verbatim spellings without resolving
+// aliases or accepting a different path. The installation may not exist yet.
+fn same_path(left: &Path, right: &Path) -> bool {
     #[cfg(not(windows))]
     {
-        Ok(actual == path)
+        left == right
     }
     #[cfg(windows)]
     {
-        // Node realpath emits DOS paths; Rust canonicalize emits a verbatim
-        // prefix. Comparing those spellings directly rejects every real npm
-        // handoff on Windows. Strip only that native prefix, not components.
         fn normalized(p: &Path) -> String {
             let s = p.to_string_lossy();
             if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
@@ -37,8 +35,16 @@ fn canonical_spelling(path: &Path) -> Result<bool, String> {
                 s.strip_prefix(r"\\?\").unwrap_or(&s).to_owned()
             }
         }
-        Ok(normalized(&actual).eq_ignore_ascii_case(&normalized(path)))
+        normalized(left).eq_ignore_ascii_case(&normalized(right))
     }
+}
+fn canonical_spelling(path: &Path) -> Result<bool, String> {
+    Ok(same_path(&path.canonicalize().map_err(|_| ERROR)?, path))
+}
+fn json_path(value: &Value, expected: &Path) -> bool {
+    value
+        .as_str()
+        .is_some_and(|s| same_path(Path::new(s), expected))
 }
 fn private_bytes(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
     let file = storage_stage::open(path, false).map_err(|_| ERROR)?;
@@ -65,8 +71,8 @@ fn load(root: &Path, descriptor: &Path) -> Result<Source, String> {
         || uuid::Uuid::parse_str(&source.instance).is_err()
         || !source.source_root.is_absolute()
         || !root.is_absolute()
-        || source.installation != root
-        || descriptor != directory.join("source.json")
+        || !same_path(&source.installation, root)
+        || !same_path(descriptor, &directory.join("source.json"))
         || source.token.len() != 64
         || !source.token.bytes().all(|c| c.is_ascii_hexdigit())
     {
@@ -112,18 +118,16 @@ fn completed(source: &Source, directory: &Path) -> Result<Option<PathBuf>, Strin
     }
     let plan: Value = serde_json::from_slice(&private_bytes(&path, 32768)?).map_err(|_| ERROR)?;
     let receipt = directory.join("export/closed-owner.json");
-    if plan["version"] != 1 || plan["closed_owner"] != receipt.to_string_lossy().as_ref() {
+    if plan["version"] != 1 || !json_path(&plan["closed_owner"], &receipt) {
         return Err(ERROR.into());
     }
     let owner: Value =
         serde_json::from_slice(&private_bytes(&receipt, 8 * 1024 * 1024)?).map_err(|_| ERROR)?;
     if owner["profile_mode"] != "existing"
-        || owner["source_hold"]
-            != source
-                .source_root
-                .join("native-upgrade-source-hold.json")
-                .to_string_lossy()
-                .as_ref()
+        || !json_path(
+            &owner["source_hold"],
+            &source.source_root.join("native-upgrade-source-hold.json"),
+        )
     {
         return Err(ERROR.into());
     }
