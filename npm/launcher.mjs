@@ -12,7 +12,12 @@ export const VERSION = '0.0.0';
 // An explicit launch, never npm postinstall, performs the handoff. Arguments
 // remain an array on Windows as well as POSIX; no shell interprets paths.
 export function nativeArguments(args) {
+  if (args[0] === 'migrate') {
+    if (args.length !== 3) throw new Error('Usage: rmx-native-experiment migrate INSTALL_DIR SOURCE_JSON');
+    return ['--npm-upgrade', 'automatic', ...args.slice(1)];
+  }
   if (args[0] === 'start') {
+    if (args.length === 3) return ['--npm-upgrade', 'automatic', ...args.slice(1)];
     if (args.length !== 2) throw new Error('Usage: rmx-native-experiment start INSTALL_DIR');
     return ['--npm-upgrade', 'resume', args[1]];
   }

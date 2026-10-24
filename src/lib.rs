@@ -118,3 +118,4 @@ mod storage_native_schema_tests;
 pub mod export_recovery;
 pub mod npm_upgrade;
 mod source_hold;
+pub mod upgrade_source;

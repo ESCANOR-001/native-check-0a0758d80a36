@@ -1,0 +1,86 @@
+/** Private, source-owned upgrade rendezvous. No route is added to the public
+ * dashboard. A package launcher can request only this owner's fixed export. */
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { constants } from 'node:fs';
+import { mkdir, open, realpath } from 'node:fs/promises';
+import { isAbsolute, join, resolve } from 'node:path';
+
+export interface UpgradeControlOptions {
+  sourceRoot: string;
+  installation: string;
+  /** Called once. Must use the owner's admission/shutdown boundary, and return
+   * only after its public listener and owned workers have stopped. */
+  exportOwner(directory: string): Promise<{
+    version: 1; closed_owner: string; configuration: string;
+    bind: string; public_url: string; gui: string;
+  }>;
+}
+const FAILURE = 'The source upgrade did not complete. Existing data and recovery files were retained.';
+async function writeNew(path: string, value: unknown) {
+  const bytes = Buffer.from(JSON.stringify(value));
+  if (bytes.length > 32768) throw new Error(FAILURE);
+  const file = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+  try { await file.writeFile(bytes); await file.sync(); } finally { await file.close(); }
+  if (process.platform !== 'win32') {
+    const parent = await open(resolve(path, '..'), 'r');
+    try { await parent.sync(); } finally { await parent.close(); }
+  }
+}
+export async function startUpgradeControl(options: UpgradeControlOptions) {
+  if (!isAbsolute(options.sourceRoot) || !isAbsolute(options.installation)
+    || resolve(options.sourceRoot) !== options.sourceRoot || resolve(options.installation) !== options.installation) throw new Error(FAILURE);
+  const sourceRoot = await realpath(options.sourceRoot);
+  const instance = randomUUID(), token = randomBytes(32).toString('hex');
+  const directory = join(sourceRoot, `native-upgrade-${instance}`);
+  await mkdir(directory, { mode: 0o700 });
+  const planPath = join(directory, 'npm-plan.json');
+  let phase: 'idle' | 'exporting' | 'ready' | 'failed' = 'idle';
+  let flight: Promise<void> | undefined;
+  let closed = false;
+  const server = Bun.serve({
+    hostname: '127.0.0.1', port: 0, maxRequestBodySize: 1024, idleTimeout: 10,
+    fetch(request) {
+      const auth = Buffer.from(request.headers.get('authorization') ?? '');
+      const expected = Buffer.from(`Bearer ${token}`);
+      // Not a browser API: Origin, Fetch Metadata and redirects have no role in
+      // local lifecycle control. Never echo credentials or callback errors.
+      if (auth.length !== expected.length || !timingSafeEqual(auth, expected)
+        || request.headers.has('origin') || request.headers.has('sec-fetch-site')
+        || request.headers.get('x-remodex-upgrade-instance') !== instance) return new Response(null, { status: 403 });
+      const url = new URL(request.url);
+      if (url.pathname !== '/upgrade' || url.search || url.hash
+        || request.headers.get('transfer-encoding')
+        || ![null, '0'].includes(request.headers.get('content-length'))) return new Response(null, { status: 400 });
+      if (!['GET', 'POST'].includes(request.method)) return new Response(null, { status: 405 });
+      if (closed) return new Response(null, { status: 503 });
+      if (request.method === 'POST' && phase === 'idle') {
+        // Set synchronously before any await. Repeated requests join the same
+        // durable attempt; they never replay shutdown or overwrite an export.
+        phase = 'exporting';
+        flight = (async () => {
+          await writeNew(join(directory, 'attempt.json'), { version: 1, instance });
+          const plan = await options.exportOwner(join(directory, 'export'));
+          if (plan.version !== 1 || plan.closed_owner !== join(directory, 'export', 'closed-owner.json')) throw new Error(FAILURE);
+          await writeNew(planPath, plan);
+          phase = 'ready';
+        })().catch(() => { phase = 'failed'; });
+      }
+      return Response.json({ version: 1, instance, phase }, { headers: { 'cache-control': 'no-store' } });
+    },
+  });
+  const descriptor = join(directory, 'source.json');
+  try {
+    await writeNew(descriptor, { version: 1, source_root: sourceRoot, installation: options.installation,
+      instance, endpoint: `http://127.0.0.1:${server.port}/upgrade`, token });
+  } catch (error) { await server.stop(true); throw error; }
+  return {
+    descriptor,
+    async close() {
+      closed = true;
+      await server.stop(true);
+      // A caller disconnect cannot cancel the source's shutdown or truncate its
+      // receipt. Keep the directory as recovery evidence, including failures.
+      await flight;
+    },
+  };
+}

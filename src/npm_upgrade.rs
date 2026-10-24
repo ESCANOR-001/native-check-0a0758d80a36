@@ -308,6 +308,38 @@ pub async fn run<F: std::future::Future<Output = ()>>(
     resume(root, stop).await
 }
 
+/// First launch acquires the source owner's export. Later package launches use
+/// only the retained selected generation, even when the old owner is gone.
+pub async fn launch<F: std::future::Future<Output = ()>>(
+    root: &Path,
+    source: &Path,
+    stop: F,
+) -> Result<i32, String> {
+    let selected = if root
+        .join("npm-upgrade.sqlite")
+        .try_exists()
+        .map_err(|_| ERROR)?
+    {
+        let journal = Journal::open(root, false)?;
+        let phase: String = journal
+            .db
+            .query_row("SELECT phase FROM upgrade WHERE id=1", [], |r| r.get(0))
+            .map_err(|_| ERROR)?;
+        match phase.as_str() {
+            "selected" => true,
+            "preparing" => false,
+            _ => return Err(ERROR.into()),
+        }
+    } else {
+        false
+    };
+    if selected {
+        return resume(root, stop).await;
+    }
+    let plan = crate::upgrade_source::acquire(root, source).await?;
+    run(root, &plan, stop).await
+}
+
 fn selected(root: &Path) -> Result<Journal, String> {
     let journal = Journal::open(root, false)?;
     let (raw, attempt, phase): (Vec<u8>, u32, String) = journal
