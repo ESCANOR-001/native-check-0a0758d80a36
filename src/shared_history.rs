@@ -45,6 +45,7 @@ pub(crate) struct Batch {
     pub caught_up: bool,
     pub busy: bool,
     pub missing_empty_session: bool,
+    pub live_compaction: Option<(String, String)>,
 }
 
 async fn rpc(c: &mut Connection, method: &str, params: Value) -> Result<Value, String> {
@@ -139,7 +140,7 @@ pub(crate) async fn read(
                 match rpc_response(&mut connection,"thread/resume",json!({"threadId":native,"excludeTurns":true})).await? {
                     Ok(v)=>v,
                     Err(error) if error["message"]==format!("no rollout found for thread id {native}")=>{
-                        return Ok(Batch{native:native.clone(),before:before.clone(),after:before,turn:None,public_turn:None,items:vec![],recovered_images:Default::default(),final_page:false,caught_up:true,busy:false,missing_empty_session:true});
+                        return Ok(Batch{native:native.clone(),before:before.clone(),after:before,turn:None,public_turn:None,items:vec![],recovered_images:Default::default(),final_page:false,caught_up:true,busy:false,missing_empty_session:true,live_compaction:None});
                     }
                     Err(_)=>return Err("The original session could not be verified; history is intact".into()),
                 }
@@ -159,7 +160,8 @@ pub(crate) async fn read(
         // v2 did not capture image results during history catch-up.
         // v3 omitted MCP images carried inside native JSON text envelopes.
         let after=if before.projection_version<PROJECTION_VERSION {Cursor::default()}else{before.clone()};
-        let mut batch=Batch{native:native.clone(),before,after,turn:None,public_turn:None,items:vec![],recovered_images:Default::default(),final_page:false,caught_up:false,busy,missing_empty_session:false};
+        let live_compaction = metadata["thread"]["remodexLiveCompaction"]["turnId"].as_str().zip(metadata["thread"]["remodexLiveCompaction"]["itemId"].as_str()).map(|(t,i)|(t.to_owned(),i.to_owned()));
+        let mut batch=Batch{native:native.clone(),before,after,turn:None,public_turn:None,items:vec![],recovered_images:Default::default(),final_page:false,caught_up:false,busy,missing_empty_session:false,live_compaction};
         // Skip a bounded number of turns already reconciled by this projection.
         for _ in 0..8 {
             let page=rpc(&mut connection,"thread/turns/list",json!({"threadId":native,"cursor":batch.after.turns,"limit":1,"sortDirection":"asc","itemsView":"notLoaded"})).await?;

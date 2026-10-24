@@ -7,6 +7,8 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[path = "desktop_phase.rs"]
+mod desktop_phase;
 
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(12);
@@ -105,6 +107,8 @@ pub struct Client {
     generation: String,
     timeout: Duration,
     poisoned: bool,
+    followed: Option<Owner>,
+    phase: desktop_phase::Phase,
 }
 #[derive(Clone)]
 pub struct Owner {
@@ -155,6 +159,8 @@ impl Client {
             generation: uuid::Uuid::new_v4().to_string(),
             timeout,
             poisoned: false,
+            followed: None,
+            phase: Default::default(),
         };
         let result = client
             .exchange(
@@ -194,6 +200,7 @@ impl Client {
                 let response = read_frame(&mut self.stream)
                     .await
                     .map_err(|_| UNAVAILABLE)?;
+                self.observe_phase(&response)?;
                 if response["requestId"] != request {
                     // Never answer discovery, approvals or native requests on
                     // someone else's behalf; this client is a follower only.
@@ -263,6 +270,73 @@ impl Client {
             client: owner.into(),
             connection: self.generation.clone(),
         })
+    }
+    fn observe_phase(&mut self, value: &Value) -> Result<(), String> {
+        let Some(owner) = &self.followed else {
+            return Ok(());
+        };
+        let p = &value["params"];
+        if value["type"] == "broadcast"
+            && value["method"] == "thread-stream-state-changed"
+            && value["sourceClientId"] == owner.client
+            && p["conversationId"] == owner.thread
+            && p["hostId"] == "local"
+        {
+            self.phase.apply(&p["change"], &owner.thread)?;
+        }
+        Ok(())
+    }
+    /// Observe only the discovered owner's live phase. Frames are bounded before
+    /// decoding; the thin projection drops all message and tool content.
+    pub async fn compacting(&mut self, owner: &Owner) -> Result<Option<(String, String)>, String> {
+        if self.poisoned || owner.connection != self.generation {
+            return Err(UNAVAILABLE.into());
+        }
+        if self
+            .followed
+            .as_ref()
+            .is_some_and(|old| old.thread != owner.thread || old.client != owner.client)
+        {
+            self.poisoned = true;
+            return Err(UNAVAILABLE.into());
+        }
+        if self.followed.is_none() {
+            self.followed = Some(owner.clone());
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                write_frame(
+                    &mut self.stream,
+                    &json!({"type":"broadcast","sourceClientId":self.client,
+                    "method":"thread-stream-following-changed","version":1,
+                    "params":{"conversationId":owner.thread,"hostId":"local","following":true}}),
+                )
+                .await
+                .map_err(|_| UNAVAILABLE)?;
+                for _ in 0..256 {
+                    let value = read_frame(&mut self.stream)
+                        .await
+                        .map_err(|_| UNAVAILABLE)?;
+                    self.observe_phase(&value)?;
+                    if self.phase.ready() {
+                        return Ok(());
+                    }
+                }
+                Err(UNAVAILABLE.to_owned())
+            })
+            .await
+            .unwrap_or_else(|_| Err(UNAVAILABLE.into()));
+            if result.is_err() {
+                self.poisoned = true;
+            }
+            result?;
+        } else {
+            // A harmless owner probe drains preceding status broadcasts and
+            // verifies that cached state still belongs to this connection.
+            let current = self.owner(&owner.thread).await?;
+            if current.client != owner.client {
+                return Err(UNAVAILABLE.into());
+            }
+        }
+        Ok(self.phase.compacting())
     }
     async fn action(
         &mut self,
@@ -343,6 +417,7 @@ impl Client {
         {
             return Err(UNAVAILABLE.into());
         }
+        normalize_text_input(&mut request)?;
         request["threadId"] = json!(owner.thread);
         let result=self.action(owner,"thread-follower-start-turn",2,json!({"commandId":command,"turnStart":{"request":request,"context":{"inheritThreadSettings":true}}})).await?;
         let turn = result.get("result").unwrap_or(&result).get("turn");
@@ -374,6 +449,7 @@ impl Client {
         {
             return Err(UNAVAILABLE.into());
         }
+        normalize_text_input(&mut request)?;
         request["threadId"] = json!(owner.thread);
         let expected = request["expectedTurnId"].clone();
         let result = self
@@ -408,6 +484,23 @@ impl Client {
         }
         Ok(result)
     }
+}
+
+// Desktop renders the pending input before app-server normalizes defaults.
+// Plain text must carry the same explicit element array as its own composer;
+// otherwise its continuation/mention renderer can throw while the turn runs.
+fn normalize_text_input(request: &mut Value) -> Result<(), String> {
+    let input = request["input"].as_array_mut().ok_or(UNAVAILABLE)?;
+    for item in input {
+        if item["type"] == "text" {
+            if item.get("text_elements").is_none() {
+                item["text_elements"] = json!([]);
+            } else if !item["text_elements"].is_array() {
+                return Err(UNAVAILABLE.into());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -483,9 +576,26 @@ mod tests {
             "phone-message"
         );
         assert_eq!(log[3]["params"]["commandId"], command);
+        assert_eq!(
+            log[3]["params"]["turnStart"]["request"]["input"][0]["text_elements"],
+            json!([])
+        );
         assert_eq!(log[4]["version"], 1);
+        assert_eq!(
+            log[4]["params"]["turnSteerParams"]["input"][0]["text_elements"],
+            json!([])
+        );
         assert_eq!(log[5]["version"], 4);
         assert_eq!(log[5]["params"]["expectedTurnId"], "t2");
+    }
+    #[test]
+    fn desktop_input_retains_existing_elements_and_refuses_malformed_values() {
+        let mut input = json!({"input":[{"type":"text","text":"hello","text_elements":[{"placeholder":"mention","byteRange":{"start":0,"end":5}}]},{"type":"localImage","path":"image.png"}]});
+        let original = input.clone();
+        normalize_text_input(&mut input).unwrap();
+        assert_eq!(input, original);
+        input["input"][0]["text_elements"] = Value::Null;
+        assert!(normalize_text_input(&mut input).is_err());
     }
     #[tokio::test]
     async fn wrong_owner_or_method_cannot_confirm_a_mutation_or_trigger_replay() {

@@ -72,6 +72,16 @@ async fn controls_stay_with_desktop_and_history_reader_never_resumes_the_chat() 
             stream.read_exact(&mut bytes).await.unwrap();
             let v: Value = serde_json::from_slice(&bytes).unwrap();
             seen.lock().unwrap().push(v.clone());
+            if v["method"] == "thread-stream-following-changed" {
+                assert_eq!(v["params"]["conversationId"], NATIVE);
+                let b = json!({"type":"broadcast","sourceClientId":"original","method":"thread-stream-state-changed","params":{
+                    "conversationId":NATIVE,"hostId":"local","change":{"type":"snapshot","revision":1,
+                    "conversationState":{"id":NATIVE,"hostId":"local","turns":[]}}
+                }}).to_string().into_bytes();
+                stream.write_u32_le(b.len() as u32).await.unwrap();
+                stream.write_all(&b).await.unwrap();
+                continue;
+            }
             let result = match v["method"].as_str().unwrap() {
                 "initialize" => json!({"clientId":"reader"}),
                 "thread-owner-discovery" => json!({"handledByClientId":"original"}),

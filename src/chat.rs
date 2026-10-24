@@ -1139,6 +1139,15 @@ impl Hub {
                 chat.thread["session"]["lastError"] = Value::Null;
                 chat.thread["latestUserMessageAt"] = json!(started);
                 chat.thread["updatedAt"] = json!(completed.as_ref().unwrap_or(&started));
+                if let Some((native, item)) = &batch.live_compaction {
+                    if turn["id"] == *native && turn["status"] == "inProgress" {
+                        projection::project(
+                            &mut chat,
+                            &json!({"method":"item/started","params":{
+                            "threadId":batch.native,"turnId":native,"item":{"type":"contextCompaction","id":item}}}),
+                        );
+                    }
+                }
                 if batch.final_page {
                     let state = match s(&turn["status"]) {
                         "interrupted" => "interrupted",

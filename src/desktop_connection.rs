@@ -142,13 +142,25 @@ impl Desktop {
             _ => return Err(ERROR.into()),
         };
         thread["status"] = json!({"type":state});
+        if state == "active" {
+            let owner = self.client.owner(native).await?;
+            if let Some((turn, item)) = self.client.compacting(&owner).await? {
+                if page["data"][0]["id"] == turn {
+                    thread["remodexLiveCompaction"] = json!({"turnId":turn,"itemId":item});
+                }
+            }
+        }
         Ok((thread, page))
     }
     async fn poll(&mut self, output: &mpsc::Sender<Event>) -> Result<(), String> {
         if self.turn.is_empty() {
             return Ok(());
         }
-        let (_, page) = self.metadata(&self.native.clone()).await?;
+        let (metadata, page) = self.metadata(&self.native.clone()).await?;
+        if metadata["remodexLiveCompaction"]["turnId"] == self.turn {
+            send(output, json!({"method":"item/started","params":{"threadId":self.native,"turnId":self.turn,
+                "item":{"type":"contextCompaction","id":metadata["remodexLiveCompaction"]["itemId"]}}})).await?;
+        }
         let turns = page["data"]
             .as_array()
             .filter(|v| v.len() <= 1)
