@@ -1428,6 +1428,22 @@ fn npm_replacement_start_refuses_cancelled_unfinished_or_redirected_selection() 
     write(&intent, &redirected);
     assert!(npm_upgrade::resume_info(&root).is_err());
     fs::write(intent, original).unwrap();
+    let service = Connection::open(root.join("service/service.sqlite")).unwrap();
+    let saved: Vec<u8> = service
+        .query_row("SELECT plan FROM selection", [], |r| r.get(0))
+        .unwrap();
+    let mut changed: Value = serde_json::from_slice(&saved).unwrap();
+    changed["bind"] = json!("127.0.0.1:18992");
+    service
+        .execute(
+            "UPDATE selection SET plan=?1",
+            [serde_json::to_vec(&changed).unwrap()],
+        )
+        .unwrap();
+    assert!(npm_upgrade::resume_info(&root).is_err());
+    service
+        .execute("UPDATE selection SET plan=?1", [saved])
+        .unwrap();
     let db = Connection::open(root.join("npm-upgrade.sqlite")).unwrap();
     db.execute("UPDATE upgrade SET phase='preparing'", [])
         .unwrap();

@@ -334,8 +334,10 @@ fn selected(root: &Path) -> Result<Journal, String> {
     }
     // This revalidates the selected configuration, original profile binding,
     // source hold and service identity, without opening an agent process.
-    if crate::service_cutover::registration(&journal.root.join("service"))?
-        != crate::profile_handoff::ProfileMode::Existing
+    if crate::service_cutover::registration_for_plan(
+        &journal.root.join("service"),
+        Some(&expected),
+    )? != crate::profile_handoff::ProfileMode::Existing
     {
         return Err(ERROR.into());
     }

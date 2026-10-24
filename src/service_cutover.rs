@@ -216,10 +216,23 @@ pub fn cancel(directory: &Path) -> Result<Value, String> {
 pub(crate) fn registration(
     directory: &Path,
 ) -> Result<crate::profile_handoff::ProfileMode, String> {
+    registration_for_plan(directory, None)
+}
+
+pub(crate) fn registration_for_plan(
+    directory: &Path,
+    expected: Option<&Value>,
+) -> Result<crate::profile_handoff::ProfileMode, String> {
     let selection = Selection::open(directory, false)?;
     let (raw, digest, phase) = selection.saved()?.ok_or(ERROR)?;
     if !matches!(phase.as_str(), "selected" | "started") {
         return Err(ERROR.into());
+    }
+    if let Some(expected) = expected {
+        let actual: Value = serde_json::from_slice(&raw).map_err(|_| ERROR)?;
+        if &actual != expected {
+            return Err(ERROR.into());
+        }
     }
     let (plan, _, current, hold) = inputs(&raw, true)?;
     let _source = crate::source_hold::lease(&hold)?;
