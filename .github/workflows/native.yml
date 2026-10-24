@@ -47,6 +47,8 @@ jobs:
         run: node --test npm/launcher.test.mjs
       - name: Lint all targets
         run: cargo +1.98.0 clippy --locked --all-targets -- -D warnings
+      - name: Qualify source handoff before the full suite
+        run: cargo +1.98.0 test --locked --test upgrade_source_interop -- --show-output
       - name: Execute protocol and lifecycle tests
         timeout-minutes: 15
         run: cargo +1.98.0 test --locked --all-targets --no-fail-fast -- --test-threads=1 --show-output
