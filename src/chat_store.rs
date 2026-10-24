@@ -483,7 +483,9 @@ impl Store {
             // Stream snapshots contain the bounded recent page. Do not allocate
             // AUTOINCREMENT ids or dirty its pages for rows that did not change.
             // Reuse the statement across rows/events; FULL durability is retained.
-            let mut upsert = tx.prepare_cached("INSERT INTO chat_rows(chat,kind,id,turn,data) SELECT ?1,?2,?3,?4,?5 WHERE NOT EXISTS (SELECT 1 FROM chat_rows WHERE chat=?1 AND kind=?2 AND id=?3 AND data=?5) ON CONFLICT(chat,kind,id) DO UPDATE SET turn=excluded.turn,data=CASE
+            // Paging exposes the destination row sequence. Saving an unchanged
+            // page must not rewrite the source sequence in migrated history.
+            let mut upsert = tx.prepare_cached("INSERT INTO chat_rows(chat,kind,id,turn,data) SELECT ?1,?2,?3,?4,?5 WHERE NOT EXISTS (SELECT 1 FROM chat_rows WHERE chat=?1 AND kind=?2 AND id=?3 AND (data=?5 OR (json_extract(?5,'$.sequence')=seq AND json_remove(data,'$.sequence')=json_remove(?5,'$.sequence')))) ON CONFLICT(chat,kind,id) DO UPDATE SET turn=excluded.turn,data=CASE
                         WHEN excluded.turn=chat_rows.turn AND excluded.kind='activities'
                         AND json_type(chat_rows.data,'$.payload.turnDurationMs')='integer'
                         AND json_extract(chat_rows.data,'$.payload.turnDurationMs')>=0

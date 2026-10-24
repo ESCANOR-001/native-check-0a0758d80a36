@@ -322,6 +322,7 @@ impl Store {
         }
         p.verify(&self.db)?;
         crate::legacy_uploads::verify(&self.db, &self.directory, id)?;
+        crate::legacy_codex_native::verify(&self.db, &self.directory, id)?;
         p.states
             .into_iter()
             .find(|s| s["thread"]["id"] == id)
@@ -397,6 +398,11 @@ pub(crate) fn rollback(
         p.verify(db)?;
         for state in &p.states {
             crate::legacy_uploads::rollback(
+                db,
+                directory,
+                state["thread"]["id"].as_str().ok_or(INVALID)?,
+            )?;
+            crate::legacy_codex_native::rollback(
                 db,
                 directory,
                 state["thread"]["id"].as_str().ok_or(INVALID)?,

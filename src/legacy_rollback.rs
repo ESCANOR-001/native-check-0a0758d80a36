@@ -28,6 +28,7 @@ impl Store {
     /// rolls it back. Apply commits that same sequence atomically. Failure or a
     /// process exit cannot leave half the chats removed. Call only offline.
     pub fn rollback_legacy_imports(&mut self, apply: bool) -> Result<Value, String> {
+        let _native_lease = crate::legacy_activation::rollback_lease(&self.db)?;
         let deadline = Instant::now() + Duration::from_secs(300);
         let tx = self
             .db
@@ -84,6 +85,10 @@ impl Store {
         // Parent verification also rejects any unrelated state, active child
         // receipt, changed copied asset or storage charge. It runs last while
         // every preceding change is still uncommitted.
+        if table(&tx, "legacy_activation")? {
+            tx.execute_batch("DROP TABLE legacy_activation;")
+                .map_err(|_| INVALID)?;
+        }
         crate::legacy_connection::rollback(&tx, &self.directory)?;
         if Instant::now() >= deadline {
             return Err(INVALID.into());

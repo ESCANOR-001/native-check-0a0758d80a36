@@ -43,6 +43,7 @@ struct Images {
 struct Codex {
     id: String,
     history: String,
+    native: Option<Native>,
     uploads: Option<Uploads>,
 }
 #[derive(Deserialize)]
@@ -124,7 +125,7 @@ fn database(path: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-fn existing_store(directory: &Path) -> Result<Store, String> {
+pub(crate) fn existing_store(directory: &Path) -> Result<Store, String> {
     let path = directory.join("native-connect.sqlite");
     database(&path)?;
     let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -290,6 +291,13 @@ fn import(store: &mut Store, root: &Path, plan: &Plan, deadline: Instant) -> Res
             return Err(ERROR.into());
         }
         store.prepare_legacy_codex_history(&chat.id, &input(root, &chat.history)?)?;
+        if let Some(native) = &chat.native {
+            store.prepare_legacy_codex_native(
+                &chat.id,
+                &checked(root, &native.snapshot, true)?,
+                &native.transcript,
+            )?;
+        }
         uploads(store, root, &chat.id, &chat.uploads)?;
     }
     for chat in &plan.claude {

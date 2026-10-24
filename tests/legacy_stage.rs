@@ -22,6 +22,38 @@ struct Fixture {
     original: PathBuf,
 }
 impl Fixture {
+    fn activation_config(&self) -> PathBuf {
+        use remodex_connect_native::profile_handoff::{self, Input, Plan};
+        let claude = self._dir.path().join("claude-profile");
+        fs::create_dir(&claude).unwrap();
+        fs::write(claude.join("settings.json"), b"{}").unwrap();
+        let claude_snapshot = self._dir.path().join("claude-profile-export");
+        migration_snapshot::capture(&claude, &claude_snapshot, ENV).unwrap();
+        let codex = self._dir.path().join("codex-export");
+        let handoff = self._dir.path().join("native-generation");
+        profile_handoff::prepare(
+            &handoff,
+            &Plan {
+                version: 1,
+                environment: ENV.into(),
+                codex: Input {
+                    original_profile: codex.clone(),
+                    snapshot: self.source.join("codex-native"),
+                },
+                claude: Input {
+                    original_profile: claude.clone(),
+                    snapshot: claude_snapshot,
+                },
+            },
+        )
+        .unwrap();
+        let config = self._dir.path().join("config.json");
+        write(
+            &config,
+            &json!({"native_profile_handoff":handoff,"workspace":self._dir.path(),"codex":{"executable":std::env::current_exe().unwrap(),"profile":codex,"model":"test"},"claude":{"executable":std::env::current_exe().unwrap(),"profile":claude,"model":"test","remote_control":true}}),
+        );
+        config
+    }
     fn new(count: usize) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("export");
@@ -85,6 +117,24 @@ impl Fixture {
     fn capture(&self) {
         migration_snapshot::capture(&self.source, &self.snapshot, ENV).unwrap();
     }
+    fn codex_native_export(&self, mutate: impl FnOnce(&mut Vec<Value>)) {
+        let profile = self._dir.path().join("codex-export");
+        fs::create_dir_all(profile.join("sessions")).unwrap();
+        let mut events = vec![
+            json!({"type":"session_meta","payload":{"id":CODEX}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":CODEX,"turn_id":"native-old-turn","item":{"type":"UserMessage","id":"native-user","client_id":PROMPT,"content":[{"type":"text","text":"Native content is retained only in the offline snapshot"}]}}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":CODEX,"turn_id":"native-old-turn","item":{"type":"AgentMessage","id":"reply","content":[{"type":"Text","text":"Keep reply"}]}}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"native-old-turn"}}),
+        ];
+        mutate(&mut events);
+        let raw = events.iter().map(|v| format!("{v}\n")).collect::<String>();
+        fs::write(profile.join("sessions/test.jsonl"), raw).unwrap();
+        migration_snapshot::capture(&profile, &self.source.join("codex-native"), ENV).unwrap();
+        let mut plan = read(&self.source.join("stage.json"));
+        plan["codex"][0]["native"] =
+            json!({"snapshot":"codex-native","transcript":"sessions/test.jsonl"});
+        write(&self.source.join("stage.json"), &plan);
+    }
     fn run(&self) -> Result<Value, String> {
         legacy_stage::run(&self.snapshot, &self.generation, ENV)
     }
@@ -103,6 +153,230 @@ impl Fixture {
             .arg(&self.generation)
             .arg(ENV);
         c
+    }
+}
+
+#[test]
+fn verified_owned_activation_is_idempotent_and_unused_generation_rolls_back_atomically() {
+    use remodex_connect_native::{launch_config, legacy_activation};
+    let f = Fixture::new(0);
+    f.codex_native_export(|_| {});
+    f.capture();
+    f.run().unwrap();
+    let state = f.generation.join("state");
+    let original = rows(&f.db());
+    let path = f.activation_config();
+    let config = launch_config::load(&path).unwrap();
+    assert!(legacy_activation::before_start(&state, Some(&config)).is_err());
+    assert_eq!(legacy_activation::run(&state, &path).unwrap()["chats"], 1);
+    assert_eq!(
+        legacy_activation::run(&state, &path).unwrap()["alreadyActive"],
+        true
+    );
+    let mut wrong = config.clone();
+    wrong.native_profile_handoff = None;
+    assert!(legacy_activation::before_start(&state, Some(&wrong)).is_err());
+    assert!(legacy_activation::before_start(&state, None).is_err());
+    assert_eq!(rows(&f.db()), original);
+    assert_eq!(
+        legacy_rollback::run(&state, false).unwrap()["phase"],
+        "rollback-verified"
+    );
+    assert_eq!(rows(&f.db()), original);
+    legacy_rollback::run(&state, true).unwrap();
+    assert!(rows(&f.db()).is_empty());
+    assert!(legacy_activation::before_start(&state, Some(&config)).is_err());
+    assert!(legacy_activation::run(&state, &path).is_err());
+    assert!(config
+        .native_profile_handoff
+        .unwrap()
+        .join("attempt-1/working/codex/data/sessions/test.jsonl")
+        .exists());
+    migration_snapshot::verify_tree(
+        &f.source.join("codex-native"),
+        &f._dir.path().join("codex-export"),
+        ENV,
+    )
+    .unwrap();
+    assert_eq!(
+        legacy_rollback::run(&state, true).unwrap()["alreadyRolledBack"],
+        true
+    );
+}
+
+#[test]
+fn startup_claim_preserves_new_history_and_never_reimports_it_on_restart_or_rollback() {
+    use remodex_connect_native::{launch_config, legacy_activation};
+    let f = Fixture::new(0);
+    f.codex_native_export(|_| {});
+    f.capture();
+    f.run().unwrap();
+    let state = f.generation.join("state");
+    let path = f.activation_config();
+    let config = launch_config::load(&path).unwrap();
+    legacy_activation::run(&state, &path).unwrap();
+    legacy_activation::before_start(&state, Some(&config)).unwrap();
+    f.db().execute("UPDATE chat_rows SET data=json_set(data,'$.text','NEW WORK MUST STAY') WHERE kind='messages' AND id='reply'",[]).unwrap();
+    let after = rows(&f.db());
+    assert!(after.iter().any(|s| s.contains("NEW WORK MUST STAY")));
+    legacy_activation::before_start(&state, Some(&config)).unwrap();
+    assert!(legacy_rollback::run(&state, false)
+        .unwrap_err()
+        .contains("current state"));
+    assert!(legacy_rollback::run(&state, true).is_err());
+    assert_eq!(rows(&f.db()), after);
+    assert_eq!(
+        legacy_activation::run(&state, &path).unwrap()["alreadyActive"],
+        true
+    );
+    assert_eq!(rows(&f.db()), after);
+}
+
+#[tokio::test]
+async fn runtime_api_requires_the_explicit_migration_configuration() {
+    use remodex_connect_native::{auth::Auth, launch_config, legacy_activation, server::App};
+    let f = Fixture::new(0);
+    f.codex_native_export(|_| {});
+    f.capture();
+    f.run().unwrap();
+    let state = f.generation.join("state");
+    let path = f.activation_config();
+    let config = launch_config::load(&path).unwrap();
+    legacy_activation::run(&state, &path).unwrap();
+    legacy_activation::before_start(&state, Some(&config)).unwrap();
+    assert!(App::new(Auth::new(Store::open(&state).unwrap()), "isolated").is_err());
+    let mut wrong = config.clone();
+    wrong.native_profile_handoff = None;
+    assert!(App::with_configuration(
+        Auth::new(Store::open(&state).unwrap()),
+        "isolated",
+        Some(&wrong)
+    )
+    .is_err());
+    let app = App::with_configuration(
+        Auth::new(Store::open(&state).unwrap()),
+        "isolated",
+        Some(&config),
+    )
+    .unwrap();
+    let before = rows(&f.db());
+    let chats = remodex_connect_native::chat::Chats::start(app.auth.clone(), config)
+        .await
+        .unwrap();
+    let result = chats
+        .call(
+            remodex_connect_native::chat::AgentKind::Codex,
+            "test-phone",
+            "orchestration.subscribeThread",
+            json!({"threadId":"codex"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["snapshot"]["thread"]["session"]["status"], "ready");
+    assert_eq!(
+        result["snapshot"]["thread"]["session"]["statusConfidence"],
+        "confirmed"
+    );
+    assert_eq!(rows(&f.db()), before);
+    chats
+        .call(
+            remodex_connect_native::chat::AgentKind::Codex,
+            "local",
+            "native.shutdown",
+            json!({}),
+        )
+        .await
+        .unwrap();
+    drop(chats);
+    drop(app);
+}
+
+#[test]
+fn saving_a_loaded_page_keeps_legacy_message_bytes_and_native_identity_proofs() {
+    let f = Fixture::new(1);
+    f.codex_native_export(|_| {});
+    for name in ["codex.json", "claude-0.json"] {
+        let file = f.source.join(name);
+        let mut value = read(&file);
+        let thread = if name == "codex.json" {
+            &mut value
+        } else {
+            &mut value["thread"]
+        };
+        for (i, row) in thread["messages"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            row["sequence"] = json!(900 + i);
+        }
+        write(&file, &value);
+    }
+    f.capture();
+    f.run().unwrap();
+    let old = rows(&f.db());
+    let mut store = Store::open(&f.generation.join("state")).unwrap();
+    for id in ["codex", "claude-0"] {
+        let mut state = store.load_chat(id).unwrap();
+        assert_ne!(state["thread"]["messages"][0]["sequence"], 900);
+        state["paused"] = json!(true);
+        store.save_chat(&state, None).unwrap();
+    }
+    assert_eq!(rows(&f.db()), old);
+    assert!(store
+        .legacy_codex_replayed_item(
+            "codex",
+            CODEX,
+            "old-turn",
+            "native-old-turn",
+            &json!({"id":"native-user","type":"userMessage","clientId":PROMPT})
+        )
+        .unwrap());
+}
+
+#[test]
+fn changed_working_profile_or_missing_native_proof_blocks_activation_and_retains_rows() {
+    use remodex_connect_native::{launch_config, legacy_activation};
+    for missing in [true, false] {
+        let f = Fixture::new(0);
+        f.codex_native_export(|_| {});
+        if missing {
+            let mut plan = read(&f.source.join("stage.json"));
+            plan["codex"][0].as_object_mut().unwrap().remove("native");
+            write(&f.source.join("stage.json"), &plan);
+        }
+        f.capture();
+        f.run().unwrap();
+        let before = rows(&f.db());
+        let state = f.generation.join("state");
+        let path = f.activation_config();
+        let config = launch_config::load(&path).unwrap();
+        if missing {
+            assert!(legacy_activation::run(&state, &path).is_err());
+        } else {
+            legacy_activation::run(&state, &path).unwrap();
+            fs::write(
+                config
+                    .native_profile_handoff
+                    .as_ref()
+                    .unwrap()
+                    .join("attempt-1/working/codex/data/new-work"),
+                b"KEEP",
+            )
+            .unwrap();
+            assert!(legacy_activation::before_start(&state, Some(&config)).is_err());
+            assert!(legacy_activation::run(&state, &path).is_err());
+            assert!(legacy_rollback::run(&state, true).is_err());
+            assert_eq!(
+                f.db()
+                    .query_row("SELECT phase FROM legacy_activation", [], |r| r
+                        .get::<_, String>(0))
+                    .unwrap(),
+                "active"
+            );
+        }
+        assert_eq!(rows(&f.db()), before);
     }
 }
 fn write(path: &std::path::Path, value: &Value) {
@@ -439,4 +713,151 @@ fn stages_verified_native_claude_history_and_keeps_startup_blocked() {
         .is_err());
     legacy_rollback::run(&f.generation.join("state"), true).unwrap();
     assert!(profile.join(transcript).exists());
+}
+
+#[test]
+fn codex_native_ids_survive_staging_retry_and_rollback_with_original_history() {
+    let f = Fixture::new(1);
+    f.codex_native_export(|_| {});
+    f.capture();
+    f.run().unwrap();
+    let db = f.db();
+    let before = rows(&db);
+    let report: String = db
+        .query_row(
+            "SELECT report FROM legacy_codex_native WHERE chat='codex'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(parsed["items"].as_array().unwrap().len(), 2);
+    assert!(parsed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|i| i["native"] == "native-user" && i["public"] == PROMPT));
+    assert!(!report.contains("Native content"));
+    f.run().unwrap();
+    assert_eq!(rows(&db), before);
+    let store = Store::open(&f.generation.join("state")).unwrap();
+    assert!(store.assert_migration_ready().is_err());
+    let user = json!({"type":"userMessage","id":"native-user","clientId":PROMPT});
+    assert!(store
+        .legacy_codex_replayed_item("codex", CODEX, "old-turn", "native-old-turn", &user)
+        .unwrap());
+    assert!(store
+        .legacy_codex_replayed_item(
+            "codex",
+            CODEX,
+            "old-turn",
+            "native-old-turn",
+            &json!({"type":"agentMessage","id":"reply"})
+        )
+        .unwrap());
+    assert!(!store
+        .legacy_codex_replayed_item("codex", CODEX, "new-turn", "native-new-turn", &user)
+        .unwrap());
+    assert!(store
+        .legacy_codex_replayed_item(
+            "codex",
+            "wrong-native",
+            "old-turn",
+            "native-old-turn",
+            &user
+        )
+        .is_err());
+    assert!(store
+        .legacy_codex_replayed_item(
+            "codex",
+            CODEX,
+            "old-turn",
+            "native-old-turn",
+            &json!({"type":"userMessage","id":"unknown"})
+        )
+        .is_err());
+    assert!(store
+        .legacy_codex_replayed_item(
+            "codex",
+            CODEX,
+            "old-turn",
+            "native-old-turn",
+            &json!({"type":"userMessage","id":"native-user","clientId":"conflicting-client"})
+        )
+        .is_err());
+    let original: String = db
+        .query_row(
+            "SELECT data FROM chat_rows WHERE chat='codex' AND id=?1",
+            [PROMPT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.execute("UPDATE chat_rows SET data=json_set(data,'$.text','Changed history') WHERE chat='codex' AND id=?1",[PROMPT]).unwrap();
+    assert!(store
+        .legacy_codex_replayed_item("codex", CODEX, "old-turn", "native-old-turn", &user)
+        .is_err());
+    db.execute(
+        "UPDATE chat_rows SET data=?1 WHERE chat='codex' AND id=?2",
+        rusqlite::params![original, PROMPT],
+    )
+    .unwrap();
+    drop(store);
+    legacy_rollback::run(&f.generation.join("state"), true).unwrap();
+    assert_eq!(
+        db.query_row("SELECT phase FROM legacy_codex_native", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "rolled-back"
+    );
+    assert!(f.generation.join("state/legacy-native").exists());
+    assert!(f.run().is_err());
+}
+
+#[test]
+fn missing_wrong_ambiguous_and_incomplete_codex_native_identities_stay_offline() {
+    for change in 0..8 {
+        let f = Fixture::new(1);
+        f.codex_native_export(|events| match change {
+            0 => events[0]["payload"]["id"] = json!("wrong-session"),
+            1 => events[1]["payload"]["item"]["client_id"] = json!("unknown-public-id"),
+            2 => events[2]["payload"]["item"]["id"] = json!("unknown-reply-id"),
+            3 => {
+                events.pop();
+            }
+            4 => events[1]["payload"]["turn_id"] = json!("wrong-turn"),
+            5 => events.push(events[1].clone()),
+            6 => events[1]["payload"]["thread_id"] = json!("wrong-thread"),
+            _ => events.push(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"native-old-turn"}})),
+        });
+        f.capture();
+        assert!(f.run().is_err(), "change={change}");
+        assert!(Store::open(&f.generation.join("state"))
+            .unwrap()
+            .assert_migration_ready()
+            .is_err());
+        assert_eq!(rows(&f.db()).len(), 2); // Imported Codex history is retained.
+    }
+}
+
+#[test]
+fn a_changed_copied_codex_rollout_refuses_retry_and_rollback_without_repair() {
+    let f = Fixture::new(1);
+    f.codex_native_export(|_| {});
+    f.capture();
+    f.run().unwrap();
+    let db = f.db();
+    let before = rows(&db);
+    let bundle: String = db
+        .query_row("SELECT bundle FROM legacy_codex_native", [], |r| r.get(0))
+        .unwrap();
+    let file = f
+        .generation
+        .join("state/legacy-native")
+        .join(bundle)
+        .join("data/sessions/test.jsonl");
+    fs::write(&file, b"changed native history\n").unwrap();
+    assert!(f.run().is_err());
+    assert!(legacy_rollback::run(&f.generation.join("state"), true).is_err());
+    assert_eq!(rows(&db), before);
+    assert_eq!(fs::read(file).unwrap(), b"changed native history\n");
 }

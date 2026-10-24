@@ -244,7 +244,9 @@ pub struct Chats {
 }
 impl Chats {
     pub async fn start(db: AuthService, mut config: Config) -> Result<Self, String> {
-        db.call(|a| a.store.assert_migration_ready()).await??;
+        let migration_config = config.clone();
+        db.call(move |a| a.store.claim_migration_start(Some(&migration_config)))
+            .await??;
         let requested_handoff = config.native_profile_handoff.clone();
         db.call(move |a| {
             a.store
@@ -279,6 +281,9 @@ impl Chats {
             })
             .await
             .map_err(|_| "Native profile handoff check failed")??;
+            let migration_config = config.clone();
+            db.call(move |a| a.store.complete_migration_activation(&migration_config))
+                .await??;
             (config.codex.profile, config.claude.profile) = session.profiles();
             Some(Arc::new(session))
         } else {
@@ -940,6 +945,28 @@ impl Hub {
             for row in &batch.items {
                 let item = &row["item"];
                 let item_id = s(&item["id"]);
+                let (cid, session, public_id, native_turn, native_item) = (
+                    id.to_owned(),
+                    batch.native.clone(),
+                    public.clone(),
+                    s(&turn["id"]).to_owned(),
+                    item.clone(),
+                );
+                if self
+                    .db
+                    .call(move |a| {
+                        a.store.legacy_codex_replayed_item(
+                            &cid,
+                            &session,
+                            &public_id,
+                            &native_turn,
+                            &native_item,
+                        )
+                    })
+                    .await??
+                {
+                    continue;
+                }
                 if item["type"] == "userMessage" {
                     if let Some(client_id) = item["clientId"].as_str() {
                         let cid = id.to_owned();

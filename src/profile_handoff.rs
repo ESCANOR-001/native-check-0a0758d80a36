@@ -479,6 +479,32 @@ pub fn activate(root: &Path, environment: &str, codex: &Path, claude: &Path) -> 
     })
 }
 
+/// Hold a prepared generation while the offline migration verifies its native
+/// transcripts. This does not mark it active or start an agent.
+pub(crate) fn inspect_prepared(
+    root: &Path,
+    environment: &str,
+    codex: &Path,
+    claude: &Path,
+) -> Result<Session> {
+    let journal = Journal::open(root, false)?;
+    let (plan, phase) = journal.saved()?;
+    if phase != "prepared"
+        || plan.environment != environment
+        || plan.codex.original_profile != codex
+        || plan.claude.original_profile != claude
+    {
+        return Err(ERROR.into());
+    }
+    journal.verify_sources(&plan)?;
+    journal.unchanged(&plan)?;
+    Ok(Session {
+        root: journal.root,
+        attempt: journal.attempt,
+        _lease: journal._lease,
+    })
+}
+
 /// Withdraw an unused generation. After work changes, refusal preserves the
 /// complete current profiles; rolling back the executable must keep those data.
 /// This function never deletes a history or writes a byte to original profiles.

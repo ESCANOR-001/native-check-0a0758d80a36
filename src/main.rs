@@ -39,6 +39,20 @@ async fn serve(
     args: Vec<String>,
     parent: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    if args.get(1).is_some_and(|a| a == "--legacy-activate") {
+        if args.len() != 4 {
+            return Err(
+                "Usage: --legacy-activate ABSOLUTE_OFFLINE_STATE_DIR ISOLATED_CHAT_CONFIG_JSON"
+                    .into(),
+            );
+        }
+        let report = remodex_connect_native::legacy_activation::run(
+            &PathBuf::from(&args[2]),
+            &PathBuf::from(&args[3]),
+        )?;
+        println!("{report}");
+        return Ok(0);
+    }
     if args.get(1).is_some_and(|a| a == "--legacy-stage") {
         if args.len() != 5 {
             return Err("Usage: --legacy-stage ABSOLUTE_EXPORT_SNAPSHOT ABSOLUTE_NEW_GENERATION ENVIRONMENT_ID".into());
@@ -122,13 +136,14 @@ async fn serve(
         .transpose()?;
     let directory = PathBuf::from(&args[1]);
     let _profile_lock = remodex_connect_native::profile_lock::acquire(&directory)?;
+    remodex_connect_native::legacy_activation::before_start(&directory, config.as_ref())?;
     InvitationFile::clear_previous(&directory)?;
     // Install signal handlers before advertising readiness. Otherwise an
     // immediate service stop can use the OS default instead of our cleanup.
     let stopping = shutdown()?;
     let listener = tokio::net::TcpListener::bind(&args[2]).await?;
     let store = Store::open(&directory)?;
-    store.assert_migration_ready()?;
+    store.assert_migration_configuration(config.as_ref())?;
     let mut auth = Auth::new(store);
     let invite = if auth.control_enabled()?
         && auth.local_network_enabled()?
@@ -138,7 +153,7 @@ async fn serve(
     } else {
         None
     };
-    let mut app = App::new(auth, "Rust native foundation")?;
+    let mut app = App::with_configuration(auth, "Rust native foundation", config.as_ref())?;
     app.local_url = Some(args[3].clone());
     let diagnostics = remodex_connect_native::diagnostics::Log::new(&directory)?;
     app.diagnostics = Some(diagnostics.clone());
