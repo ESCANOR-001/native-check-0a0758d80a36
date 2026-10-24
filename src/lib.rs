@@ -24,6 +24,7 @@ pub mod claude_turns;
 pub mod dashboard;
 pub mod diagnostics;
 mod handoff_codex;
+pub mod launch_config;
 mod legacy_claude;
 mod legacy_claude_assets;
 mod legacy_claude_bindings;

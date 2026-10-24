@@ -2,7 +2,7 @@ use axum::serve::{Listener as _, ListenerExt as _};
 use remodex_connect_native::invitation_file::InvitationFile;
 use remodex_connect_native::{
     auth::{self, Auth},
-    chat::{AgentKind, Chats, Config},
+    chat::{AgentKind, Chats},
     server::App,
     store::Store,
 };
@@ -39,6 +39,17 @@ async fn serve(
     args: Vec<String>,
     parent: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    if args.get(1).is_some_and(|a| a == "--check-config") {
+        if args.len() != 3 {
+            return Err("Usage: --check-config ISOLATED_CHAT_CONFIG_JSON".into());
+        }
+        let config = remodex_connect_native::launch_config::load(&PathBuf::from(&args[2]))?;
+        println!(
+            "{}",
+            serde_json::json!({"configurationValid":true,"configurationVersion":1,"nativeProfileHandoff":config.native_profile_handoff.is_some(),"runtimeStarted":false,"migrationComplete":false})
+        );
+        return Ok(0);
+    }
     if args.get(1).is_some_and(|a| a == "--native-handoff") {
         if args.len() == 6 && args[2] == "capture" {
             let result = remodex_connect_native::profile_handoff::capture_export(
@@ -67,7 +78,7 @@ async fn serve(
     if args.len() == 2 && args[1] == "--version" {
         println!(
             "{}",
-            serde_json::json!({"name":"remodex-connect-native","version":env!("CARGO_PKG_VERSION"),"runtime":"rust","migrationComplete":false})
+            serde_json::json!({"name":"remodex-connect-native","version":env!("CARGO_PKG_VERSION"),"runtime":"rust","configurationVersion":1,"migrationComplete":false})
         );
         return Ok(0);
     }
@@ -78,6 +89,12 @@ async fn serve(
     if !(4..=6).contains(&args.len()) {
         return Err("Usage: remodex-connect-native ABSOLUTE_ISOLATED_STATE_DIR BIND_ADDRESS PUBLIC_URL [ISOLATED_CHAT_CONFIG_JSON [GUI_DIST_DIRECTORY]]\nExperimental: native pairing and bounded chat orchestration; not a production replacement.".into());
     }
+    // Reject an incompatible upgrade before opening SQLite, claiming ownership,
+    // changing permissions, or clearing a previous pairing invitation.
+    let config = args
+        .get(4)
+        .map(|path| remodex_connect_native::launch_config::load(&PathBuf::from(path)))
+        .transpose()?;
     let directory = PathBuf::from(&args[1]);
     let _profile_lock = remodex_connect_native::profile_lock::acquire(&directory)?;
     InvitationFile::clear_previous(&directory)?;
@@ -105,8 +122,7 @@ async fn serve(
         app.restart = Some(restart.clone());
     }
     let stop_restart = restart.clone();
-    if let Some(path) = args.get(4) {
-        let config: Config = serde_json::from_slice(&std::fs::read(path)?)?;
+    if let Some(config) = config {
         app.chats = Some(Chats::start(app.auth.clone(), config).await?);
     }
     if let Some(path) = args.get(5) {

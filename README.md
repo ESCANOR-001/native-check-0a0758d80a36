@@ -17,3 +17,7 @@ Native profile handoff uses verified, quiesced exports and isolated working copi
 The connection retains its native generation across restarts. Data rollback refuses
 new or changed history. Shared owners and complete legacy cutover remain separate
 release gates; this does not change the experimental publication status above.
+
+`--check-config CONFIG_JSON` validates configuration without starting agents or
+opening connection state. It is a preflight check, not a migration or live-sync
+readiness assertion. Invalid startup configurations preserve existing invitations.

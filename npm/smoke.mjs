@@ -53,6 +53,12 @@ try {
   const chatConfig = join(root, 'agent.json');
   const agent = { executable: fixture, profile: agentProfile, model: 'test' };
   await writeFile(chatConfig, JSON.stringify({ workspace, codex: agent, claude: agent }));
+  const checked = JSON.parse(run(process.execPath, [launcher, '--check-config', chatConfig]));
+  assert.equal(checked.configurationValid, true);
+  assert.equal(checked.runtimeStarted, false);
+  assert.equal(checked.configurationVersion, 1);
+  assert.deepEqual(await readdir(agentProfile), []);
+  assert.deepEqual(await readdir(state), ['sentinel']);
   let identity, phone;
   for (let attempt = 0; attempt < 2; attempt++) {
     // Exercise both the replacement path and the older-Node forwarding path.
