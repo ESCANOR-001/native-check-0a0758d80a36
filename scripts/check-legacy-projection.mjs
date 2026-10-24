@@ -7,7 +7,7 @@ const bins = readdirSync(directory).filter(name => /^legacy_claude-[a-f0-9]+(?:\
 if (bins.length !== 1) throw new Error('Expected one built legacy Claude test executable');
 const binary = join(directory, bins[0]);
 const test = 'first_native_event_after_upgrade_advances_anchor_and_preserves_old_prompt_bubbles';
-for (let iteration = 1; iteration <= 20; iteration++) {
+for (let iteration = 1; iteration <= 500; iteration++) {
   await new Promise((resolve, reject) => {
     let text = '', timedOut = false;
     const child = spawn(binary, ['--exact', test, '--nocapture'], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -30,4 +30,4 @@ for (let iteration = 1; iteration <= 20; iteration++) {
     });
   });
 }
-console.log('20 bounded legacy projection/replay checks passed');
+console.log('500 bounded legacy projection/replay checks passed');

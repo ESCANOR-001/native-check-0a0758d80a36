@@ -47,14 +47,13 @@ Implemented here:
   systemd unit without starting it; start is separate. Foreign units, overrides,
   altered enablement links and active or incompletely stopped workers are refused.
   Uninstall removes only the verified unit/link and retains all chat data. Stop
-  the owned bridge through its existing dashboard before uninstalling. This does
-  retain a bounded, hash-verified private copy of the selected runtime: replacing
+  the owned bridge through its existing dashboard before uninstalling. Registration
+  retains a bounded, hash-verified private copy of the selected runtime: replacing
   or removing the npm package cannot silently replace the registered executable.
   Version-2 registrations bind that copy. Corrupt/missing copies block start;
   their exact stopped registration can still be removed without deleting data.
   Installation never overwrites an existing runtime copy or registration.
-  The operation does
-  not replace the ordinary bridge, enable system-wide services, or activate the
+  It does not replace the ordinary bridge, enable system-wide services, or activate the
   published npm entrypoint. Windows/macOS registration remains unqualified and is
   explicitly refused; source-only CI is not a physical Desktop integration test.
 - Owned-install preparation coordinator: `--legacy-upgrade prepare|check|rollback
