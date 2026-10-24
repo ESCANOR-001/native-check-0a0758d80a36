@@ -145,7 +145,7 @@ async fn status(unit: &str) -> Result<std::collections::BTreeMap<String, String>
     let output = systemctl(&[
         "show",
         unit,
-        "--property=LoadState,ActiveState,MainPID,FragmentPath,DropInPaths",
+        "--property=LoadState,ActiveState,MainPID,ControlPID,ControlGroup,TasksCurrent,FragmentPath,DropInPaths",
     ])
     .await?;
     let text = std::str::from_utf8(&output.stdout).map_err(|_| ERROR)?;
@@ -179,6 +179,9 @@ fn stopped(state: &std::collections::BTreeMap<String, String>) -> Result<(), Str
         .get("ActiveState")
         .is_some_and(|s| matches!(s.as_str(), "inactive" | "failed"))
         || state.get("MainPID").map(String::as_str) != Some("0")
+        || state.get("ControlPID").map(String::as_str) != Some("0")
+        || (state.get("ControlGroup").map(String::as_str) != Some("")
+            && state.get("TasksCurrent").map(String::as_str) != Some("0"))
     {
         return Err("Stop the selected bridge safely before changing its background registration; no running service was stopped".into());
     }
@@ -363,6 +366,8 @@ mod tests {
             ("FragmentPath".into(), file.to_str().unwrap().into()),
             ("DropInPaths".into(), "".into()),
             ("MainPID".into(), "1".into()),
+            ("ControlPID".into(), "0".into()),
+            ("ControlGroup".into(), "".into()),
             ("ActiveState".into(), "active".into()),
         ]);
         assert!(stopped(&state).is_err());
@@ -376,6 +381,14 @@ mod tests {
         assert!(stopped(&state).is_err());
         state.insert("MainPID".into(), "0".into());
         stopped(&state).unwrap();
+        state.insert("ControlGroup".into(), "/remaining-workers".into());
+        assert!(stopped(&state).is_err());
+        state.insert("TasksCurrent".into(), "1".into());
+        assert!(stopped(&state).is_err());
+        state.insert("TasksCurrent".into(), "0".into());
+        stopped(&state).unwrap();
+        state.insert("ControlPID".into(), "99".into());
+        assert!(stopped(&state).is_err());
         assert_eq!(fs::read(&file).unwrap(), b"exact");
     }
 }
