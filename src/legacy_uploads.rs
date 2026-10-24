@@ -234,9 +234,10 @@ pub(crate) fn verify(db: &rusqlite::Connection, directory: &Path, id: &str) -> R
     if manifest(&path.join("restored.json"))? != bundle {
         return Err(INVALID.into());
     }
-    for f in files {
-        checked(directory, &path.join("data").join(&f.relative), &f)?;
+    for f in &files {
+        checked(directory, &path.join("data").join(&f.relative), f)?;
     }
+    crate::legacy_upload_display::verify(db, directory, id, &bundle, &files)?;
     Ok(())
 }
 pub(crate) fn rollback(
@@ -313,7 +314,17 @@ impl Store {
             {
                 return Err(INVALID.into());
             }
-            verify(&self.db, &self.directory, id)?;
+            self.check_history(crate::legacy_upload_display::additional_bytes(
+                &self.db,
+                &self.directory,
+                id,
+                &bundle,
+                &files,
+            )?)?;
+            let tx = self.db.transaction().map_err(|_| INVALID)?;
+            crate::legacy_upload_display::prepare(&tx, &self.directory, id, &bundle, &files)?;
+            verify(&tx, &self.directory, id)?;
+            tx.commit().map_err(|_| INVALID)?;
             return Ok(
                 json!({"phase":"uploads-prepared","files":files.len(),"migrationComplete":false}),
             );
@@ -373,6 +384,7 @@ impl Store {
         self.check_history(
             (raw.len() as u64)
                 .saturating_add(crate::legacy_upload_native::storage_bytes(&evidence))
+                .saturating_add(files.len() as u64 * 6144)
                 .saturating_add(8192),
         )?;
         self.db.execute_batch("CREATE TABLE IF NOT EXISTS legacy_uploads(chat TEXT PRIMARY KEY,source_hash TEXT NOT NULL,original_root TEXT NOT NULL,bundle TEXT NOT NULL,plan BLOB NOT NULL,phase TEXT NOT NULL);").map_err(|_|INVALID)?;
@@ -389,6 +401,7 @@ impl Store {
             ],
         )
         .map_err(|_| INVALID)?;
+        crate::legacy_upload_display::prepare(&tx, &self.directory, id, &bundle, &files)?;
         verify(&tx, &self.directory, id)?;
         tx.commit().map_err(|_| INVALID)?;
         Ok(json!({"phase":"uploads-prepared","files":files.len(),"migrationComplete":false}))

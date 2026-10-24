@@ -21,3 +21,5 @@ release gates; this does not change the experimental publication status above.
 `--check-config CONFIG_JSON` validates configuration without starting agents or
 opening connection state. It is a preflight check, not a migration or live-sync
 readiness assertion. Invalid startup configurations preserve existing invitations.
+
+Attachment presentation qualification: offline preparation derives bounded filename/type descriptors only from verified native evidence. Outgoing history pages count descriptors in their byte budget; source messages and file bytes are unchanged. Legacy production activation remains blocked.

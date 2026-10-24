@@ -216,6 +216,196 @@ fn both_agents_keep_exact_history_and_private_file_bytes_across_retry_restart_an
             .exists());
     }
 }
+
+#[test]
+fn projected_attachments_count_toward_page_bytes_without_skipping_the_prompt() {
+    let mut f = Fixture::native(|_| {});
+    f.prepare().unwrap();
+    let before = f.rows();
+    let old_bytes: i64 =
+        f.db.query_row(
+            "SELECT sum(length(data)) FROM chat_rows WHERE chat=?1",
+            [CHAT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut tail = json!({"id":"later-reply","role":"assistant","text":"","turnId":"later-turn"});
+    // The original rows fit, but the verified attachment descriptors require
+    // a second page. This tests the byte boundary rather than the row count.
+    let padding = remodex_connect_native::chat_store::PAGE_BYTES
+        - old_bytes as usize
+        - tail.to_string().len()
+        - 1;
+    tail["text"] = json!("x".repeat(padding));
+    f.db.execute(
+        "INSERT INTO chat_rows(chat,kind,id,turn,data) VALUES(?1,'messages','later-reply','later-turn',?2)",
+        rusqlite::params![CHAT,tail.to_string()],
+    ).unwrap();
+    let raw = f.store.history_page(CHAT, None, None).unwrap();
+    assert_eq!(raw["messages"].as_array().unwrap().len(), 3);
+    assert_eq!(raw["pageInfo"]["hasOlder"], false);
+    let first = f.store.history_page_display(CHAT, None, None).unwrap();
+    assert_eq!(first["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(first["pageInfo"]["hasOlder"], true);
+    let cursor = first["pageInfo"]["olderCursor"]
+        .as_str()
+        .unwrap()
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let second = f
+        .store
+        .history_page_display(CHAT, Some(cursor), None)
+        .unwrap();
+    assert_eq!(second["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(second["messages"][0]["role"], "user");
+    assert_eq!(
+        second["messages"][0]["attachments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(second["pageInfo"]["hasOlder"], false);
+    let old = f.rows();
+    assert_eq!(&old[..before.len()], before.as_slice());
+}
+
+#[test]
+fn native_only_attachments_render_without_reading_bytes_or_rewriting_history() {
+    let mut f = Fixture::native(|_| {});
+    let before = f.rows();
+    f.prepare().unwrap();
+    let paths = [f.path(0), f.path(1)];
+    // Files may be unavailable until a tap. Reading a message page must not
+    // load either file, scan native history, or depend on the original PC path.
+    for p in &paths {
+        fs::remove_file(p).unwrap();
+    }
+    let page = f.store.history_page_display(CHAT, None, None).unwrap();
+    let mut message = page["messages"][0].clone();
+    assert_eq!(message["text"], "Inspect these attachments.");
+    let attachments = message["attachments"].as_array().unwrap();
+    assert_eq!(attachments.len(), 2);
+    assert_eq!(attachments[0]["type"], "file");
+    assert_eq!(attachments[1]["type"], "image");
+    assert_eq!(attachments[1]["mimeType"], "image/png");
+    for (i, a) in attachments.iter().enumerate() {
+        assert_eq!(a["path"], f.old.join(&f.files[i].0).to_str().unwrap());
+        assert_eq!(a["sizeBytes"], f.files[i].1.len());
+        assert!(a.get("dataUrl").is_none());
+        assert!(a.get("base64").is_none());
+    }
+    f.store.present_legacy_uploads(CHAT, &mut message).unwrap();
+    assert_eq!(message["attachments"].as_array().unwrap().len(), 2);
+    assert_eq!(f.rows(), before);
+    assert!(f.store.load_chat(CHAT).unwrap()["thread"]["messages"][0]["attachments"].is_null());
+    assert_eq!(
+        f.store.load_chat_display(CHAT, &[]).unwrap()["thread"]["messages"][0]["attachments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(f
+        .store
+        .resolve_legacy_upload(CHAT, f.old.join(&f.files[0].0).to_str().unwrap())
+        .is_err());
+    for (i, p) in paths.iter().enumerate() {
+        fs::write(p, &f.files[i].1).unwrap();
+    }
+    assert!(f.prepare().is_ok());
+    let reopened = Store::open(f.dir.path()).unwrap();
+    assert_eq!(
+        reopened.history_page_display(CHAT, None, None).unwrap(),
+        page
+    );
+    assert!(reopened.assert_migration_ready().is_err());
+    drop(reopened);
+    f.rollback().unwrap();
+    let mut original = message.clone();
+    original.as_object_mut().unwrap().remove("attachments");
+    f.store.present_legacy_uploads(CHAT, &mut original).unwrap();
+    assert!(original["attachments"].is_null());
+}
+
+#[test]
+fn omitted_attachment_projection_is_scoped_to_the_original_message_and_chat() {
+    let mut f = Fixture::native(|_| {});
+    f.prepare().unwrap();
+    let page = f.store.history_page(CHAT, None, None).unwrap();
+    let original = page["messages"][0].clone();
+    let mut other = original.clone();
+    f.store
+        .present_legacy_uploads("different-chat", &mut other)
+        .unwrap();
+    assert_eq!(other, original);
+    let mut changed = original.clone();
+    changed["text"] = json!("Different prompt");
+    assert!(f.store.present_legacy_uploads(CHAT, &mut changed).is_err());
+    assert!(changed["attachments"].is_null());
+    f.db.execute("UPDATE chat_rows SET data=json_set(data,'$.text','Changed stored prompt') WHERE kind='messages' AND json_extract(data,'$.role')='user'",[]).unwrap();
+    let mut changed = original;
+    assert!(f.store.present_legacy_uploads(CHAT, &mut changed).is_err());
+    assert!(changed["attachments"].is_null());
+}
+
+#[test]
+fn already_visible_links_and_image_attachments_are_not_duplicated_by_display() {
+    for agent in ["claude", "codex"] {
+        let mut f = Fixture::new(agent);
+        let raw = f.store.history_page(CHAT, None, None).unwrap();
+        f.prepare().unwrap();
+        assert_eq!(f.store.history_page_display(CHAT, None, None).unwrap(), raw);
+        assert_eq!(
+            f.store.load_chat_display(CHAT, &[]).unwrap()["thread"]["messages"],
+            raw["messages"]
+        );
+    }
+}
+
+#[test]
+fn old_prepared_uploads_add_presentation_only_after_storage_capacity_check() {
+    let mut f = Fixture::native(|_| {});
+    f.prepare().unwrap();
+    let before = f.rows();
+    f.db.execute_batch("DROP TABLE legacy_upload_display; DROP TABLE legacy_upload_display_import; CREATE TABLE retained_data(bytes BLOB); INSERT INTO retained_data VALUES(zeroblob(1048576));").unwrap();
+    f.store
+        .configure_storage(remodex_connect_native::storage::Limits {
+            history_bytes: 1048576,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(f.prepare().unwrap_err().contains("storage limit"));
+    assert_eq!(f.rows(), before);
+    f.store.configure_storage(Default::default()).unwrap();
+    f.prepare().unwrap();
+    assert_eq!(
+        f.store.history_page_display(CHAT, None, None).unwrap()["messages"][0]["attachments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(f.rows(), before);
+}
+
+#[test]
+fn changed_or_oversized_presentation_receipts_never_replace_a_message() {
+    for raw in ["[{}]".to_owned(), "x".repeat(49153)] {
+        let mut f = Fixture::native(|_| {});
+        f.prepare().unwrap();
+        let before = f.rows();
+        f.db.execute("UPDATE legacy_upload_display SET descriptors=?1", [raw])
+            .unwrap();
+        assert!(f.store.history_page_display(CHAT, None, None).is_err());
+        assert_eq!(f.rows(), before);
+        assert!(f.prepare().is_err());
+        assert_eq!(f.rows(), before);
+    }
+}
 #[test]
 fn original_text_links_and_image_previews_use_verified_copies_without_exposing_copy_paths() {
     for agent in ["claude", "codex"] {

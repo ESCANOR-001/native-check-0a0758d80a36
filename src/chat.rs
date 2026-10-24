@@ -2532,7 +2532,7 @@ impl Hub {
                 };
                 let mut page = self
                     .db
-                    .call(move |a| a.store.history_page(&id, before, turn.as_deref()))
+                    .call(move |a| a.store.history_page_display(&id, before, turn.as_deref()))
                     .await?
                     .map_err(|_| "History unavailable")?;
                 if method == "orchestration.getTurnWork" {

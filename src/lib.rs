@@ -36,6 +36,7 @@ mod legacy_codex_headers;
 mod legacy_codex_history;
 pub mod legacy_connection;
 mod legacy_preferences;
+mod legacy_upload_display;
 mod legacy_upload_native;
 mod legacy_uploads;
 mod migration_assets;

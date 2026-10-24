@@ -67,12 +67,15 @@ impl Store {
             .collect()
     }
     pub fn load_chat(&self, id: &str) -> rusqlite::Result<Value> {
+        self.load_chat_page(id, false)
+    }
+    fn load_chat_page(&self, id: &str, display: bool) -> rusqlite::Result<Value> {
         let mut state = parse(self.db.query_row(
             "SELECT data FROM chats WHERE id=?1",
             [id],
             |r| r.get(0),
         )?)?;
-        let page = self.history_page(id, None, None)?;
+        let page = self.history_page_inner(id, None, None, display)?;
         state["thread"]["messages"] = page["messages"].clone();
         state["thread"]["activities"] = page["activities"].clone();
         state["thread"]["proposedPlans"] = page["proposedPlans"].clone();
@@ -85,6 +88,23 @@ impl Store {
         before: Option<i64>,
         turn: Option<&str>,
     ) -> rusqlite::Result<Value> {
+        self.history_page_inner(id, before, turn, false)
+    }
+    pub fn history_page_display(
+        &self,
+        id: &str,
+        before: Option<i64>,
+        turn: Option<&str>,
+    ) -> rusqlite::Result<Value> {
+        self.history_page_inner(id, before, turn, true)
+    }
+    fn history_page_inner(
+        &self,
+        id: &str,
+        before: Option<i64>,
+        turn: Option<&str>,
+        display: bool,
+    ) -> rusqlite::Result<Value> {
         let mut stmt = self.db.prepare("SELECT seq,kind,data FROM chat_rows WHERE chat=?1 AND seq<?2 AND (?3 IS NULL OR turn=?3) ORDER BY seq DESC LIMIT 25")?;
         let mut rows = stmt.query(params![id, before.unwrap_or(i64::MAX), turn])?;
         let mut selected = Vec::new();
@@ -92,18 +112,22 @@ impl Store {
         let mut older = false;
         while let Some(row) = rows.next()? {
             let text: String = row.get(2)?;
+            let mut row_bytes = text.len();
+            let kind: String = row.get(1)?;
+            let mut value = parse(text)?;
+            if display && kind == "messages" {
+                self.present_legacy_uploads(id, &mut value)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                row_bytes = value.to_string().len();
+            }
             if !selected.is_empty()
-                && (bytes + text.len() > PAGE_BYTES || selected.len() >= PAGE_ROWS)
+                && (bytes + row_bytes > PAGE_BYTES || selected.len() >= PAGE_ROWS)
             {
                 older = true;
                 break;
             }
-            bytes += text.len();
-            selected.push((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                parse(text)?,
-            ));
+            bytes += row_bytes;
+            selected.push((row.get::<_, i64>(0)?, kind, value));
         }
         let cursor = if older {
             selected.last().map(|r| format!("v1:{id}:{}", r.0))
@@ -132,7 +156,7 @@ impl Store {
         if pending.len() > 16 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let mut state = self.load_chat(id)?;
+        let mut state = self.load_chat_page(id, true)?;
         let claude = state["agent"] == "claude";
         let rows = state["thread"]["activities"].as_array_mut().unwrap();
         let mut query = self.db.prepare(
