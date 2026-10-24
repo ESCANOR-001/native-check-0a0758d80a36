@@ -301,10 +301,10 @@ async fn supervised_failed_startup_exits_without_retry_loop_or_invitation() {
     std::fs::write(&f.config, "{}").unwrap();
     let mut child = f.launch("--supervise");
     exit(&mut child, false).await;
-    assert!(!std::fs::read_dir(&f.state)
-        .unwrap()
-        .filter_map(Result::ok)
-        .any(|e| e.file_name().to_string_lossy().starts_with("pairing-")));
+    assert!(
+        !f.state.exists(),
+        "invalid configuration must not create state or pairing invitations"
+    );
     let _lock = remodex_connect_native::profile_lock::acquire(&f.state).unwrap();
 }
 
