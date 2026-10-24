@@ -31,6 +31,8 @@ struct Chat {
     history: String,
     transcript: String,
     sha256: String,
+    uploads: Option<crate::legacy_export_assets::Uploads>,
+    images: Option<crate::legacy_export_assets::Images>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +40,7 @@ struct Receipt {
     version: u32,
     environment: String,
     profiles: Profiles,
+    source_hold: Option<PathBuf>,
     chats: Vec<Chat>,
     connection: String,
     codex_projects: String,
@@ -104,20 +107,6 @@ fn fingerprint(path: &Path) -> Result<String, String> {
     }
     Ok(format!("{:x}", digest.finalize()))
 }
-fn assets_present(v: &Value) -> bool {
-    match v {
-        Value::Object(map) => map.iter().any(|(k, v)| {
-            matches!(k.as_str(), "attachments" | "toolImages")
-                && v.as_array().is_some_and(|a| !a.is_empty())
-                || assets_present(v)
-        }),
-        Value::Array(items) => items.iter().any(assets_present),
-        Value::String(s) => {
-            s.contains("android-remote-files/") || s.contains("android-remote-files\\")
-        }
-        _ => false,
-    }
-}
 /// Fresh export roots only. Failed/partial roots are retained, never overwritten.
 /// Once prepared, the existing coordinator handles same-input retries/rollback.
 pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value, String> {
@@ -157,6 +146,11 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
             return Err(ERROR.into());
         }
     }
+    let hold = receipt
+        .source_hold
+        .as_ref()
+        .map(|path| crate::source_hold::bind(path, &original, &receipt.environment))
+        .transpose()?;
     let mut ids = BTreeSet::new();
     let mut files = BTreeSet::new();
     for chat in &receipt.chats {
@@ -180,9 +174,13 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
         {
             return Err(ERROR.into());
         }
-        if assets_present(&v) {
-            return Err("This export contains attachments or tool images. Keep the source installation; asset inventory is required before automatic cutover".into());
-        }
+        crate::legacy_export_assets::validate(
+            &v,
+            &chat.agent,
+            &original,
+            chat.uploads.as_ref(),
+            chat.images.as_ref(),
+        )?;
     }
     private_directory::prepare(&root).map_err(|_| ERROR)?;
     migration_snapshot::capture(&original, &root.join("owner-export"), &receipt.environment)
@@ -248,11 +246,27 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
         let name = format!("{}-{index}.json", chat.agent);
         let bytes = read(&child(&public, &chat.history)?, 16 * 1024 * 1024)?;
         let v: Value = serde_json::from_slice(&bytes).map_err(|_| ERROR)?;
+        crate::legacy_export_assets::validate(
+            &v,
+            &chat.agent,
+            &public,
+            chat.uploads.as_ref(),
+            chat.images.as_ref(),
+        )?;
         write(&source.join(&name), &bytes)?;
         let mut entry = json!({"id":chat.id,"history":name,"native":{"snapshot":format!("{}-native",chat.agent),"transcript":chat.transcript}});
         if chat.agent == "claude" {
             entry["resume"] = json!(v["bridgeId"].as_str().is_some_and(|s| !s.is_empty()));
         }
+        crate::legacy_export_assets::prepare(
+            &public,
+            &source,
+            index,
+            &receipt.environment,
+            chat.uploads.as_ref(),
+            chat.images.as_ref(),
+            &mut entry,
+        )?;
         stage[&chat.agent].as_array_mut().ok_or(ERROR)?.push(entry);
     }
     json_file(&source.join("stage.json"), &stage)?;
@@ -274,7 +288,10 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
         &json!({"version":1,"environment":receipt.environment,"export_snapshot":root.join("snapshot"),"native_plan":root.join("native-plan.json"),"configuration":root.join("configuration.json")}),
     )?;
     legacy_upgrade::run("prepare", &generation, &plan)?;
-    let report = json!({"phase":"prepared","chats":receipt.chats.len(),"generation":generation,"plan":plan,"sourceStoppedByExporter":false,"migrationComplete":false});
+    if let Some(binding) = &hold {
+        crate::source_hold::check(binding)?;
+    }
+    let report = json!({"source_hold":hold,"phase":"prepared","chats":receipt.chats.len(),"generation":generation,"plan":plan,"sourceStoppedByExporter":false,"migrationComplete":false});
     json_file(&root.join("prepared.json"), &report)?;
     Ok(report)
 }

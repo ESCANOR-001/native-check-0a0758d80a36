@@ -38,6 +38,7 @@ mod legacy_codex_history;
 mod legacy_codex_native;
 pub mod legacy_connection;
 pub mod legacy_export;
+mod legacy_export_assets;
 mod legacy_preferences;
 pub mod legacy_rollback;
 pub mod legacy_stage;
@@ -110,3 +111,5 @@ pub mod storage_cleanup;
 
 #[cfg(test)]
 mod storage_native_schema_tests;
+
+mod source_hold;

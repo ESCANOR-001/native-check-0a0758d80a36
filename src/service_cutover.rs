@@ -33,7 +33,7 @@ fn bytes(path: &Path) -> Result<Vec<u8>, String> {
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-fn inputs(raw: &[u8]) -> Result<(Plan, Vec<OsString>, String), String> {
+fn inputs(raw: &[u8]) -> Result<(Plan, Vec<OsString>, String, Value), String> {
     let mut plan: Plan = serde_json::from_slice(raw).map_err(|_| ERROR)?;
     let address: std::net::SocketAddr = plan.bind.parse().map_err(|_| ERROR)?;
     let url = reqwest::Url::parse(&plan.public_url).map_err(|_| ERROR)?;
@@ -62,6 +62,8 @@ fn inputs(raw: &[u8]) -> Result<(Plan, Vec<OsString>, String), String> {
     {
         return Err(ERROR.into());
     }
+    let hold = prepared["source_hold"].clone();
+    crate::source_hold::check(&hold)?;
     let config_path = generation.join("configuration.json");
     let config = bytes(&config_path)?;
     let parsed: crate::chat::Config = serde_json::from_slice(&config).map_err(|_| ERROR)?;
@@ -76,7 +78,7 @@ fn inputs(raw: &[u8]) -> Result<(Plan, Vec<OsString>, String), String> {
         config_path.into_os_string(),
         plan.gui.clone().into_os_string(),
     ];
-    Ok((plan, arguments, hash(&config)))
+    Ok((plan, arguments, hash(&config), hold))
 }
 impl Selection {
     fn open(directory: &Path, create: bool) -> Result<Self, String> {
@@ -139,12 +141,14 @@ impl Selection {
 }
 pub fn select(directory: &Path, plan_file: &Path) -> Result<Value, String> {
     let raw = bytes(plan_file)?;
-    let (plan, _, digest) = inputs(&raw)?;
+    let (plan, _, digest, hold) = inputs(&raw)?;
     let selection = Selection::open(directory, true)?;
+    let _source_lease = crate::source_hold::lease(&hold)?;
     if let Some((old, config, phase)) = selection.saved()? {
         if old != raw || config != digest || phase == "cancelled" {
             return Err(ERROR.into());
         }
+        crate::source_hold::claim(&hold, directory)?;
         return Ok(
             json!({"phase":phase,"sourceServiceTouched":false,"legacyFallbackAllowed":phase=="selected","migrationComplete":false}),
         );
@@ -154,6 +158,7 @@ pub fn select(directory: &Path, plan_file: &Path) -> Result<Value, String> {
         &plan.export_root.join("generation"),
         &plan.export_root.join("upgrade-plan.json"),
     )?;
+    crate::source_hold::claim(&hold, directory)?;
     selection
         .db
         .execute(
@@ -171,7 +176,9 @@ pub fn cancel(directory: &Path) -> Result<Value, String> {
     if phase == "started" {
         return Err("The native service may have written new work. Keep current data and use a compatible native executable; automatic legacy fallback is disabled".into());
     }
-    let (plan, _, current) = inputs(&raw)?;
+    let (plan, _, current, hold) = inputs(&raw)?;
+    let _source_lease = crate::source_hold::lease(&hold)?;
+    crate::source_hold::claim(&hold, directory)?;
     if digest != current {
         return Err(ERROR.into());
     }
@@ -185,6 +192,7 @@ pub fn cancel(directory: &Path) -> Result<Value, String> {
         .db
         .execute("UPDATE selection SET phase='cancelled' WHERE id=1", [])
         .map_err(|_| ERROR)?;
+    crate::source_hold::release(&hold, directory)?;
     Ok(json!({"phase":"cancelled","sourceServiceTouched":false,"migrationComplete":false}))
 }
 pub async fn run(
@@ -196,7 +204,9 @@ pub async fn run(
     if !matches!(phase.as_str(), "selected" | "started") {
         return Err(ERROR.into());
     }
-    let (_, arguments, actual) = inputs(&raw)?;
+    let (_, arguments, actual, hold) = inputs(&raw)?;
+    let _source_lease = crate::source_hold::lease(&hold)?;
+    crate::source_hold::claim(&hold, directory)?;
     if expected != actual {
         return Err(ERROR.into());
     }

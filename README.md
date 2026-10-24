@@ -48,3 +48,7 @@ Coordinated offline rollback checks or applies all imported chats, settings and 
   only before any native startup. This is a launcher boundary, **not** OS service
   registration or replacement of the published npm entrypoint. It never stops
   or adopts another service. Desktop-owned profiles remain outside this path.
+
+
+### Owned export assets and startup handoff
+The isolated exporter now retains inventoried uploads and tool images. A durable source hold blocks old gateway startup; one source can select only one native service. Cancellation before startup releases that hold. After startup, fallback retains the current native data. Actual OS service registration and production activation remain unqualified.

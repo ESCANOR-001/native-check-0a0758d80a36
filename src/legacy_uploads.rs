@@ -108,6 +108,37 @@ fn source(db: &rusqlite::Connection, id: &str) -> Result<(String, Value), String
         },
     ))
 }
+pub(crate) fn redact_reference(text: &str, original: &str, user: bool) -> String {
+    let text = text
+        .replace(&format!("](<{original}>)"), "](retained)")
+        .replace(&format!("]({original})"), "](retained)");
+    if !user {
+        return text;
+    }
+    let marker = "\n\nFiles uploaded from Android and staged on this PC:\n";
+    let suffix = text.rfind(marker).map(|i| i + marker.len());
+    let file_section = suffix.filter(|i| {
+        text[*i..].split('\n').all(|line| {
+            line.starts_with("- ") || (line.starts_with("[Image: ") && line.ends_with(']'))
+        })
+    });
+    let mut offset = 0;
+    text.split('\n')
+        .map(|line| {
+            let covered = line == format!("[Image: {original}]")
+                || (file_section.is_some_and(|i| offset >= i) && line == format!("- {original}"));
+            offset += line.len() + 1;
+            if covered && line.starts_with("[Image: ") {
+                "[Image: retained]"
+            } else if covered {
+                "- retained"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 pub(crate) fn referenced(message: &Value, original: &str) -> bool {
     message["attachments"]
         .as_array()
@@ -115,7 +146,7 @@ pub(crate) fn referenced(message: &Value, original: &str) -> bool {
         || message["text"].as_str().is_some_and(|text| {
             // Match complete Markdown destinations, never substrings or bare
             // prose paths. The export is also restricted to the old upload root.
-            text.contains(&format!("](<{original}>)")) || text.contains(&format!("]({original})"))
+            redact_reference(text, original, message["role"] == "user") != text
         })
 }
 fn plan(raw: &[u8], root: &Path, thread: &Value) -> Result<Vec<File>, String> {
@@ -564,5 +595,32 @@ impl Store {
             .join(&f.relative);
         checked(&self.directory, &path, f)?;
         Ok(Some(path))
+    }
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+    #[test]
+    fn complete_staged_sections_and_image_rows_only() {
+        let a = "/private/android-remote-files/phone/id/one.txt";
+        let b = "/private/android-remote-files/phone/id/two.txt";
+        let text = format!("Inspect\n\nFiles uploaded from Android and staged on this PC:\n- {a}\n- {b}\n[Image: {a}]");
+        let message = json!({"role":"user","text":text});
+        assert!(referenced(&message, a));
+        assert!(referenced(&message, b));
+        let redacted = redact_reference(&redact_reference(&text, a, true), b, true);
+        assert!(!redacted.contains("android-remote-files"));
+        for invalid in [
+            a.to_owned(),
+            format!("- {a}"),
+            format!("prefix [Image: {a}]"),
+            format!(
+                "Inspect\n\nFiles uploaded from Android and staged on this PC:\n- {a}\nmore prose"
+            ),
+        ] {
+            assert!(!referenced(&json!({"role":"user","text":invalid}), a));
+        }
+        assert!(!referenced(&json!({"role":"assistant","text":text}), b));
     }
 }
