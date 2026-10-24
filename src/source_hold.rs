@@ -137,6 +137,31 @@ fn exists(path: &Path) -> Result<bool, String> {
         Err(_) => Err(ERROR.into()),
     }
 }
+/// Recovery of an unpublished stopped export cannot release a selected service.
+/// The caller holds the source lease and has durably recorded cancellation.
+pub(crate) fn release_unselected(
+    binding: &Value,
+    export: &Path,
+    environment: &str,
+) -> Result<(), String> {
+    let path = Path::new(binding["path"].as_str().ok_or(ERROR)?);
+    let root = path.parent().ok_or(ERROR)?;
+    if exists(&root.join("native-upgrade-selected-service.json"))? {
+        return Err(ERROR.into());
+    }
+    if exists(path)? {
+        if bind(path, export, environment)? != *binding {
+            return Err(ERROR.into());
+        }
+        fs::remove_file(path).map_err(|_| ERROR)?;
+    }
+    #[cfg(unix)]
+    storage_stage::open(root, true)
+        .map_err(|_| ERROR)?
+        .sync_all()
+        .map_err(|_| ERROR)?;
+    Ok(())
+}
 pub(crate) fn check_release(binding: &Value, service: &Path) -> Result<(), String> {
     let path = Path::new(binding["path"].as_str().ok_or(ERROR)?);
     if exists(path)? {

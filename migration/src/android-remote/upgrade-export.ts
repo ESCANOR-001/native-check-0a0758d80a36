@@ -6,7 +6,7 @@ import { mkdir, open, realpath, type FileHandle } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { exportChatAssets, type AssetProof } from './upgrade-export-assets';
 import { verifyShutdownBookkeeping } from './upgrade-shutdown-proof';
-import { holdUpgradeSource, releaseUnpublishedStoppedExport } from './upgrade-source-hold';
+import { holdUpgradeSource, recordStoppedUpgradeOwner, releaseUnpublishedStoppedExport } from './upgrade-source-hold';
 
 export const UPGRADE_BUSY = 'Upgrade is waiting for settled chats and exclusive ownership. Finish pending work and retry; no chat was moved.';
 export class UpgradeAdmission {
@@ -173,6 +173,7 @@ export async function exportOwnedUpgrade(
     owner.assertSettled();
     await owner.stop();
     stopped = true;
+    if (hold) await recordStoppedUpgradeOwner(hold, owner.environment);
     for (const chat of chats) {
       const agent = chat.agent as 'codex' | 'claude';
       const proof = await transcriptFingerprint(profiles[agent], resolve(profiles[agent], chat.transcript));

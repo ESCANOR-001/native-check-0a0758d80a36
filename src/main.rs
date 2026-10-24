@@ -93,9 +93,16 @@ async fn serve(
     parent: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     if args.get(1).is_some_and(|a| a == "--legacy-export") {
+        if args.len() == 4 && args[2] == "recover-source" {
+            println!(
+                "{}",
+                remodex_connect_native::export_recovery::run(&PathBuf::from(&args[3]))?
+            );
+            return Ok(0);
+        }
         if args.len() != 5 {
             return Err(
-                "Usage: --legacy-export ABSOLUTE_NEW_ROOT CLOSED_OWNER_JSON CONFIG_JSON".into(),
+                "Usage: --legacy-export ABSOLUTE_NEW_ROOT CLOSED_OWNER_JSON CONFIG_JSON | recover-source STOPPED_OWNER_JSON".into(),
             );
         }
         let report = remodex_connect_native::legacy_export::run(

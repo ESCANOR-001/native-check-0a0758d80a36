@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { exportOwnedUpgrade } from '../src/android-remote/upgrade-export';
@@ -29,6 +29,12 @@ for (const mode of ['validation-failed', 'stop-uncertain', 'newer-hold', 'select
         },
       })).rejects.toThrow();
       expect(stopped).toBe(mode !== 'stop-uncertain');
+      if (stopped) {
+        const proof = JSON.parse(await readFile(join(output, 'stopped-owner.json'), 'utf8'));
+        expect(proof).toMatchObject({ version: 1, phase: 'workers-stopped', pid: process.pid, environment: 'test', export: await realpath(output) });
+        expect(proof.source_hold.path).toBe(join(await realpath(source), SOURCE_HOLD));
+        expect(proof.source_hold.sha256).toMatch(/^[a-f0-9]{64}$/);
+      } else await expect(readFile(join(output, 'stopped-owner.json'))).rejects.toThrow();
       // The closed controller cannot resume admitting requests. Its fresh
       // lifecycle replacement may restart only the definitely stopped case.
       expect(released).toBe(false);

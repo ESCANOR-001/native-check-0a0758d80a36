@@ -50,6 +50,17 @@ jobs:
       - name: Execute protocol and lifecycle tests
         timeout-minutes: 15
         run: cargo +1.98.0 test --locked --all-targets --no-fail-fast -- --test-threads=1 --show-output
+      - name: Recheck intermittent legacy projection shutdown
+        timeout-minutes: 3
+        run: node scripts/check-legacy-projection.mjs
+      - name: Keep bounded hang diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: projection-diagnostic-${{ runner.os }}-${{ github.sha }}
+          path: legacy-hang-*
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Qualify pinned tunnel helper installation and reuse
         timeout-minutes: 12
         run: cargo +1.98.0 test --locked --lib cloudflared::tests::pinned_platform_helper_installs_and_reuses_verified_cache -- --exact --ignored

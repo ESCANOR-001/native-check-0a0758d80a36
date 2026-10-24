@@ -113,4 +113,5 @@ pub mod storage_cleanup;
 #[cfg(test)]
 mod storage_native_schema_tests;
 
+pub mod export_recovery;
 mod source_hold;

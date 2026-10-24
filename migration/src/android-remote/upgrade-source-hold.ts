@@ -2,6 +2,7 @@
  * Its presence blocks the old owner, including after a process restart. Never
  * remove it automatically after a partially successful native activation. */
 import { constants, lstatSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { lstat, open, realpath, unlink } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 
@@ -32,6 +33,21 @@ export async function holdUpgradeSource(root: string, exportDirectory: string, e
     try { await directory.sync(); } finally { await directory.close(); }
   }
   return { path, contents, directory: canonical, exportDirectory };
+}
+
+/** Persist only AFTER the lifecycle owner confirms every owned worker exited.
+ * A later local recovery also requires this exporter process to have exited;
+ * PID absence alone is never evidence that its workers stopped safely. */
+export async function recordStoppedUpgradeOwner(hold: Awaited<ReturnType<typeof holdUpgradeSource>>, environment: string) {
+  const path = join(hold.exportDirectory, 'stopped-owner.json');
+  const contents = JSON.stringify({ version: 1, phase: 'workers-stopped', pid: process.pid, environment,
+    export: hold.exportDirectory, source_hold: { path: hold.path, sha256: createHash('sha256').update(hold.contents).digest('hex') } });
+  const file = await open(path, 'wx', 0o600);
+  try { await file.writeFile(contents); await file.sync(); } finally { await file.close(); }
+  if (process.platform !== 'win32') {
+    const directory = await open(hold.exportDirectory, 'r');
+    try { await directory.sync(); } finally { await directory.close(); }
+  }
 }
 
 /** Only the living lifecycle owner may call this, after its own stop resolves
