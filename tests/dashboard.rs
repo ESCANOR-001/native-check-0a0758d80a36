@@ -703,6 +703,7 @@ async fn agents_dashboard_uses_real_profile_status_and_isolated_preferences() {
     claude.remote_control = true;
     let config = Config {
         storage: Default::default(),
+        native_profile_handoff: None,
         max_active_chats: 1,
         workspace: f._root.path().into(),
         codex: agent,
@@ -1933,6 +1934,7 @@ async fn storage_fixture() -> (Fixture, remodex_connect_native::chat::Chats) {
     };
     let config = Config {
         storage: Default::default(),
+        native_profile_handoff: None,
         max_active_chats: 1,
         workspace: f._root.path().into(),
         codex: agent.clone(),

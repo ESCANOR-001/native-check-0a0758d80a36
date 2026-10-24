@@ -48,9 +48,14 @@ pub(crate) struct ClaudeSetup {
     files: Arc<tokio::sync::Semaphore>,
     probes: Arc<tokio::sync::Semaphore>,
     account: Arc<Mutex<Option<(Instant, PathBuf, Value)>>>,
+    handoff: Option<Arc<crate::profile_handoff::Session>>,
 }
 impl ClaudeSetup {
-    pub fn new(mut config: AgentConfig, cwd: PathBuf) -> Result<Self, String> {
+    pub fn new(
+        mut config: AgentConfig,
+        cwd: PathBuf,
+        handoff: Option<Arc<crate::profile_handoff::Session>>,
+    ) -> Result<Self, String> {
         config.profile = config
             .profile
             .canonicalize()
@@ -61,6 +66,7 @@ impl ClaudeSetup {
             files: Arc::new(tokio::sync::Semaphore::new(1)),
             probes: Arc::new(tokio::sync::Semaphore::new(1)),
             account: Arc::default(),
+            handoff,
         })
     }
     pub async fn preference(&self, enabled: Option<bool>) -> Result<Value, String> {
@@ -70,7 +76,9 @@ impl ClaudeSetup {
             .try_acquire_owned()
             .map_err(|_| "Claude settings are busy; retry shortly")?;
         let profile = self.config.profile.clone();
+        let handoff = self.handoff.clone();
         tokio::task::spawn_blocking(move || {
+            let _handoff = handoff;
             let _permit = permit;
             if let Some(enabled) = enabled {
                 save_preference(&profile, enabled)?;

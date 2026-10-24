@@ -39,6 +39,31 @@ async fn serve(
     args: Vec<String>,
     parent: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    if args.get(1).is_some_and(|a| a == "--native-handoff") {
+        if args.len() == 6 && args[2] == "capture" {
+            let result = remodex_connect_native::profile_handoff::capture_export(
+                &PathBuf::from(&args[3]),
+                &PathBuf::from(&args[4]),
+                &args[5],
+            )?;
+            println!("{result}");
+            return Ok(0);
+        }
+        if args.len() != 5 {
+            return Err("Usage: --native-handoff prepare ABSOLUTE_GENERATION_DIR PLAN_JSON | --native-handoff rollback ABSOLUTE_GENERATION_DIR ENVIRONMENT_ID".into());
+        }
+        let root = PathBuf::from(&args[3]);
+        let result = match args[2].as_str() {
+            "prepare" => remodex_connect_native::profile_handoff::prepare_file(
+                &root,
+                &PathBuf::from(&args[4]),
+            )?,
+            "rollback" => remodex_connect_native::profile_handoff::rollback(&root, &args[4])?,
+            _ => return Err("Unknown native handoff operation".into()),
+        };
+        println!("{result}");
+        return Ok(0);
+    }
     if args.len() == 2 && args[1] == "--version" {
         println!(
             "{}",

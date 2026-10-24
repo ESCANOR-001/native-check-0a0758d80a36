@@ -205,11 +205,14 @@ pub struct Report {
     pub bytes: u64,
 }
 fn environment(value: &str) -> bool {
-    value.len() == 34
-        && value.starts_with("opencodex-")
-        && value[10..]
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    // Existing TypeScript installations use opencodex-<hex>; isolated native
+    // profiles retain their UUID identity through a profile-generation upgrade.
+    (value.len() == 36 && uuid::Uuid::parse_str(value).is_ok_and(|id| id.to_string() == value))
+        || (value.len() == 34
+            && value.starts_with("opencodex-")
+            && value[10..]
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
 }
 fn stream(
     path: &Path,
@@ -335,6 +338,17 @@ fn capture_inner(
 /// mark a profile ready, execute stored code, or connect to either agent.
 pub fn verify(snapshot: &Path, original_environment: &str) -> io::Result<Report> {
     verify_inner(snapshot, original_environment).map(|(_, report)| report)
+}
+
+/// Compare a quiesced working copy with its immutable checkpoint. This never
+/// restores over new work. Upgrade rollback uses it before changing ownership.
+pub fn verify_tree(snapshot: &Path, data: &Path, original_environment: &str) -> io::Result<Report> {
+    let (manifest, report) = verify_inner(snapshot, original_environment)?;
+    if !data.is_absolute() {
+        return Err(invalid());
+    }
+    verify_data(data, &manifest, Instant::now() + TIMEOUT)?;
+    Ok(report)
 }
 fn read_manifest(directory: &Path, name: &str) -> io::Result<Manifest> {
     open(directory, true)?;

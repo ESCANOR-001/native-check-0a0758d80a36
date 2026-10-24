@@ -85,6 +85,8 @@ fn default_workers() -> usize {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
+    pub native_profile_handoff: Option<PathBuf>,
+    #[serde(default)]
     pub storage: crate::storage::Limits,
     #[serde(default = "default_workers")]
     pub max_active_chats: usize,
@@ -243,7 +245,50 @@ pub struct Chats {
 impl Chats {
     pub async fn start(db: AuthService, mut config: Config) -> Result<Self, String> {
         db.call(|a| a.store.assert_migration_ready()).await??;
+        let requested_handoff = config.native_profile_handoff.clone();
+        db.call(move |a| {
+            a.store
+                .check_native_profile_binding(requested_handoff.as_deref())
+        })
+        .await??;
+        let profile_handoff = if let Some(root) = config.native_profile_handoff.clone() {
+            if config.codex.shared_server.is_some() {
+                return Err("Shared Codex ownership must be handed off by its original server; a copied profile cannot adopt that transport".into());
+            }
+            let external = db
+                .call(|a| -> rusqlite::Result<bool> {
+                    a.store.init_chats()?;
+                    Ok(a.store
+                        .chat_headers()?
+                        .iter()
+                        .any(|chat| chat["external_claude"] == true))
+                })
+                .await?
+                .map_err(|_| "Cannot verify native profile ownership")?;
+            if external {
+                return Err("Externally owned Claude chats must remain with their original profile; automatic profile handoff was refused".into());
+            }
+            let environment = db
+                .call(|a| a.store.environment_id())
+                .await?
+                .map_err(|_| "Cannot verify handoff environment")?;
+            let codex = config.codex.profile.clone();
+            let claude = config.claude.profile.clone();
+            let session = tokio::task::spawn_blocking(move || {
+                crate::profile_handoff::activate(&root, &environment, &codex, &claude)
+            })
+            .await
+            .map_err(|_| "Native profile handoff check failed")??;
+            (config.codex.profile, config.claude.profile) = session.profiles();
+            Some(Arc::new(session))
+        } else {
+            None
+        };
         config.validate()?;
+        if let Some(root) = config.native_profile_handoff.clone() {
+            db.call(move |a| a.store.bind_native_profiles(&root))
+                .await??;
+        }
         let switches = setup::Settings::load(&db, config.claude.remote_control).await?;
         let claude_default_binary = config.claude.executable.clone();
         if let Some(binary) = &switches.binary {
@@ -253,8 +298,11 @@ impl Chats {
             config.claude.executable = binary.clone();
         }
         config.claude.remote_control = switches.desktop_sync;
-        let setup =
-            crate::agent_setup::ClaudeSetup::new(config.claude.clone(), config.workspace.clone())?;
+        let setup = crate::agent_setup::ClaudeSetup::new(
+            config.claude.clone(),
+            config.workspace.clone(),
+            profile_handoff.clone(),
+        )?;
         let activity = crate::activity::Reader::new(config.codex.profile.clone());
         let storage_report = crate::storage_report::Reader::new(config.codex.profile.clone());
         let limits = config.storage.clone();
@@ -389,6 +437,7 @@ impl Chats {
         let restart_gate = Arc::new(AtomicU8::new(0));
         tokio::spawn(
             Hub {
+                _profile_handoff: profile_handoff,
                 db,
                 config,
                 claude_enabled: switches.enabled,
@@ -653,6 +702,8 @@ struct Hub {
     seq: u64,
     changes: watch::Sender<u64>,
     dirty: bool,
+    // Keep ownership until the workers and all other profile users are dropped.
+    _profile_handoff: Option<Arc<crate::profile_handoff::Session>>,
 }
 pub(crate) fn finish(chat: &mut Chat, state: &str, error: Option<&str>) {
     chat.pending_message = Value::Null;

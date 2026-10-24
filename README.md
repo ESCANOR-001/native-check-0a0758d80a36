@@ -12,3 +12,8 @@ These are unsigned experimental binaries for isolated validation, not production
 installers or npm releases. No configuration, test workspace or credentials are
 included in the binary artifact. A passing matrix does not qualify other CPU
 architectures or older operating-system versions.
+
+Native profile handoff uses verified, quiesced exports and isolated working copies.
+The connection retains its native generation across restarts. Data rollback refuses
+new or changed history. Shared owners and complete legacy cutover remain separate
+release gates; this does not change the experimental publication status above.

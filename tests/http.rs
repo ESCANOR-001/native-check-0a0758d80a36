@@ -184,6 +184,7 @@ async fn first_pairing_recovers_a_lost_exchange_and_opens_its_first_socket() {
         app.auth.clone(),
         Config {
             storage: Default::default(),
+            native_profile_handoff: None,
             max_active_chats: 1,
             workspace: dir.path().into(),
             codex: provider.clone(),
@@ -331,6 +332,7 @@ async fn android_http_chat_creation_and_websocket_reads_share_native_state() {
         app.auth.clone(),
         Config {
             storage: Default::default(),
+            native_profile_handoff: None,
             max_active_chats: 1,
             workspace: dir.path().into(),
             codex: agent.clone(),
@@ -464,6 +466,7 @@ async fn previews_require_an_authorized_exact_file_and_stop_after_phone_revocati
         Config {
             storage: Default::default(),
             workspace,
+            native_profile_handoff: None,
             max_active_chats: 1,
             codex: a.clone(),
             claude: a,
