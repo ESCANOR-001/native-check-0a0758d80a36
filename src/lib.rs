@@ -37,6 +37,7 @@ mod legacy_codex_headers;
 mod legacy_codex_history;
 mod legacy_codex_native;
 pub mod legacy_connection;
+pub mod legacy_export;
 mod legacy_preferences;
 pub mod legacy_rollback;
 pub mod legacy_stage;
@@ -49,6 +50,7 @@ pub mod migration_snapshot;
 pub mod profile_handoff;
 pub mod restart_drain;
 pub mod server;
+pub mod service_cutover;
 pub mod store;
 
 pub mod attachments;

@@ -11,6 +11,40 @@ use std::{future::IntoFuture, path::PathBuf, time::Duration};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "--service-cutover") {
+        let operation = args.get(2).map(String::as_str).unwrap_or("");
+        if !matches!(
+            (operation, args.len()),
+            ("select", 5) | ("run" | "cancel", 4)
+        ) {
+            return Err(
+                "Usage: --service-cutover select SERVICE_DIR PLAN_JSON | run|cancel SERVICE_DIR"
+                    .into(),
+            );
+        }
+        let directory = PathBuf::from(&args[3]);
+        match operation {
+            "select" => println!(
+                "{}",
+                remodex_connect_native::service_cutover::select(
+                    &directory,
+                    &PathBuf::from(&args[4])
+                )?
+            ),
+            "cancel" => println!(
+                "{}",
+                remodex_connect_native::service_cutover::cancel(&directory)?
+            ),
+            _ => {
+                let code =
+                    remodex_connect_native::service_cutover::run(&directory, shutdown()?).await?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }
+        }
+        return Ok(());
+    }
     if args.get(1).is_some_and(|a| a == "--supervise") {
         let code = remodex_connect_native::supervisor::run(
             std::env::args_os().skip(2).collect(),
@@ -39,6 +73,20 @@ async fn serve(
     args: Vec<String>,
     parent: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    if args.get(1).is_some_and(|a| a == "--legacy-export") {
+        if args.len() != 5 {
+            return Err(
+                "Usage: --legacy-export ABSOLUTE_NEW_ROOT CLOSED_OWNER_JSON CONFIG_JSON".into(),
+            );
+        }
+        let report = remodex_connect_native::legacy_export::run(
+            &PathBuf::from(&args[2]),
+            &PathBuf::from(&args[3]),
+            &PathBuf::from(&args[4]),
+        )?;
+        println!("{report}");
+        return Ok(0);
+    }
     if args.get(1).is_some_and(|a| a == "--legacy-upgrade") {
         if args.len() != 5 {
             return Err(

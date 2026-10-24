@@ -1116,3 +1116,138 @@ fn a_changed_copied_codex_rollout_refuses_retry_and_rollback_without_repair() {
     assert_eq!(rows(&db), before);
     assert_eq!(fs::read(file).unwrap(), b"changed native history\n");
 }
+
+fn automatic_export_fixture() -> (Fixture, PathBuf, PathBuf) {
+    let f = Fixture::new(0);
+    // A distinct asset-free chat. Asset-bearing exports must not be guessed or
+    // silently stripped by the automatic exporter.
+    let mut history = read(&f.source.join("codex.json"));
+    history["messages"][0]["text"] = json!("Keep original prompt");
+    write(&f.source.join("codex.json"), &history);
+    f.codex_native_export(|_| {});
+    let config = f.activation_config();
+    let cfg = read(&config);
+    let owner = f._dir.path().join("closed-owner");
+    fs::create_dir(&owner).unwrap();
+    for name in [
+        "connection.json",
+        "settings.json",
+        "projects.json",
+        "codex.json",
+    ] {
+        fs::copy(f.source.join(name), owner.join(name)).unwrap();
+    }
+    let receipt = owner.join("closed-owner.json");
+    let native = f._dir.path().join("codex-export/sessions/test.jsonl");
+    write(
+        &receipt,
+        &json!({"version":1,"environment":ENV,
+        "profiles":{"codex":cfg["codex"]["profile"],"claude":cfg["claude"]["profile"]},
+        "connection":"connection.json","codex_projects":"projects.json","claude_settings":"settings.json",
+        "chats":[{"agent":"codex","id":"codex","history":"codex.json","transcript":"sessions/test.jsonl","sha256":format!("{:x}",Sha256::digest(fs::read(&native).unwrap()))}]}),
+    );
+    (f, receipt, config)
+}
+#[test]
+fn automatic_export_prepares_original_identity_history_and_pairing_without_handmade_stage() {
+    let (f, receipt, config) = automatic_export_fixture();
+    let root = f._dir.path().join("automatic");
+    let before = fs::read(receipt.parent().unwrap().join("codex.json")).unwrap();
+    let result = remodex_connect_native::legacy_export::run(&root, &receipt, &config);
+    if result.is_err() {
+        eprintln!(
+            "export-root entries: {:?}",
+            fs::read_dir(&root).map(|r| r.map(|v| v.unwrap().file_name()).collect::<Vec<_>>())
+        );
+    }
+    let report = result.unwrap();
+    assert_eq!(report["phase"], "prepared");
+    let db = Connection::open(root.join("generation/bridge/state/native-connect.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM clients", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM chat_rows", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(fs::read(root.join("source/codex-0.json")).unwrap(), before);
+    assert_eq!(
+        fs::read(receipt.parent().unwrap().join("codex.json")).unwrap(),
+        before
+    );
+    assert!(remodex_connect_native::legacy_export::run(&root, &receipt, &config).is_err());
+    remodex_connect_native::legacy_upgrade::run(
+        "check",
+        &root.join("generation"),
+        &root.join("upgrade-plan.json"),
+    )
+    .unwrap();
+}
+#[test]
+fn automatic_export_refuses_raced_native_history_and_uninventoried_assets() {
+    let (f, receipt, config) = automatic_export_fixture();
+    let root = f._dir.path().join("automatic");
+    let mut history = read(&receipt.parent().unwrap().join("codex.json"));
+    history["messages"][0]["attachments"] = json!([{"id":"must-retain"}]);
+    write(&receipt.parent().unwrap().join("codex.json"), &history);
+    assert!(
+        remodex_connect_native::legacy_export::run(&root, &receipt, &config)
+            .unwrap_err()
+            .contains("asset inventory")
+    );
+    assert!(!root.exists());
+    history["messages"][0]["attachments"] = json!([]);
+    write(&receipt.parent().unwrap().join("codex.json"), &history);
+    fs::write(
+        f._dir.path().join("codex-export/sessions/test.jsonl"),
+        "changed after shutdown\n",
+    )
+    .unwrap();
+    assert!(remodex_connect_native::legacy_export::run(&root, &receipt, &config).is_err());
+    assert!(!root.join("prepared.json").exists());
+    assert!(!root.join("generation").exists());
+}
+#[test]
+fn service_selection_is_bound_exclusive_and_cancellable_only_before_native_start() {
+    use remodex_connect_native::{legacy_export, service_cutover};
+    let (f, receipt, config) = automatic_export_fixture();
+    let root = f._dir.path().join("automatic");
+    legacy_export::run(&root, &receipt, &config).unwrap();
+    let service = f._dir.path().join("service");
+    let plan = f._dir.path().join("service-plan.json");
+    write(
+        &plan,
+        &json!({"version":1,"export_root":root,"bind":"127.0.0.1:18991","public_url":"http://127.0.0.1:18991","gui":f._dir.path()}),
+    );
+    assert_eq!(
+        service_cutover::select(&service, &plan).unwrap()["phase"],
+        "selected"
+    );
+    assert_eq!(
+        service_cutover::select(&service, &plan).unwrap()["phase"],
+        "selected"
+    );
+    let lease = profile_lock::acquire(&service).unwrap();
+    assert!(service_cutover::cancel(&service).is_err());
+    drop(lease);
+    let db = Connection::open(service.join("service.sqlite")).unwrap();
+    db.execute("UPDATE selection SET phase='started'", [])
+        .unwrap();
+    assert!(service_cutover::cancel(&service)
+        .unwrap_err()
+        .contains("current data"));
+    assert_eq!(
+        service_cutover::select(&service, &plan).unwrap()["legacyFallbackAllowed"],
+        false
+    );
+    db.execute("UPDATE selection SET phase='selected'", [])
+        .unwrap();
+    assert_eq!(
+        service_cutover::cancel(&service).unwrap()["phase"],
+        "cancelled"
+    );
+    assert!(service_cutover::select(&service, &plan).is_err());
+}
