@@ -1327,6 +1327,14 @@ fn service_selection_is_bound_exclusive_and_cancellable_only_before_native_start
         .unwrap()
         .assert_migration_ready()
         .is_err());
+    let cfg = read(&config);
+    assert!(remodex_connect_native::profile_handoff::activate(
+        &root.join("generation/native"),
+        ENV,
+        std::path::Path::new(cfg["codex"]["profile"].as_str().unwrap()),
+        std::path::Path::new(cfg["claude"]["profile"].as_str().unwrap())
+    )
+    .is_err());
     let imported =
         Connection::open(root.join("generation/bridge/state/native-connect.sqlite")).unwrap();
     assert_eq!(

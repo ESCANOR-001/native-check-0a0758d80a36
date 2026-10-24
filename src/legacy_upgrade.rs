@@ -338,6 +338,10 @@ pub fn run(operation: &str, root: &Path, plan_file: &Path) -> Result<Value, Stri
             db.execute("UPDATE upgrade SET phase='rolling-back' WHERE id=1", [])
                 .map_err(|_| ERROR)?;
             legacy_rollback::run(&state, true)?;
+            // The bridge's import and the copied CLI profile generation must
+            // both be revoked before a coordinator releases the old owner.
+            // This step is idempotent after an interrupted rollback commit.
+            profile_handoff::rollback(&root.join("native"), &plan.environment)?;
             db.execute("UPDATE upgrade SET phase='rolled-back' WHERE id=1", [])
                 .map_err(|_| ERROR)?;
         }
