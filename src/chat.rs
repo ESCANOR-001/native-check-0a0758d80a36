@@ -203,6 +203,8 @@ pub(crate) struct Chat {
     #[serde(default)]
     pub paused: bool,
     #[serde(default)]
+    pub compaction_turn: Option<String>,
+    #[serde(default)]
     pub disabled_mcp: Vec<String>,
     #[serde(skip)]
     pub stream_id: String,
@@ -228,6 +230,7 @@ impl Chat {
         self.sync_replacement = None;
         self.queue.clear();
         self.paused = false;
+        self.compaction_turn = None;
         self.stream_id.clear();
         self.stream_model.clear();
         self.pending_message = Value::Null;
@@ -735,10 +738,12 @@ struct Hub {
 }
 pub(crate) fn finish(chat: &mut Chat, state: &str, error: Option<&str>) {
     chat.pending_message = Value::Null;
+    chat.compaction_turn = None;
     chat.external_stop = None;
     let t = &mut chat.thread;
     t["session"]["status"] = json!(if state == "completed" { "ready" } else { state });
     t["session"]["activeTurnId"] = Value::Null;
+    t["session"]["statusConfidence"] = json!("confirmed");
     // A provider error can itself be a large protocol frame. Keep diagnostics
     // bounded too, rather than retaining it outside the transcript size guard.
     t["session"]["lastError"] = json!(error.map(|e| e.chars().take(1024).collect::<String>()));
@@ -2768,6 +2773,7 @@ impl Hub {
             sync_replacement: None,
             queue: vec![],
             paused: false,
+            compaction_turn: None,
             disabled_mcp: vec![],
             stream_id: String::new(),
             stream_model: String::new(),
@@ -4657,8 +4663,9 @@ impl Hub {
             } else {
                 None
             };
-            chat.thread["session"]["status"] = json!("running");
-            chat.thread["latestTurn"]["startedAt"] = json!(now());
+            // Writing a prompt to a socket is delivery, not proof execution began.
+            // Keep Sending until the native owner acknowledges this turn.
+            chat.thread["session"]["status"] = json!("starting");
         }
         if codex && (response == "turn" || v["method"] == "turn/started") {
             let turn = if response == "turn" {
@@ -4667,6 +4674,9 @@ impl Hub {
                 &v["params"]["turn"]
             };
             w.native_turn = s(&turn["id"]).into();
+            chat.thread["session"]["status"] = json!("running");
+            chat.thread["session"]["statusConfidence"] = json!("confirmed");
+            chat.thread["latestTurn"]["startedAt"] = json!(now());
             let cid = id.clone();
             let public = s(&chat.thread["latestTurn"]["turnId"]).to_owned();
             let native = w.native_turn.clone();
@@ -4676,6 +4686,22 @@ impl Hub {
                 .map_err(|_| "Could not save the verified native turn")?;
             if !w.stopping {
                 w.deadline = None;
+            }
+        }
+        if !codex
+            && w.stage == "running"
+            && v["parent_tool_use_id"].is_null()
+            && (matches!(
+                v["type"].as_str(),
+                Some("assistant" | "stream_event" | "control_request")
+            ) || v["type"] == "system"
+                && v["subtype"] == "status"
+                && v["status"] == "compacting")
+        {
+            chat.thread["session"]["status"] = json!("running");
+            chat.thread["session"]["statusConfidence"] = json!("confirmed");
+            if chat.thread["latestTurn"]["startedAt"].is_null() {
+                chat.thread["latestTurn"]["startedAt"] = json!(now());
             }
         }
         if codex && w.steers.contains_key(response) {
@@ -5070,6 +5096,7 @@ impl Hub {
             }
             chat.thread["session"]["status"] = json!("running");
             chat.thread["session"]["activeTurnId"] = json!(turn.public_turn);
+            chat.thread["session"]["statusConfidence"] = json!("confirmed");
             chat.thread["sharedTurnOwner"] = json!(if turn.local { "android" } else { "desktop" });
             chat.thread["latestTurn"]["startedAt"] = chat.thread["latestTurn"]["startedAt"]
                 .as_str()

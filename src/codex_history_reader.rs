@@ -148,6 +148,11 @@ fn identifier(value: &Value) -> Result<&str, String> {
         .ok_or_else(|| ERROR.into())
 }
 fn fingerprint(profile: &Path, path: &Path, native: &str) -> Result<(u64, String), String> {
+    // Compare against both spellings of the configured root, never resolve the
+    // untrusted transcript first. macOS /var and Windows short paths may differ
+    // from their canonical root even when the reader uses the supplied profile.
+    crate::storage_stage::open(profile, true).map_err(|_| ERROR)?;
+    let canonical = profile.canonicalize().map_err(|_| ERROR)?;
     // Windows APIs disagree on the verbatim prefix. Normalize only that
     // spelling; component-by-component opens below still reject redirects.
     #[cfg(windows)]
@@ -160,10 +165,13 @@ fn fingerprint(profile: &Path, path: &Path, native: &str) -> Result<(u64, String
         }
     }
     #[cfg(windows)]
-    let (profile, path) = (dos(profile), dos(path));
+    let (profile, path, canonical) = (dos(profile), dos(path), dos(&canonical));
     #[cfg(windows)]
     let (profile, path) = (profile.as_path(), path.as_path());
-    let relative = path.strip_prefix(profile).map_err(|_| ERROR)?;
+    let relative = path
+        .strip_prefix(profile)
+        .or_else(|_| path.strip_prefix(&canonical))
+        .map_err(|_| ERROR)?;
     let parts: Vec<_> = relative.components().collect();
     if parts.len() < 2
         || !matches!(parts.first(),Some(Component::Normal(p)) if *p=="sessions" || *p=="archived_sessions")
@@ -171,7 +179,7 @@ fn fingerprint(profile: &Path, path: &Path, native: &str) -> Result<(u64, String
     {
         return Err(ERROR.into());
     }
-    let mut checked = profile.to_owned();
+    let mut checked = canonical;
     crate::storage_stage::open(&checked, true).map_err(|_| ERROR)?;
     for (i, part) in parts.iter().enumerate() {
         checked.push(part);
@@ -245,7 +253,7 @@ pub async fn capture(
     let result=tokio::time::timeout(Duration::from_secs(120),async {
         let metadata=reader.metadata(native).await?;
         let path=PathBuf::from(metadata["path"].as_str().ok_or(ERROR)?);
-        let p=profile.clone();let n=native.to_owned();let source=path.clone();
+        let p=config.profile.clone();let n=native.to_owned();let source=path.clone();
         let before=tokio::task::spawn_blocking(move||fingerprint(&p,&source,&n)).await.map_err(|_|ERROR)??;
         let mut digest=Sha256::new();let mut bytes=0u64;let mut turns=0usize;let mut items=0usize;
         let mut turn_cursor=None;let mut seen_turns=BTreeSet::new();let mut cursors=BTreeSet::new();
@@ -278,7 +286,7 @@ pub async fn capture(
         }
         let after_metadata=reader.metadata(native).await?;
         if after_metadata["path"]!=metadata["path"] {return Err(ERROR.into());}
-        let p=profile.clone();let n=native.to_owned();
+        let p=config.profile.clone();let n=native.to_owned();
         let after=tokio::task::spawn_blocking(move||fingerprint(&p,&path,&n)).await.map_err(|_|ERROR)??;
         if before!=after {return Err(ERROR.into());}
         let report=json!({"type":"complete","version":1,"native":native,"turns":turns,"items":items,"bytes":bytes,"sha256":format!("{:x}",digest.finalize()),"sourceBytes":before.0,"sourceSha256":before.1,"historyOnly":true,"ownerStateVerified":false});

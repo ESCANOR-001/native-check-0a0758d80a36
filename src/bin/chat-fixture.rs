@@ -169,6 +169,12 @@ fn main() {
                     if text == "crash" {
                         return;
                     }
+                    if text == "compact-hold" {
+                        out(
+                            json!({"method":"item/started","params":{"threadId":v["params"]["threadId"],"turnId":"turn-test","item":{"id":"fixture-compaction","type":"contextCompaction"}}}),
+                        );
+                        continue;
+                    }
                     if text == "foreign-events" {
                         for thread in [
                             json!({"threadId":"another-thread"}),
@@ -581,6 +587,15 @@ This came from another Claude session — not typed by your user, but very likel
                     out(json!({"type":"result","user_message_uuids":host_inputs}));
                     continue;
                 }
+            }
+            if !hosted {
+                out(
+                    json!({"type":"stream_event","event":{"type":"message_start","message":{"id":last,"role":"assistant","content":[]}}}),
+                );
+            }
+            if text == "compact-hold" {
+                out(json!({"type":"system","subtype":"status","status":"compacting"}));
+                continue;
             }
             if text == "background-fixture" {
                 out(

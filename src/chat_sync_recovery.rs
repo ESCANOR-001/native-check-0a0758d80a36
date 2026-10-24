@@ -344,7 +344,7 @@ impl Hub {
         chat.thread["nativeSessionId"] = json!(chat.native_id);
         chat.thread["session"]["lastError"] =
             json!("Connecting a replacement Claude link; saved history is retained");
-        chat.thread["session"]["statusConfidence"] = json!("unavailable");
+        chat.thread["session"]["statusConfidence"] = json!("unknown");
         let state = serde_json::to_value(&chat).unwrap();
         let result = json!({"nativeSessionId":chat.native_id});
         self.db

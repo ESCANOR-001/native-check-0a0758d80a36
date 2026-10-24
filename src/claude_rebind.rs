@@ -147,7 +147,7 @@ impl Store {
         }
         state["remote_identity"] = json!(link.identity);
         state["paused"] = json!(true);
-        state["thread"]["session"]["statusConfidence"] = json!("unavailable");
+        state["thread"]["session"]["statusConfidence"] = json!("unknown");
         state["thread"]["session"]["lastError"] =
             json!("Reconnecting to Claude's updated link; saved history is retained");
         // Metadata, archived old cursor and new cursor commit together. Transcript,
@@ -233,10 +233,7 @@ mod tests {
         assert_eq!(state["thread"]["title"], "Keep title");
         assert_eq!(state["paused"], true);
         assert_eq!(state["queue"][0]["message"], "Never automatically replay");
-        assert_eq!(
-            state["thread"]["session"]["statusConfidence"],
-            "unavailable"
-        );
+        assert_eq!(state["thread"]["session"]["statusConfidence"], "unknown");
         assert_eq!(after.sequence, 0);
         assert_eq!(raw(&store, "chat_rows"), rows);
         assert!(store.rebind_claude_link("chat", &before, &link).is_err());

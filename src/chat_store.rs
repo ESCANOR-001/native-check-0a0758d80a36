@@ -479,6 +479,7 @@ impl Store {
             }
         }
         let mut metadata = state.clone();
+        crate::task_state::refresh(&mut metadata);
         {
             // Stream snapshots contain the bounded recent page. Do not allocate
             // AUTOINCREMENT ids or dirty its pages for rows that did not change.

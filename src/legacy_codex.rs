@@ -239,6 +239,7 @@ impl Prepared {
                 sync_replacement: None,
                 queue: vec![],
                 paused: true,
+                compaction_turn: None,
                 disabled_mcp: vec![],
                 stream_id: String::new(),
                 pending_message: Value::Null,

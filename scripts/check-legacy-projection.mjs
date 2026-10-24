@@ -1,11 +1,13 @@
-import { readdirSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 
-const directory = 'target/debug/deps';
-const bins = readdirSync(directory).filter(name => /^legacy_claude-[a-f0-9]+(?:\.exe)?$/.test(name) && statSync(join(directory, name)).isFile());
-if (bins.length !== 1) throw new Error('Expected one built legacy Claude test executable');
-const binary = join(directory, bins[0]);
+// Ask Cargo for the exact current artifact; restored caches can contain stale
+// hashes and must never choose which executable gets qualified.
+const built = spawnSync('cargo', ['test', '--test', 'legacy_claude', '--no-run', '--message-format=json'], { windowsHide: true, encoding: 'utf8', timeout: 180000, maxBuffer: 4 * 1024 * 1024 });
+if (built.status !== 0) throw new Error(`Cannot identify current legacy test artifact: ${built.stderr}`);
+const artifacts = built.stdout.split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(v => v.reason === 'compiler-artifact' && v.target?.name === 'legacy_claude' && v.executable);
+if (artifacts.length !== 1) throw new Error('Expected one current legacy Claude test executable');
+const binary = artifacts[0].executable;
 const test = 'first_native_event_after_upgrade_advances_anchor_and_preserves_old_prompt_bubbles';
 for (let iteration = 1; iteration <= 500; iteration++) {
   await new Promise((resolve, reject) => {

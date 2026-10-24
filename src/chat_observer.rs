@@ -139,7 +139,7 @@ impl Hub {
         chat.resumed = true;
         chat.paused = true;
         chat.thread["worktreePath"] = json!(link.cwd);
-        chat.thread["session"]["statusConfidence"] = json!("unavailable");
+        chat.thread["session"]["statusConfidence"] = json!("unknown");
         self.chats.insert(requested.into(), chat);
         if let Err(error) = self.save(requested, None).await {
             self.chats.remove(requested);
@@ -466,7 +466,7 @@ impl Hub {
             // would repeatedly kill valid recovery of a large conversation.
             w.deadline = None;
             let chat = self.chats.get_mut(id).unwrap();
-            chat.thread["session"]["statusConfidence"] = json!("unavailable");
+            chat.thread["session"]["statusConfidence"] = json!("unknown");
             projection::activity(
                 chat,
                 "claude-native-sync",
@@ -619,7 +619,7 @@ impl Hub {
         if let Some(error) = queued {
             chat.thread["session"]["lastError"] = json!(error);
         }
-        chat.thread["session"]["statusConfidence"] = json!("unavailable");
+        chat.thread["session"]["statusConfidence"] = json!("unknown");
         projection::activity(
             chat,
             "claude-native-sync",

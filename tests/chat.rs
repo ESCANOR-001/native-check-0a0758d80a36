@@ -1727,7 +1727,8 @@ async fn hosted_claude_stop_before_native_start_finishes_without_result_or_disco
     test.call(a, prompt("host-prestart", "hold-before-start", "normal"))
         .await
         .unwrap();
-    test.wait(a, "host-prestart", "running").await;
+    let pending = test.wait(a, "host-prestart", "starting").await;
+    assert_eq!(pending["session"]["executionState"], "starting");
     tokio::time::timeout(Duration::from_secs(3), async {
         while !test.dir.path().join("host-prompt-waiting").exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -6087,4 +6088,48 @@ async fn repository_clone_does_not_block_either_agent_and_shutdown_never_replays
             .is_err()
     );
     test.stop().await;
+}
+
+#[tokio::test]
+async fn execution_phase_survives_subscription_compaction_stop_and_restart() {
+    for a in [AgentKind::Codex, AgentKind::Claude] {
+        let mut t = Test::new().await;
+        t.create(a, "phase").await;
+        t.call(a, prompt("phase", "compact-hold", "normal"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let thread = t.detail(a, "phase").await;
+                if thread["session"]["executionState"] == "compacting" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("native compaction must be persisted and visible");
+        t.call(
+            a,
+            json!({"type":"thread.turn.interrupt","threadId":"phase","commandId":"stop-phase"}),
+        )
+        .await
+        .unwrap();
+        let stopped = t.wait(a, "phase", "interrupted").await;
+        assert_eq!(stopped["session"]["executionState"], "paused");
+        t.stop().await;
+        t.hub = Chats::start(t.db.clone(), t.config.clone()).await.unwrap();
+        assert_eq!(
+            t.detail(a, "phase").await["session"]["executionState"],
+            "paused"
+        );
+        t.call(a, prompt("phase", "AFTER_COMPACTION", "normal"))
+            .await
+            .unwrap();
+        assert_eq!(
+            t.wait(a, "phase", "ready").await["session"]["executionState"],
+            "idle"
+        );
+        t.stop().await;
+    }
 }

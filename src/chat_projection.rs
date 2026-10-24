@@ -373,6 +373,27 @@ fn proposed_plan(chat: &mut Chat, id: &str, text: &str, delta: bool, completed: 
         chat.thread["hasActionableProposedPlan"] = json!(true);
     }
 }
+fn compaction(chat: &mut Chat, id: &str, running: bool) {
+    if running {
+        chat.compaction_turn = chat.thread["latestTurn"]["turnId"]
+            .as_str()
+            .map(str::to_owned);
+    } else {
+        chat.compaction_turn = None;
+    }
+    activity(
+        chat,
+        id,
+        "context-compaction",
+        if running {
+            "Compacting context"
+        } else {
+            "Context compacted"
+        },
+        "info",
+        json!({"itemId":id,"itemType":"context-compaction","status":if running {"inProgress"}else{"completed"}}),
+    );
+}
 pub fn project(chat: &mut Chat, v: &Value) {
     match chat.agent {
         AgentKind::Codex => {
@@ -420,6 +441,7 @@ pub fn project(chat: &mut Chat, v: &Value) {
                         "running"
                     };
                     match s(&i["type"]) {
+                        "contextCompaction" => compaction(chat, id, !completed),
                         "plan" => proposed_plan(chat, id, s(&i["text"]), false, completed),
                         "agentMessage" => {
                             message(chat, id, s(&i["text"]), "assistant", false, !completed)
@@ -489,6 +511,19 @@ pub fn project(chat: &mut Chat, v: &Value) {
             // Parent output excludes nested agents and internal/user prompt echoes.
             if !v["parent_tool_use_id"].is_null() {
                 return;
+            }
+            if v["type"] == "system" && v["subtype"] == "status" && v["status"] == "compacting" {
+                let id = format!("compaction-{}", s(&chat.thread["latestTurn"]["turnId"]));
+                compaction(chat, &id, true);
+            }
+            if v["type"] == "system"
+                && (v["subtype"] == "compact_boundary"
+                    || v["subtype"] == "status"
+                        && v.get("status") == Some(&Value::Null)
+                        && chat.compaction_turn.is_some())
+            {
+                let id = format!("compaction-{}", s(&chat.thread["latestTurn"]["turnId"]));
+                compaction(chat, &id, false);
             }
             if v["type"] == "stream_event" {
                 let e = &v["event"];
@@ -677,6 +712,7 @@ mod tests {
             sync_replacement: None,
             queue: vec![],
             paused: false,
+            compaction_turn: None,
             disabled_mcp: vec![],
             stream_id: String::new(),
             stream_model: String::new(),
@@ -872,5 +908,34 @@ mod tests {
             "Inspect files, then test."
         );
         assert_eq!(c.thread["hasActionableProposedPlan"], true);
+    }
+    #[test]
+    fn only_native_top_level_compaction_events_set_and_clear_the_phase() {
+        for agent in [AgentKind::Codex, AgentKind::Claude] {
+            let mut c = chat(agent);
+            c.thread["latestTurn"] = json!({"turnId":"t","state":"running"});
+            let start = if agent == AgentKind::Codex {
+                json!({"method":"item/started","params":{"item":{"type":"contextCompaction","id":"c"}}})
+            } else {
+                json!({"type":"system","subtype":"status","status":"compacting"})
+            };
+            project(&mut c, &start);
+            assert_eq!(c.compaction_turn.as_deref(), Some("t"));
+            let end = if agent == AgentKind::Codex {
+                json!({"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"c"}}})
+            } else {
+                json!({"type":"system","subtype":"compact_boundary"})
+            };
+            project(&mut c, &end);
+            assert_eq!(c.compaction_turn, None);
+            assert_eq!(c.thread["activities"].as_array().unwrap().len(), 1);
+            assert_eq!(c.thread["activities"][0]["payload"]["status"], "completed");
+            if agent == AgentKind::Claude {
+                let mut nested = start;
+                nested["parent_tool_use_id"] = json!("nested");
+                project(&mut c, &nested);
+                assert_eq!(c.compaction_turn, None);
+            }
+        }
     }
 }

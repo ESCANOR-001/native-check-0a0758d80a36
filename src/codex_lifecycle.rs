@@ -47,7 +47,12 @@ impl Tracker {
     ) -> Result<(String, String), String> {
         let profile = spelling(profile);
         let path = spelling(path);
-        let relative = path.strip_prefix(&profile).map_err(|_| ERROR)?;
+        crate::storage_stage::open(&profile, true).map_err(|_| ERROR)?;
+        let canonical = spelling(&profile.canonicalize().map_err(|_| ERROR)?);
+        let relative = path
+            .strip_prefix(&profile)
+            .or_else(|_| path.strip_prefix(&canonical))
+            .map_err(|_| ERROR)?;
         let parts: Vec<_> = relative.components().collect();
         if parts.len() < 2
             || !matches!(parts.first(),Some(Component::Normal(p)) if *p=="sessions" || *p=="archived_sessions")
@@ -55,7 +60,7 @@ impl Tracker {
         {
             return Err(ERROR.into());
         }
-        let mut checked = profile;
+        let mut checked = canonical;
         crate::storage_stage::open(&checked, true).map_err(|_| ERROR)?;
         for (i, part) in parts.iter().enumerate() {
             checked.push(part);
