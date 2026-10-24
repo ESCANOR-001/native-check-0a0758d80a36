@@ -296,17 +296,67 @@ pub fn prepare(root: &Path, plan_path: &Path) -> Result<Value, String> {
     )
 }
 
-/// Same immutable plan is required on every invocation; a repeated npm launch
-/// selects the existing generation instead of replaying an old export.
+/// Preparation requires the immutable source plan. Once selected, ordinary
+/// starts use the retained journal and generation; updating/replacing the npm
+/// package does not reread a source export or require its original plan file.
 pub async fn run<F: std::future::Future<Output = ()>>(
     root: &Path,
     plan: &Path,
     stop: F,
 ) -> Result<i32, String> {
     prepare(root, plan)?;
+    resume(root, stop).await
+}
+
+fn selected(root: &Path) -> Result<Journal, String> {
+    let journal = Journal::open(root, false)?;
+    let (raw, attempt, phase): (Vec<u8>, u32, String) = journal
+        .db
+        .query_row(
+            "SELECT plan,attempt,phase FROM upgrade WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|_| ERROR)?;
+    if phase != "selected" || !(1..=3).contains(&attempt) {
+        return Err(ERROR.into());
+    }
+    let plan: Plan = serde_json::from_slice(&raw).map_err(|_| ERROR)?;
+    if plan.version != 1 {
+        return Err(ERROR.into());
+    }
+    let expected = json!({"version":1,"export_root":journal.root.join(format!("attempt-{attempt}")),
+        "bind":plan.bind,"public_url":plan.public_url,"gui":plan.gui});
+    let saved: Value = serde_json::from_slice(&read(&journal.root.join("cutover.json"), 32768)?)
+        .map_err(|_| ERROR)?;
+    if saved != expected {
+        return Err(ERROR.into());
+    }
+    // This revalidates the selected configuration, original profile binding,
+    // source hold and service identity, without opening an agent process.
+    if crate::service_cutover::registration(&journal.root.join("service"))?
+        != crate::profile_handoff::ProfileMode::Existing
+    {
+        return Err(ERROR.into());
+    }
+    Ok(journal)
+}
+
+pub fn resume_info(root: &Path) -> Result<Value, String> {
+    let journal = selected(root)?;
+    Ok(
+        json!({"resumable":true,"service":journal.root.join("service"),"profilesKeptInPlace":true,
+        "runtimeStarted":false,"migrationComplete":false}),
+    )
+}
+
+pub async fn resume<F: std::future::Future<Output = ()>>(
+    root: &Path,
+    stop: F,
+) -> Result<i32, String> {
     // The journal lease covers the service lifetime, preventing a second npm
     // launcher from concurrently changing selection or cancelling preparation.
-    let journal = Journal::open(root, false)?;
+    let journal = selected(root)?;
     service_cutover::run(&journal.root.join("service"), stop).await
 }
 pub fn cancel(root: &Path) -> Result<Value, String> {

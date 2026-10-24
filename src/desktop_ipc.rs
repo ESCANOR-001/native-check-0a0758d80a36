@@ -53,7 +53,8 @@ impl Endpoint {
             use sha2::{Digest, Sha256};
             let root = profile.canonicalize().map_err(|_| UNAVAILABLE)?;
             let hash = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
-            if self.path != PathBuf::from(format!(r"\\.\pipe\remodex-desktop-test-{hash}")) {
+            let expected = format!(r"\\.\pipe\remodex-desktop-test-{hash}");
+            if self.path.as_path() != Path::new(&expected) {
                 return Err(UNAVAILABLE.into());
             }
             Ok(())

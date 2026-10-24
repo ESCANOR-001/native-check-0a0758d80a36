@@ -1391,6 +1391,52 @@ fn npm_upgrade_recovers_only_its_own_interrupted_cutover_intent() {
     assert_eq!(fs::read(&path).unwrap(), b"different intent");
     assert!(!root.join("attempt-2").exists());
 }
+
+#[test]
+fn npm_replacement_start_uses_retained_selection_without_original_plan_or_export_inputs() {
+    use remodex_connect_native::npm_upgrade;
+    let (_f, root, plan, receipt) = npm_upgrade_fixture();
+    let configuration = PathBuf::from(read(&plan)["configuration"].as_str().unwrap());
+    assert!(npm_upgrade::resume_info(&root).is_err());
+    npm_upgrade::prepare(&root, &plan).unwrap();
+    // Simulate temporary launch input files being moved after the first
+    // installation. Recovery evidence retained inside the generation remains.
+    for path in [&plan, &receipt, &configuration] {
+        fs::rename(path, path.with_extension("retained-original")).unwrap();
+    }
+    let report = npm_upgrade::resume_info(&root).unwrap();
+    assert_eq!(report["resumable"], true);
+    assert_eq!(report["runtimeStarted"], false);
+    assert_eq!(report["profilesKeptInPlace"], true);
+    assert!(!root.join("attempt-2").exists());
+    let db = Connection::open(root.join("service/service.sqlite")).unwrap();
+    db.execute("UPDATE selection SET phase='started'", [])
+        .unwrap();
+    assert_eq!(npm_upgrade::resume_info(&root).unwrap(), report);
+    assert!(npm_upgrade::cancel(&root).is_err());
+}
+
+#[test]
+fn npm_replacement_start_refuses_cancelled_unfinished_or_redirected_selection() {
+    use remodex_connect_native::npm_upgrade;
+    let (_f, root, plan, _) = npm_upgrade_fixture();
+    npm_upgrade::prepare(&root, &plan).unwrap();
+    let intent = root.join("cutover.json");
+    let original = fs::read(&intent).unwrap();
+    let mut redirected = read(&intent);
+    redirected["bind"] = json!("127.0.0.1:18992");
+    write(&intent, &redirected);
+    assert!(npm_upgrade::resume_info(&root).is_err());
+    fs::write(intent, original).unwrap();
+    let db = Connection::open(root.join("npm-upgrade.sqlite")).unwrap();
+    db.execute("UPDATE upgrade SET phase='preparing'", [])
+        .unwrap();
+    assert!(npm_upgrade::resume_info(&root).is_err());
+    db.execute("UPDATE upgrade SET phase='selected'", [])
+        .unwrap();
+    npm_upgrade::cancel(&root).unwrap();
+    assert!(npm_upgrade::resume_info(&root).is_err());
+}
 #[test]
 fn automatic_export_prepares_original_identity_history_and_pairing_without_handmade_stage() {
     let (f, receipt, config) = automatic_export_fixture();

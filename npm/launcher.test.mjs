@@ -12,6 +12,9 @@ test('Upgrade runs the native coordinator only on explicit launch and keeps path
     ['--npm-upgrade', 'run', 'C:\\Users\\A B\\install', 'C:\\$(literal)\\plan.json']);
   assert.throws(() => nativeArguments(['upgrade']), /Usage/);
   assert.throws(() => nativeArguments(['upgrade', 'a', 'b', 'extra']), /Usage/);
+  assert.deepEqual(nativeArguments(['start','C:\\Users\\A B\\installation']), ['--npm-upgrade','resume','C:\\Users\\A B\\installation']);
+  assert.throws(() => nativeArguments(['start']), /Usage/);
+  assert.throws(() => nativeArguments(['start','a','b']), /Usage/);
 });
 
 test('Only qualified platforms are selected; non-glibc and unknown architectures fail clearly', () => {
