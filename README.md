@@ -25,3 +25,5 @@ readiness assertion. Invalid startup configurations preserve existing invitation
 Attachment presentation qualification: offline preparation derives bounded filename/type descriptors only from verified native evidence. Outgoing history pages count descriptors in their byte budget; source messages and file bytes are unchanged. Legacy production activation remains blocked.
 
 Offline connection rollback now preserves and verifies retained upload bundles after child-chat rollback, while refusing changed files, orphan metadata and unfinished copies. No legacy activation gate was removed.
+
+Coordinated offline rollback checks or applies all imported chats, settings and connection rows in one transaction. Interrupted or refused rollback preserves every chat; verified recovery files remain retained. Native path construction keeps Windows copied-file accounting consistent. The legacy activation barrier is unchanged.

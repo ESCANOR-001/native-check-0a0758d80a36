@@ -370,58 +370,66 @@ impl Store {
         Ok(p.report())
     }
     pub fn rollback_legacy_codex(&mut self) -> Result<Value, String> {
-        let p = Prepared::read(&self.db, true)?;
         let tx = self.db.transaction().map_err(|_| INVALID)?;
-        let (digest, data, phase): (String, String, String) = tx
-            .query_row(
-                "SELECT digest,data,phase FROM legacy_codex_import WHERE id=1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .map_err(|_| CONFLICT)?;
-        let expected = serde_json::to_string(&p.states).map_err(|_| INVALID)?;
-        if digest != p.digest || data != expected {
-            return Err(CONFLICT.into());
-        }
-        if phase == "prepared" {
-            p.verify(&tx)?;
-            for state in &p.states {
-                crate::legacy_uploads::rollback(
-                    &tx,
-                    &self.directory,
-                    state["thread"]["id"].as_str().ok_or(INVALID)?,
-                )?;
-                crate::legacy_codex_history::rollback(&tx, state)?;
-                tx.execute(
-                    "DELETE FROM chats WHERE id=?1",
-                    [state["thread"]["id"].as_str().ok_or(INVALID)?],
-                )
-                .map_err(|_| INVALID)?;
-            }
-            tx.execute(
-                "UPDATE legacy_codex_import SET phase='rolled-back' WHERE id=1",
-                [],
+        let report = rollback(&tx, &self.directory)?;
+        tx.commit().map_err(|_| INVALID)?;
+        Ok(report)
+    }
+}
+
+pub(crate) fn rollback(
+    db: &rusqlite::Connection,
+    directory: &std::path::Path,
+) -> Result<Value, String> {
+    let p = Prepared::read(db, true)?;
+    let (digest, data, phase): (String, String, String) = db
+        .query_row(
+            "SELECT digest,data,phase FROM legacy_codex_import WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|_| CONFLICT)?;
+    let expected = serde_json::to_string(&p.states).map_err(|_| INVALID)?;
+    if digest != p.digest || data != expected {
+        return Err(CONFLICT.into());
+    }
+    if phase == "prepared" {
+        p.verify(db)?;
+        for state in &p.states {
+            crate::legacy_uploads::rollback(
+                db,
+                directory,
+                state["thread"]["id"].as_str().ok_or(INVALID)?,
+            )?;
+            crate::legacy_codex_history::rollback(db, state)?;
+            db.execute(
+                "DELETE FROM chats WHERE id=?1",
+                [state["thread"]["id"].as_str().ok_or(INVALID)?],
             )
             .map_err(|_| INVALID)?;
-        } else if phase == "rolled-back" {
-            for state in &p.states {
-                let id = state["thread"]["id"].as_str().ok_or(INVALID)?;
-                let present: bool = tx
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM chats WHERE id=?1)",
-                        [id],
-                        |r| r.get(0),
-                    )
-                    .map_err(|_| CONFLICT)?;
-                if present {
-                    return Err(CONFLICT.into());
-                }
-                no_effects(&tx, id, false)?;
-            }
-        } else {
-            return Err(CONFLICT.into());
         }
-        tx.commit().map_err(|_| INVALID)?;
-        Ok(json!({"phase":"rolled-back","sourceRetained":true,"migrationComplete":false}))
+        db.execute(
+            "UPDATE legacy_codex_import SET phase='rolled-back' WHERE id=1",
+            [],
+        )
+        .map_err(|_| INVALID)?;
+    } else if phase == "rolled-back" {
+        for state in &p.states {
+            let id = state["thread"]["id"].as_str().ok_or(INVALID)?;
+            let present: bool = db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM chats WHERE id=?1)",
+                    [id],
+                    |r| r.get(0),
+                )
+                .map_err(|_| CONFLICT)?;
+            if present {
+                return Err(CONFLICT.into());
+            }
+            no_effects(db, id, false)?;
+        }
+    } else {
+        return Err(CONFLICT.into());
     }
+    Ok(json!({"phase":"rolled-back","sourceRetained":true,"migrationComplete":false}))
 }

@@ -378,67 +378,9 @@ impl Store {
     /// and receipt; retries cannot erase new messages or native side effects.
     pub fn rollback_legacy_claude(&mut self, id: &str) -> Result<Value, String> {
         let tx = self.db.transaction().map_err(|_| INVALID)?;
-        let allowed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM legacy_connection_import WHERE id=1 AND phase='prepared')",[],|r|r.get(0)).map_err(|_|CONFLICT)?;
-        if !allowed {
-            return Err(CONFLICT.into());
-        }
-        let (digest, raw, state, phase): (String, Vec<u8>, String, String) = tx
-            .query_row(
-                "SELECT digest,raw,state,phase FROM legacy_claude_import WHERE id=?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .map_err(|_| CONFLICT)?;
-        let p = Prepared::parse(&raw)?;
-        let expected_state = p.state.to_string();
-        if digest != p.hash || state != expected_state || p.state["thread"]["id"] != id {
-            return Err(CONFLICT.into());
-        }
-        verify_inactive(&tx, id)?;
-        if phase == "prepared" {
-            verify(&tx, &p, &self.directory)?;
-            crate::legacy_uploads::rollback(&tx, &self.directory, id)?;
-            crate::legacy_claude_assets::rollback(&tx, id)?;
-            crate::legacy_claude_resume::rollback(&tx, id)?;
-            crate::legacy_claude_bindings::rollback(&tx, id)?;
-            crate::legacy_claude_native::rollback(&tx, &self.directory, id)?;
-            for table in ["chat_rows", "native_checkpoints", "tool_images"] {
-                tx.execute(&format!("DELETE FROM {table} WHERE chat=?1"), [id])
-                    .map_err(|_| INVALID)?;
-            }
-            tx.execute("DELETE FROM chats WHERE id=?1", [id])
-                .map_err(|_| INVALID)?;
-            for key in &p.commands {
-                tx.execute("DELETE FROM chat_commands WHERE id=?1", [key])
-                    .map_err(|_| INVALID)?;
-            }
-            tx.execute(
-                "UPDATE legacy_claude_import SET phase='rolled-back' WHERE id=?1",
-                [id],
-            )
-            .map_err(|_| INVALID)?;
-        } else if phase == "rolled-back" {
-            let occupied:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM chats WHERE id=?1) OR EXISTS(SELECT 1 FROM chat_rows WHERE chat=?1) OR EXISTS(SELECT 1 FROM native_checkpoints WHERE chat=?1) OR EXISTS(SELECT 1 FROM tool_images WHERE chat=?1)",[id],|r|r.get(0)).map_err(|_|CONFLICT)?;
-            if occupied {
-                return Err(CONFLICT.into());
-            }
-            for key in &p.commands {
-                if tx
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM chat_commands WHERE id=?1)",
-                        [key],
-                        |r| r.get::<_, bool>(0),
-                    )
-                    .map_err(|_| CONFLICT)?
-                {
-                    return Err(CONFLICT.into());
-                }
-            }
-        } else {
-            return Err(CONFLICT.into());
-        }
+        let report = rollback(&tx, &self.directory, id)?;
         tx.commit().map_err(|_| INVALID)?;
-        Ok(json!({"phase":"rolled-back","backupRetained":true,"migrationComplete":false}))
+        Ok(report)
     }
 }
 fn verify_inactive(db: &rusqlite::Connection, id: &str) -> Result<(), String> {
@@ -558,4 +500,77 @@ fn verify(
         }
     }
     Ok(())
+}
+
+pub(crate) fn rollback(
+    db: &rusqlite::Connection,
+    directory: &std::path::Path,
+    id: &str,
+) -> Result<Value, String> {
+    let allowed: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM legacy_connection_import WHERE id=1 AND phase='prepared')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|_| CONFLICT)?;
+    if !allowed {
+        return Err(CONFLICT.into());
+    }
+    let (digest, raw, state, phase): (String, Vec<u8>, String, String) = db
+        .query_row(
+            "SELECT digest,raw,state,phase FROM legacy_claude_import WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .map_err(|_| CONFLICT)?;
+    let p = Prepared::parse(&raw)?;
+    let expected_state = p.state.to_string();
+    if digest != p.hash || state != expected_state || p.state["thread"]["id"] != id {
+        return Err(CONFLICT.into());
+    }
+    verify_inactive(db, id)?;
+    if phase == "prepared" {
+        verify(db, &p, directory)?;
+        crate::legacy_uploads::rollback(db, directory, id)?;
+        crate::legacy_claude_assets::rollback(db, id)?;
+        crate::legacy_claude_resume::rollback(db, id)?;
+        crate::legacy_claude_bindings::rollback(db, id)?;
+        crate::legacy_claude_native::rollback(db, directory, id)?;
+        for table in ["chat_rows", "native_checkpoints", "tool_images"] {
+            db.execute(&format!("DELETE FROM {table} WHERE chat=?1"), [id])
+                .map_err(|_| INVALID)?;
+        }
+        db.execute("DELETE FROM chats WHERE id=?1", [id])
+            .map_err(|_| INVALID)?;
+        for key in &p.commands {
+            db.execute("DELETE FROM chat_commands WHERE id=?1", [key])
+                .map_err(|_| INVALID)?;
+        }
+        db.execute(
+            "UPDATE legacy_claude_import SET phase='rolled-back' WHERE id=?1",
+            [id],
+        )
+        .map_err(|_| INVALID)?;
+    } else if phase == "rolled-back" {
+        let occupied:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM chats WHERE id=?1) OR EXISTS(SELECT 1 FROM chat_rows WHERE chat=?1) OR EXISTS(SELECT 1 FROM native_checkpoints WHERE chat=?1) OR EXISTS(SELECT 1 FROM tool_images WHERE chat=?1)",[id],|r|r.get(0)).map_err(|_|CONFLICT)?;
+        if occupied {
+            return Err(CONFLICT.into());
+        }
+        for key in &p.commands {
+            if db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM chat_commands WHERE id=?1)",
+                    [key],
+                    |r| r.get::<_, bool>(0),
+                )
+                .map_err(|_| CONFLICT)?
+            {
+                return Err(CONFLICT.into());
+            }
+        }
+    } else {
+        return Err(CONFLICT.into());
+    }
+    Ok(json!({"phase":"rolled-back","backupRetained":true,"migrationComplete":false}))
 }

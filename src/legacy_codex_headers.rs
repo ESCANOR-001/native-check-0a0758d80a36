@@ -181,19 +181,24 @@ impl Store {
         Ok(json!({"phase":"codex-headers-prepared","chats":rows.len(),"migrationComplete":false}))
     }
     pub fn rollback_legacy_codex_headers(&mut self) -> Result<Value, String> {
-        let (digest, root) = source(&self.db)?;
         let tx = self.db.transaction().map_err(|_| INVALID)?;
-        let (_, rows) = read(&tx, &digest, &root, true)?;
-        if rows.is_empty() {
-            return Err(INVALID.into());
-        }
-        legacy_codex::headers_can_rollback(&tx)?;
-        tx.execute(
-            "UPDATE legacy_codex_headers SET phase='rolled-back' WHERE id=1",
-            [],
-        )
-        .map_err(|_| INVALID)?;
+        let report = rollback(&tx)?;
         tx.commit().map_err(|_| INVALID)?;
-        Ok(json!({"phase":"rolled-back","sourceRetained":true,"migrationComplete":false}))
+        Ok(report)
     }
+}
+
+pub(crate) fn rollback(db: &rusqlite::Connection) -> Result<Value, String> {
+    let (digest, root) = source(db)?;
+    let (_, rows) = read(db, &digest, &root, true)?;
+    if rows.is_empty() {
+        return Err(INVALID.into());
+    }
+    legacy_codex::headers_can_rollback(db)?;
+    db.execute(
+        "UPDATE legacy_codex_headers SET phase='rolled-back' WHERE id=1",
+        [],
+    )
+    .map_err(|_| INVALID)?;
+    Ok(json!({"phase":"rolled-back","sourceRetained":true,"migrationComplete":false}))
 }

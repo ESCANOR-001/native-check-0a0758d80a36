@@ -752,8 +752,15 @@ pub(crate) fn retained_asset_rows(
             if name != RESTORED && name != RESTORE_PLAN && !name.starts_with("data/") {
                 return Err(invalid());
             }
+            // Manifest names use '/', but the storage index records paths from
+            // native directory iteration. Joining the entire name on Windows
+            // leaves mixed separators and falsely classifies valid copies as
+            // unknown assets. Build the same native path component by component.
+            let path = name
+                .split('/')
+                .fold(destination.to_path_buf(), |root, part| root.join(part));
             rows.insert(
-                destination.join(name).to_str().ok_or_else(invalid)?.into(),
+                path.to_str().ok_or_else(invalid)?.into(),
                 i64::try_from(observed.bytes).map_err(|_| invalid())?,
             );
         }
@@ -904,6 +911,21 @@ mod tests {
             fs::read_dir(destination.join("objects")).unwrap().count(),
             3
         );
+    }
+    #[test]
+    fn retained_asset_keys_use_native_separators_like_the_storage_index() {
+        let (root, source, snapshot) = fixture();
+        capture(&source, &snapshot, ENV).unwrap();
+        let destination = root.path().join("restored");
+        restore(&snapshot, &destination, ENV).unwrap();
+        let rows = retained_asset_rows(&destination, ENV).unwrap();
+        let nested = destination.join("data").join("sessions").join("chat.json");
+        assert_eq!(
+            rows.get(nested.to_str().unwrap()),
+            Some(&(fs::metadata(&nested).unwrap().len() as i64))
+        );
+        assert!(rows.contains_key(destination.join(RESTORED).to_str().unwrap()));
+        assert!(rows.contains_key(destination.join(RESTORE_PLAN).to_str().unwrap()));
     }
     #[test]
     fn restore_retains_all_original_bytes_and_empty_folders_in_a_fresh_destination() {

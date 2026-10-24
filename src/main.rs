@@ -39,6 +39,19 @@ async fn serve(
     args: Vec<String>,
     parent: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    if args.get(1).is_some_and(|a| a == "--legacy-rollback") {
+        if args.len() != 4 || !matches!(args[2].as_str(), "check" | "apply") {
+            return Err(
+                "Usage: --legacy-rollback check|apply ABSOLUTE_OFFLINE_MIGRATION_DIR".into(),
+            );
+        }
+        let report = remodex_connect_native::legacy_rollback::run(
+            &PathBuf::from(&args[3]),
+            args[2] == "apply",
+        )?;
+        println!("{report}");
+        return Ok(0);
+    }
     if args.get(1).is_some_and(|a| a == "--check-config") {
         if args.len() != 3 {
             return Err("Usage: --check-config ISOLATED_CHAT_CONFIG_JSON".into());

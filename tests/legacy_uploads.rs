@@ -881,6 +881,62 @@ fn connection_rollback_retains_verified_upload_bundles_after_chat_rollback() {
 }
 
 #[test]
+fn coordinated_rollback_preview_retains_all_history_and_apply_keeps_copied_files() {
+    for scenario in 0..3 {
+        let mut f = match scenario {
+            0 => Fixture::new("codex"),
+            1 => Fixture::new("claude"),
+            _ => Fixture::native(|_| {}),
+        };
+        f.prepare().unwrap();
+        let files = [f.path(0), f.path(1)];
+        let before = f.rows();
+        let storage = f.store.storage_status().unwrap();
+        f.store.rollback_legacy_imports(false).unwrap();
+        assert_eq!(f.rows(), before);
+        for key in ["assetBytes", "assetFiles", "historyBytes"] {
+            assert_eq!(f.store.storage_status().unwrap()[key], storage[key]);
+        }
+        f.store.rollback_legacy_imports(true).unwrap();
+        assert!(f.rows().is_empty());
+        assert!(f.store.assert_migration_ready().is_err());
+        for (i, path) in files.iter().enumerate() {
+            assert_eq!(fs::read(path).unwrap(), f.files[i].1);
+        }
+        assert_eq!(
+            f.store.storage_status().unwrap()["assetBytes"],
+            storage["assetBytes"]
+        );
+        assert!(!f.old.exists());
+    }
+}
+
+#[test]
+fn coordinated_cli_does_not_repair_a_changed_ledger_before_validating_rollback() {
+    let mut f = Fixture::native(|_| {});
+    f.prepare().unwrap();
+    f.db.execute("UPDATE storage_assets SET bytes=bytes+1", [])
+        .unwrap();
+    let rows = f.rows();
+    let storage = f.store.storage_status().unwrap();
+    for apply in [false, true] {
+        assert!(remodex_connect_native::legacy_rollback::run(f.dir.path(), apply).is_err());
+        assert_eq!(f.rows(), rows);
+        for key in ["assetBytes", "assetFiles", "historyBytes"] {
+            assert_eq!(f.store.storage_status().unwrap()[key], storage[key]);
+        }
+        assert_eq!(
+            f.db.query_row("SELECT phase FROM legacy_connection_import", [], |r| r
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+            "prepared"
+        );
+    }
+}
+
+#[test]
 fn changed_or_unclassified_retained_uploads_refuse_connection_rollback_without_clearing_state() {
     for scenario in 0..6 {
         let mut f = Fixture::native(|_| {});

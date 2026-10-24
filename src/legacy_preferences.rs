@@ -241,43 +241,48 @@ impl Store {
         Ok(p.report())
     }
     pub fn rollback_legacy_preferences(&mut self) -> Result<Value, String> {
-        let binding = connection(&self.db)?;
         let tx = self.db.transaction().map_err(|_| INVALID)?;
-        let old = receipt(&tx)?.ok_or(CONFLICT)?;
-        let p = Prepared::parse(&old.claude, &old.codex)?;
-        if old.digest != p.digest || old.connection != binding {
-            return Err(CONFLICT.into());
-        }
-        match old.phase.as_str() {
-            "prepared" => {
-                p.verify(&tx)?;
-                for key in KEYS {
-                    tx.execute("DELETE FROM metadata WHERE key=?1", [key])
-                        .map_err(|_| INVALID)?;
-                }
-                tx.execute(
-                    "UPDATE legacy_preferences_import SET phase='rolled-back' WHERE id=1",
-                    [],
-                )
-                .map_err(|_| INVALID)?;
-            }
-            "rolled-back" => {
-                for key in KEYS {
-                    let present: bool = tx
-                        .query_row(
-                            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key=?1)",
-                            [key],
-                            |r| r.get(0),
-                        )
-                        .map_err(|_| CONFLICT)?;
-                    if present {
-                        return Err(CONFLICT.into());
-                    }
-                }
-            }
-            _ => return Err(CONFLICT.into()),
-        }
+        let report = rollback(&tx)?;
         tx.commit().map_err(|_| INVALID)?;
-        Ok(json!({"phase":"rolled-back","sourceRetained":true,"migrationComplete":false}))
+        Ok(report)
     }
+}
+
+pub(crate) fn rollback(db: &rusqlite::Connection) -> Result<Value, String> {
+    let binding = connection(db)?;
+    let old = receipt(db)?.ok_or(CONFLICT)?;
+    let p = Prepared::parse(&old.claude, &old.codex)?;
+    if old.digest != p.digest || old.connection != binding {
+        return Err(CONFLICT.into());
+    }
+    match old.phase.as_str() {
+        "prepared" => {
+            p.verify(db)?;
+            for key in KEYS {
+                db.execute("DELETE FROM metadata WHERE key=?1", [key])
+                    .map_err(|_| INVALID)?;
+            }
+            db.execute(
+                "UPDATE legacy_preferences_import SET phase='rolled-back' WHERE id=1",
+                [],
+            )
+            .map_err(|_| INVALID)?;
+        }
+        "rolled-back" => {
+            for key in KEYS {
+                let present: bool = db
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM metadata WHERE key=?1)",
+                        [key],
+                        |r| r.get(0),
+                    )
+                    .map_err(|_| CONFLICT)?;
+                if present {
+                    return Err(CONFLICT.into());
+                }
+            }
+        }
+        _ => return Err(CONFLICT.into()),
+    }
+    Ok(json!({"phase":"rolled-back","sourceRetained":true,"migrationComplete":false}))
 }

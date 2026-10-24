@@ -286,47 +286,9 @@ impl Store {
     }
     pub fn rollback_legacy_connection(&mut self) -> Result<Value, String> {
         let tx = self.db.transaction().map_err(|_| INVALID)?;
-        let (phase, hash, environment, raw): (String, String, String, Vec<u8>) = tx
-            .query_row(
-                "SELECT phase,digest,environment,raw FROM legacy_connection_import WHERE id=1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .map_err(|_| INVALID)?;
-        let prepared = Prepared::parse(&raw, &environment)?;
-        if prepared.hash != hash {
-            return Err(INVALID.into());
-        }
-        if phase == "rolled-back" {
-            let occupied: bool = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM clients) OR EXISTS(SELECT 1 FROM metadata)",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(|_| INVALID)?;
-            crate::legacy_claude_assets::retained_assets(&tx, &self.directory, &environment)?;
-            if occupied || has_chats(&tx)? {
-                return Err(CONFLICT.into());
-            }
-        } else {
-            if phase != "prepared" {
-                return Err(CONFLICT.into());
-            }
-            verify(&tx, &prepared, &self.directory)?;
-            tx.execute("DELETE FROM clients", []).map_err(|_| INVALID)?;
-            tx.execute("DELETE FROM metadata", [])
-                .map_err(|_| INVALID)?;
-            tx.execute(
-                "UPDATE legacy_connection_import SET phase='rolled-back' WHERE id=1",
-                [],
-            )
-            .map_err(|_| INVALID)?;
-        }
+        let report = rollback(&tx, &self.directory)?;
         tx.commit().map_err(|_| INVALID)?;
-        Ok(
-            json!({"phase":"rolled-back","sourceUnchanged":true,"backupRetained":true,"migrationComplete":false}),
-        )
+        Ok(report)
     }
 }
 fn has_chats(db: &rusqlite::Connection) -> Result<bool, String> {
@@ -419,4 +381,50 @@ fn verify(
         }
     }
     Ok(())
+}
+
+pub(crate) fn rollback(
+    db: &rusqlite::Connection,
+    directory: &std::path::Path,
+) -> Result<Value, String> {
+    let (phase, hash, environment, raw): (String, String, String, Vec<u8>) = db
+        .query_row(
+            "SELECT phase,digest,environment,raw FROM legacy_connection_import WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .map_err(|_| INVALID)?;
+    let prepared = Prepared::parse(&raw, &environment)?;
+    if prepared.hash != hash {
+        return Err(INVALID.into());
+    }
+    if phase == "rolled-back" {
+        let occupied: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM clients) OR EXISTS(SELECT 1 FROM metadata)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|_| INVALID)?;
+        crate::legacy_claude_assets::retained_assets(db, directory, &environment)?;
+        if occupied || has_chats(db)? {
+            return Err(CONFLICT.into());
+        }
+    } else {
+        if phase != "prepared" {
+            return Err(CONFLICT.into());
+        }
+        verify(db, &prepared, directory)?;
+        db.execute("DELETE FROM clients", []).map_err(|_| INVALID)?;
+        db.execute("DELETE FROM metadata", [])
+            .map_err(|_| INVALID)?;
+        db.execute(
+            "UPDATE legacy_connection_import SET phase='rolled-back' WHERE id=1",
+            [],
+        )
+        .map_err(|_| INVALID)?;
+    }
+    Ok(
+        json!({"phase":"rolled-back","sourceUnchanged":true,"backupRetained":true,"migrationComplete":false}),
+    )
 }
