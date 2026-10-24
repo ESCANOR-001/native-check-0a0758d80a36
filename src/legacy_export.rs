@@ -151,6 +151,9 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
         .as_ref()
         .map(|path| crate::source_hold::bind(path, &original, &receipt.environment))
         .transpose()?;
+    // Preparation participates in the same source lease as service selection
+    // and recovery, so cancellation cannot race a newly prepared generation.
+    let _source_lease = hold.as_ref().map(crate::source_hold::lease).transpose()?;
     let mut ids = BTreeSet::new();
     let mut files = BTreeSet::new();
     for chat in &receipt.chats {

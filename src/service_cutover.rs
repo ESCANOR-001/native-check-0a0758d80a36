@@ -33,7 +33,7 @@ fn bytes(path: &Path) -> Result<Vec<u8>, String> {
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-fn inputs(raw: &[u8]) -> Result<(Plan, Vec<OsString>, String, Value), String> {
+fn inputs(raw: &[u8], require_hold: bool) -> Result<(Plan, Vec<OsString>, String, Value), String> {
     let mut plan: Plan = serde_json::from_slice(raw).map_err(|_| ERROR)?;
     let address: std::net::SocketAddr = plan.bind.parse().map_err(|_| ERROR)?;
     let url = reqwest::Url::parse(&plan.public_url).map_err(|_| ERROR)?;
@@ -63,7 +63,9 @@ fn inputs(raw: &[u8]) -> Result<(Plan, Vec<OsString>, String, Value), String> {
         return Err(ERROR.into());
     }
     let hold = prepared["source_hold"].clone();
-    crate::source_hold::check(&hold)?;
+    if require_hold {
+        crate::source_hold::check(&hold)?;
+    }
     let config_path = generation.join("configuration.json");
     let config = bytes(&config_path)?;
     let parsed: crate::chat::Config = serde_json::from_slice(&config).map_err(|_| ERROR)?;
@@ -141,7 +143,7 @@ impl Selection {
 }
 pub fn select(directory: &Path, plan_file: &Path) -> Result<Value, String> {
     let raw = bytes(plan_file)?;
-    let (plan, _, digest, hold) = inputs(&raw)?;
+    let (plan, _, digest, hold) = inputs(&raw, true)?;
     let selection = Selection::open(directory, true)?;
     let _source_lease = crate::source_hold::lease(&hold)?;
     if let Some((old, config, phase)) = selection.saved()? {
@@ -176,22 +178,36 @@ pub fn cancel(directory: &Path) -> Result<Value, String> {
     if phase == "started" {
         return Err("The native service may have written new work. Keep current data and use a compatible native executable; automatic legacy fallback is disabled".into());
     }
-    let (plan, _, current, hold) = inputs(&raw)?;
-    let _source_lease = crate::source_hold::lease(&hold)?;
-    crate::source_hold::claim(&hold, directory)?;
+    let (plan, _, current, hold) = inputs(&raw, phase != "cancelled")?;
+    let _source_lease = crate::source_hold::recovery_lease(&hold)?;
     if digest != current {
         return Err(ERROR.into());
     }
-    // Also catches a manual launch outside this selector.
+    if phase == "selected" {
+        crate::source_hold::claim(&hold, directory)?;
+        // Also catches a manual launch outside this selector. A failed check
+        // leaves selection and source inhibition unchanged.
+        legacy_upgrade::run(
+            "check",
+            &plan.export_root.join("generation"),
+            &plan.export_root.join("upgrade-plan.json"),
+        )?;
+        // Durable cancellation intent prevents run() while rollback/release
+        // is interrupted. Retrying cancel resumes both idempotent operations.
+        selection
+            .db
+            .execute("UPDATE selection SET phase='cancelled' WHERE id=1", [])
+            .map_err(|_| ERROR)?;
+    }
+    crate::source_hold::check_release(&hold, directory)?;
+    // Revoke the unused generation before allowing the old owner to restart.
+    // Retaining only a cancelled launcher would leave a direct native launch
+    // capable of writing to copied history alongside the old service.
     legacy_upgrade::run(
-        "check",
+        "rollback",
         &plan.export_root.join("generation"),
         &plan.export_root.join("upgrade-plan.json"),
     )?;
-    selection
-        .db
-        .execute("UPDATE selection SET phase='cancelled' WHERE id=1", [])
-        .map_err(|_| ERROR)?;
     crate::source_hold::release(&hold, directory)?;
     Ok(json!({"phase":"cancelled","sourceServiceTouched":false,"migrationComplete":false}))
 }
@@ -204,7 +220,7 @@ pub async fn run(
     if !matches!(phase.as_str(), "selected" | "started") {
         return Err(ERROR.into());
     }
-    let (_, arguments, actual, hold) = inputs(&raw)?;
+    let (_, arguments, actual, hold) = inputs(&raw, true)?;
     let _source_lease = crate::source_hold::lease(&hold)?;
     crate::source_hold::claim(&hold, directory)?;
     if expected != actual {

@@ -55,7 +55,6 @@ pub(crate) fn check(binding: &Value) -> Result<(), String> {
     Ok(())
 }
 fn selection(binding: &Value, service: &Path) -> Result<(PathBuf, Vec<u8>), String> {
-    check(binding)?;
     let root = Path::new(binding["path"].as_str().ok_or(ERROR)?)
         .parent()
         .ok_or(ERROR)?;
@@ -68,12 +67,41 @@ fn selection(binding: &Value, service: &Path) -> Result<(PathBuf, Vec<u8>), Stri
 }
 pub(crate) fn lease(binding: &Value) -> Result<crate::profile_lock::Lease, String> {
     check(binding)?;
-    let root = Path::new(binding["path"].as_str().ok_or(ERROR)?)
-        .parent()
-        .ok_or(ERROR)?;
+    let lease = recovery_lease(binding)?;
+    check(binding)?;
+    Ok(lease)
+}
+/// Cancellation must be retryable after the last unlink. This does not permit
+/// run/select: their callers still require the original intact hold.
+pub(crate) fn recovery_lease(binding: &Value) -> Result<crate::profile_lock::Lease, String> {
+    let path = Path::new(binding["path"].as_str().ok_or(ERROR)?);
+    if path.file_name().and_then(|s| s.to_str()) != Some("native-upgrade-source-hold.json")
+        || !binding["sha256"].as_str().is_some_and(|s| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    {
+        return Err(ERROR.into());
+    }
+    let root = path.parent().ok_or(ERROR)?;
+    if !root.is_absolute()
+        || root.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(ERROR.into());
+    }
+    for p in root.canonicalize().map_err(|_| ERROR)?.ancestors() {
+        storage_stage::open(p, true).map_err(|_| ERROR)?;
+    }
     crate::profile_lock::acquire(&root.join("native-upgrade-owner"))
 }
 pub(crate) fn claim(binding: &Value, service: &Path) -> Result<(), String> {
+    check(binding)?;
     let (path, bytes) = selection(binding, service)?;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -102,15 +130,38 @@ pub(crate) fn claim(binding: &Value, service: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-pub(crate) fn release(binding: &Value, service: &Path) -> Result<(), String> {
-    check(binding)?;
+fn exists(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(ERROR.into()),
+    }
+}
+pub(crate) fn check_release(binding: &Value, service: &Path) -> Result<(), String> {
+    let path = Path::new(binding["path"].as_str().ok_or(ERROR)?);
+    if exists(path)? {
+        check(binding)?;
+    }
     let (selected, expected) = selection(binding, service)?;
-    if profile_snapshot::bytes(&selected, 16384).map_err(|_| ERROR)? != expected {
+    if exists(&selected)?
+        && profile_snapshot::bytes(&selected, 16384).map_err(|_| ERROR)? != expected
+    {
         return Err(ERROR.into());
     }
-    fs::remove_file(selected).map_err(|_| ERROR)?;
+    Ok(())
+}
+pub(crate) fn release(binding: &Value, service: &Path) -> Result<(), String> {
+    // Called only after durable cancellation and verified unused-data rollback,
+    // while holding the source lease. Never erase a newer handoff's marker.
+    check_release(binding, service)?;
+    let (selected, _) = selection(binding, service)?;
+    if exists(&selected)? {
+        fs::remove_file(selected).map_err(|_| ERROR)?;
+    }
     let path = Path::new(binding["path"].as_str().ok_or(ERROR)?);
-    fs::remove_file(path).map_err(|_| ERROR)?;
+    if exists(path)? {
+        fs::remove_file(path).map_err(|_| ERROR)?;
+    }
     #[cfg(unix)]
     {
         storage_stage::open(path.parent().ok_or(ERROR)?, true)

@@ -1313,4 +1313,125 @@ fn service_selection_is_bound_exclusive_and_cancellable_only_before_native_start
         .join("native-upgrade-source-hold.json")
         .exists());
     assert!(service_cutover::select(&service, &plan).is_err());
+    assert_eq!(
+        service_cutover::cancel(&service).unwrap()["phase"],
+        "cancelled"
+    );
+    assert!(remodex_connect_native::legacy_upgrade::run(
+        "check",
+        &root.join("generation"),
+        &root.join("upgrade-plan.json")
+    )
+    .is_err());
+    assert!(Store::open(&root.join("generation/bridge/state"))
+        .unwrap()
+        .assert_migration_ready()
+        .is_err());
+    let imported =
+        Connection::open(root.join("generation/bridge/state/native-connect.sqlite")).unwrap();
+    assert_eq!(
+        imported
+            .query_row("SELECT phase FROM legacy_connection_import", [], |r| r
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+        "rolled-back"
+    );
+}
+
+#[test]
+fn cancelled_service_recovers_each_release_boundary_without_erasing_newer_handoffs() {
+    use remodex_connect_native::{legacy_export, legacy_upgrade, service_cutover};
+    for boundary in [
+        "intent",
+        "rollback",
+        "selection-removed",
+        "released",
+        "newer-hold",
+        "newer-selection",
+    ] {
+        let (f, receipt, config) = automatic_export_fixture();
+        let root = f._dir.path().join("automatic");
+        legacy_export::run(&root, &receipt, &config).unwrap();
+        let service = f._dir.path().join("service");
+        let plan = f._dir.path().join("service-plan.json");
+        write(
+            &plan,
+            &json!({"version":1,"export_root":root,"bind":"127.0.0.1:18991","public_url":"http://127.0.0.1:18991","gui":f._dir.path()}),
+        );
+        service_cutover::select(&service, &plan).unwrap();
+        Connection::open(service.join("service.sqlite"))
+            .unwrap()
+            .execute("UPDATE selection SET phase='cancelled'", [])
+            .unwrap();
+        let hold = f._dir.path().join("native-upgrade-source-hold.json");
+        let selected = f._dir.path().join("native-upgrade-selected-service.json");
+        if boundary != "intent" {
+            legacy_upgrade::run(
+                "rollback",
+                &root.join("generation"),
+                &root.join("upgrade-plan.json"),
+            )
+            .unwrap();
+        }
+        if matches!(boundary, "selection-removed" | "released" | "newer-hold") {
+            fs::remove_file(&selected).unwrap();
+        }
+        if boundary == "released" {
+            fs::remove_file(&hold).unwrap();
+        }
+        if boundary == "newer-hold" {
+            write(
+                &hold,
+                &json!({"version":1,"environment":ENV,"export":f._dir.path().join("newer")}),
+            );
+        }
+        if boundary == "newer-selection" {
+            write(&selected, &json!({"version":1,"service":"newer"}));
+        }
+        let before: Vec<_> = [&hold, &selected]
+            .iter()
+            .map(|p| fs::read(p).ok())
+            .collect();
+        if boundary.starts_with("newer") {
+            assert!(service_cutover::cancel(&service).is_err(), "{boundary}");
+            assert_eq!(
+                before,
+                [&hold, &selected]
+                    .iter()
+                    .map(|p| fs::read(p).ok())
+                    .collect::<Vec<_>>()
+            );
+        } else {
+            assert_eq!(
+                service_cutover::cancel(&service).unwrap()["phase"],
+                "cancelled",
+                "{boundary}"
+            );
+            assert!(!hold.exists() && !selected.exists());
+            assert_eq!(
+                service_cutover::cancel(&service).unwrap()["phase"],
+                "cancelled"
+            );
+            assert!(legacy_upgrade::run(
+                "prepare",
+                &root.join("generation"),
+                &root.join("upgrade-plan.json")
+            )
+            .is_err());
+        }
+        assert_eq!(
+            read(&receipt.parent().unwrap().join("codex.json"))["messages"][0]["text"],
+            "Keep original prompt"
+        );
+    }
+}
+#[test]
+fn source_lease_prevents_export_preparation_during_service_recovery() {
+    let (f, receipt, config) = automatic_export_fixture();
+    let root = f._dir.path().join("automatic");
+    let _lease = profile_lock::acquire(&f._dir.path().join("native-upgrade-owner")).unwrap();
+    assert!(remodex_connect_native::legacy_export::run(&root, &receipt, &config).is_err());
+    assert!(!root.exists());
 }
