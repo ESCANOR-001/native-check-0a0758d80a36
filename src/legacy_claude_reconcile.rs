@@ -11,6 +11,18 @@ use std::{
     time::{Duration, Instant},
 };
 const INVALID: &str = "An older Claude prompt has no unambiguous native reply-parent identity; the original history remains intact and offline";
+/// SDK replies use the API message ID; imported/remote history can use the
+/// transcript event UUID. Both are recorded native identities, never text keys.
+pub(crate) fn native_reply_ids(row: &Value) -> impl Iterator<Item = &str> {
+    [
+        row["message"]["id"].as_str(),
+        row["uuid"]
+            .as_str()
+            .filter(|id| uuid::Uuid::parse_str(id).is_ok()),
+    ]
+    .into_iter()
+    .flatten()
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Binding {
@@ -155,7 +167,7 @@ pub(crate) fn reconcile(path: &Path, source: &Value) -> Result<Vec<Binding>, Str
             }
         }
         if v["type"] == "assistant" && v["message"]["role"] == "assistant" {
-            if let Some(id) = v["message"]["id"].as_str().filter(|id| wanted.contains(id)) {
+            for id in native_reply_ids(&v).filter(|id| wanted.contains(id)) {
                 anchors
                     .entry(id.to_owned())
                     .or_default()

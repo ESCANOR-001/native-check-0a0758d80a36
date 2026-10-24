@@ -213,18 +213,22 @@ pub fn cancel(directory: &Path) -> Result<Value, String> {
 }
 /// Registration is allowed only for a selected, currently stopped owner. This
 /// is deliberately not a general-purpose service launcher or PID adoption API.
-pub(crate) fn registration(directory: &Path) -> Result<(), String> {
+pub(crate) fn registration(
+    directory: &Path,
+) -> Result<crate::profile_handoff::ProfileMode, String> {
     let selection = Selection::open(directory, false)?;
     let (raw, digest, phase) = selection.saved()?.ok_or(ERROR)?;
     if !matches!(phase.as_str(), "selected" | "started") {
         return Err(ERROR.into());
     }
-    let (_, _, current, hold) = inputs(&raw, true)?;
+    let (plan, _, current, hold) = inputs(&raw, true)?;
     let _source = crate::source_hold::lease(&hold)?;
     if digest != current {
         return Err(ERROR.into());
     }
-    crate::source_hold::claim(&hold, directory)
+    let mode = crate::profile_handoff::retained_mode(&plan.export_root.join("generation/native"))?;
+    crate::source_hold::claim(&hold, directory)?;
+    Ok(mode)
 }
 pub async fn run(
     directory: &Path,

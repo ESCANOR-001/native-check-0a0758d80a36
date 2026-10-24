@@ -9,7 +9,7 @@ Implemented here:
 - Closed-owner export: `--legacy-export ABSOLUTE_NEW_ROOT CLOSED_OWNER_JSON
   CONFIG_JSON` builds the profile snapshots, history manifest and preparation
   plans automatically. The TypeScript gateway's local lifecycle hook reserves
-  request admission, refuses unfinished/unknown/external work, captures complete
+  request admission, refuses unfinished/unknown work, captures complete
   supported histories and checks native transcript hashes after its own workers
   stop. No phone-accessible export endpoint is added. A raced transcript cannot
   produce a ready generation. Partial exports remain available for diagnosis;
@@ -39,7 +39,8 @@ Implemented here:
   release without erasing a newer selection. Source and service leases exclude
   competing preparation/selection/recovery. This is a launcher boundary, **not** OS service
   registration or replacement of the published npm entrypoint. It never stops
-  or adopts another service. Desktop-owned profiles remain outside this path.
+  or adopts another service. Codex Desktop-owned transport migration remains
+  outside this path.
 - Explicit Linux user-service registration: `--background-service prepare
   REGISTRATION_DIR CUTOVER_DIR` captures the current executable and an already
   selected, stopped generation. Then use `install`, `start`, `status` or
@@ -67,8 +68,22 @@ Implemented here:
   executable after a safe stop, reverse the registration arguments: current chat
   data and both runtime copies remain intact. This does not replace a legacy
   TypeScript service or establish compatibility with arbitrary future schemas.
-- Owned-install preparation coordinator: `--legacy-upgrade prepare|check|rollback
-  ABSOLUTE_NEW_ROOT PLAN_JSON` combines verified staging, copied native profiles,
+- Existing-profile handoff: new closed-owner exports select `profile_mode:
+  "existing"`. The original configured Codex and Claude directories remain the
+  live source of agent history; captured snapshots are recovery/evidence copies,
+  not replacement execution profiles. Preparation and first startup require
+  unchanged source data. Later restarts verify the retained snapshot and original
+  directory binding without requiring the live folder to equal an old snapshot.
+  Data rollback after startup is refused; compatible executable rollback keeps
+  current history. Older plans retain copy mode for isolated rehearsals.
+  An idle external Claude observer may migrate only with its original profile,
+  verified native transcript, shared-session identity and committed event cursor.
+  Its worker remains with the original owner; migration closes only the observer
+  connection and reattaches it after startup. Pending deliveries and missing
+  ownership evidence remain blocked. Normal agent folders are still excluded by
+  this experiment's isolation checks; this is not a shipping first-run upgrader.
+- Install preparation coordinator: `--legacy-upgrade prepare|check|rollback
+  ABSOLUTE_NEW_ROOT PLAN_JSON` combines verified staging, native-profile binding,
   activation and the atomic rollback check. The version-1 plan contains
   `environment`, `export_snapshot`, `native_plan` and `configuration` absolute
   paths (except `environment`, which is the retained environment ID).
@@ -79,7 +94,7 @@ Implemented here:
   inputs and resumes interrupted preparation. Rollback preserves recovery
   copies and refuses to discard any generation that has started handling chats.
   This command does not export or stop a running installation, change a service,
-  take over Desktop-owned sessions, or publish the candidate.
+  take over another process's worker, or publish the candidate.
 - Resumable offline export staging: `--legacy-stage ABSOLUTE_EXPORT_SNAPSHOT
   ABSOLUTE_NEW_GENERATION ENVIRONMENT_ID` imports one verified snapshot into
   `GENERATION/state`. Its version-1 `stage.json` names relative JSON files for
@@ -102,11 +117,11 @@ Implemented here:
   ISOLATED_CHAT_CONFIG_JSON` accepts only a verified staged import with a matching
   prepared native-profile generation. Every Codex/Claude chat needs native
   transcript proof; linked Claude chats also need their resume receipt and Remote Control.
-  Missing proof, shared/external ownership, changed profiles and mismatched
+  Missing proof, unsupported ownership, changed profiles and mismatched
   configuration keep the import offline. Historical Codex native items bind
   to public message IDs by native/client ID, never repeated prompt text.
   Verified historical replay preserves original rows instead of duplicating
-  bubbles. The startup receipt binds the environment and copied profiles.
+  bubbles. The startup receipt binds the environment and selected profile mode.
   Older owned Claude CLI chats without a Remote Control link can activate from
   their verified native history without inventing a shared-session ID or cursor.
   Chats that already have a shared link still require its verified resume receipt
@@ -114,8 +129,13 @@ Implemented here:
   An unused activation can be rolled back atomically; once startup is claimed,
   data rollback refuses and retains current history. Executable rollback must
   retain the same state and native generation and use a compatible build.
-  This is isolated owned-session qualification, not an automatic production
-  cutover or permission to take over Desktop-owned sessions.
+  Existing-profile service replacement additionally requires the runtime's
+  `existingProfileHandoffVersion: 1` declaration. A pre-support executable cannot
+  be selected as a rollback target merely because its storage version matches.
+  External Claude observers additionally require existing-profile mode and their
+  saved shared-event cursor; copied profiles cannot adopt their ownership.
+  This is isolated qualification, not an automatic production cutover or
+  permission to take over Desktop-owned sessions.
 - Coordinated offline rollback: `--legacy-rollback check|apply
   ABSOLUTE_OFFLINE_MIGRATION_DIR` verifies imported Claude/Codex chats, settings,
   headers, pairing and copied assets in dependency order. Check rolls back its

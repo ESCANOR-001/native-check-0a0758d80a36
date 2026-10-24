@@ -47,6 +47,7 @@ impl Fixture {
         drop(db);
         let plan = Plan {
             version: 1,
+            profile_mode: Default::default(),
             environment: environment.into(),
             codex: Input {
                 original_profile: codex,
@@ -90,6 +91,72 @@ impl Fixture {
         }
     }
 }
+#[test]
+fn existing_install_keeps_agent_paths_and_new_history_without_rebasing_or_restoring() {
+    let mut f = Fixture::new();
+    f.plan.profile_mode = profile_handoff::ProfileMode::Existing;
+    f.prepare();
+    f.prepare();
+    assert!(!f.root.join("attempt-1").exists());
+    let lease = f.activate();
+    assert!(lease.retains_original_profiles());
+    assert_eq!(
+        lease.profiles(),
+        (
+            f.plan.codex.original_profile.canonicalize().unwrap(),
+            f.plan.claude.original_profile.canonicalize().unwrap()
+        )
+    );
+    f.original_intact();
+    drop(lease);
+    let path = f
+        .plan
+        .claude
+        .original_profile
+        .join(format!("projects/fixture/{ID}.jsonl"));
+    let old = fs::read(&path).unwrap();
+    let new = [old.as_slice(), b"NEW DESKTOP MESSAGE\n"].concat();
+    fs::write(&path, &new).unwrap();
+    fs::write(
+        f.plan.codex.original_profile.join("new-native-file"),
+        b"NEW CODEX MESSAGE",
+    )
+    .unwrap();
+    let lease = f.activate();
+    assert!(lease.retains_original_profiles());
+    drop(lease);
+    assert!(profile_handoff::rollback(&f.root, ENV)
+        .unwrap_err()
+        .contains("current agent directories"));
+    assert_eq!(fs::read(path).unwrap(), new);
+    migration_snapshot::verify(&f.plan.claude.snapshot, ENV).unwrap();
+}
+
+#[test]
+fn existing_install_refuses_source_changes_before_start_and_keeps_unused_rollback_safe() {
+    let mut f = Fixture::new();
+    f.plan.profile_mode = profile_handoff::ProfileMode::Existing;
+    f.prepare();
+    let path = f
+        .plan
+        .claude
+        .original_profile
+        .join("unknown-future-metadata");
+    fs::write(&path, b"CHANGED BEFORE CUTOVER").unwrap();
+    assert!(profile_handoff::activate(
+        &f.root,
+        ENV,
+        &f.plan.codex.original_profile,
+        &f.plan.claude.original_profile
+    )
+    .is_err());
+    assert!(profile_handoff::rollback(&f.root, ENV).is_err());
+    fs::write(&path, b"KEEP_UNKNOWN").unwrap();
+    profile_handoff::rollback(&f.root, ENV).unwrap();
+    f.original_intact();
+    assert!(!f.root.join("attempt-1").exists());
+}
+
 #[test]
 fn handoff_rebases_only_copied_rollout_paths_and_keeps_all_metadata() {
     let f = Fixture::new();

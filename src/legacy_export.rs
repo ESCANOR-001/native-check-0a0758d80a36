@@ -38,6 +38,8 @@ struct Chat {
 #[serde(deny_unknown_fields)]
 struct Receipt {
     version: u32,
+    #[serde(default)]
+    profile_mode: profile_handoff::ProfileMode,
     environment: String,
     profiles: Profiles,
     source_hold: Option<PathBuf>,
@@ -281,7 +283,7 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
     json_file(&root.join("configuration.json"), &next)?;
     json_file(
         &root.join("native-plan.json"),
-        &json!({"version":1,"environment":receipt.environment,
+        &json!({"version":1,"environment":receipt.environment,"profile_mode":receipt.profile_mode,
         "codex":{"original_profile":receipt.profiles.codex,"snapshot":source.join("codex-native")},
         "claude":{"original_profile":receipt.profiles.claude,"snapshot":source.join("claude-native")}}),
     )?;

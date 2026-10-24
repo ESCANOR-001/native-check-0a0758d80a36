@@ -2,21 +2,22 @@
 //! No process is stopped or started, and no database/history snapshot is restored.
 use super::*;
 
-fn compatible(value: &Value) -> bool {
+fn compatible(value: &Value, existing_profiles: bool) -> bool {
     value["name"] == "remodex-connect-native"
         && value["runtime"] == "rust"
         && value["configurationVersion"] == 1
         && value["storageFormatVersion"] == 1
+        && (!existing_profiles || value["existingProfileHandoffVersion"] == 1)
 }
 
-async fn check_runtime(plan: &Plan) -> Result<(), String> {
+async fn check_runtime(plan: &Plan, existing_profiles: bool) -> Result<(), String> {
     verify_binary(plan)?;
     let mut command = tokio::process::Command::new(&plan.executable);
     command.arg("--version");
     let output = crate::subprocess::run(command, Duration::from_secs(10), 8192, 8192).await?;
     let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| ERROR)?;
-    if output.code != 0 || !compatible(&value) {
-        return Err("The runtime has not declared a compatible native storage format; its registration and all chat data were retained".into());
+    if output.code != 0 || !compatible(&value, existing_profiles) {
+        return Err("The runtime has not declared a compatible native storage format and profile mode; its registration and all chat data were retained".into());
     }
     verify_binary(plan)
 }
@@ -148,11 +149,12 @@ pub async fn replace(root: &Path, previous: &Path) -> Result<Value, String> {
     if fs::read_link(wants.join(&name)).map_err(|_| ERROR)? != path {
         return Err(ERROR.into());
     }
-    crate::service_cutover::registration(&next.service)?;
+    let existing_profiles = crate::service_cutover::registration(&next.service)?
+        == crate::profile_handoff::ProfileMode::Existing;
     // Exclude another native start/cancel until the replacement is durable.
     let _selected = profile_lock::acquire(&next.service)?;
-    check_runtime(&old).await?;
-    check_runtime(&next).await?;
+    check_runtime(&old, existing_profiles).await?;
+    check_runtime(&next, existing_profiles).await?;
     stopped(&status(&name).await?)?;
     switch_unit(&root, &previous, &path, &old_bytes, &new_bytes)?;
     if systemctl(&["daemon-reload"]).await?.code != 0 {
@@ -191,9 +193,10 @@ mod tests {
                 version: 2, service: dir.path().to_owned(),
                 binary_sha256: fingerprint(&executable, None).unwrap(), executable,
             };
-            assert_eq!(check_runtime(&plan).await.is_ok(), valid);
+            assert_eq!(check_runtime(&plan, false).await.is_ok(), valid);
+            assert!(check_runtime(&plan, true).await.is_err());
             fs::write(&plan.executable, b"changed").unwrap();
-            assert!(check_runtime(&plan).await.is_err());
+            assert!(check_runtime(&plan, false).await.is_err());
         }
     }
 
@@ -201,7 +204,14 @@ mod tests {
     fn unknown_and_incompatible_storage_formats_are_not_guessed() {
         let good = json!({"name":"remodex-connect-native","runtime":"rust",
             "configurationVersion":1,"storageFormatVersion":1});
-        assert!(compatible(&good));
+        assert!(compatible(&good, false));
+        assert!(!compatible(&good, true));
+        let mut existing = good.clone();
+        existing["existingProfileHandoffVersion"] = json!(1);
+        assert!(compatible(&existing, false));
+        assert!(compatible(&existing, true));
+        existing["existingProfileHandoffVersion"] = json!(2);
+        assert!(!compatible(&existing, true));
         for (key, value) in [
             ("storageFormatVersion", json!(null)),
             ("storageFormatVersion", json!(2)),
@@ -211,7 +221,7 @@ mod tests {
         ] {
             let mut bad = good.clone();
             bad[key] = value;
-            assert!(!compatible(&bad));
+            assert!(!compatible(&bad, false));
         }
     }
 

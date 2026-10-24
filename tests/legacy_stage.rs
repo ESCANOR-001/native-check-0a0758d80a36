@@ -50,6 +50,13 @@ impl Fixture {
         self.activation_config_using(None)
     }
     fn activation_config_using(&self, existing_claude: Option<PathBuf>) -> PathBuf {
+        self.activation_config_mode(existing_claude, Default::default())
+    }
+    fn activation_config_mode(
+        &self,
+        existing_claude: Option<PathBuf>,
+        profile_mode: remodex_connect_native::profile_handoff::ProfileMode,
+    ) -> PathBuf {
         use remodex_connect_native::profile_handoff::{self, Input, Plan};
         let claude = existing_claude.unwrap_or_else(|| {
             let path = self._dir.path().join("claude-profile");
@@ -65,6 +72,7 @@ impl Fixture {
             &handoff,
             &Plan {
                 version: 1,
+                profile_mode,
                 environment: ENV.into(),
                 codex: Input {
                     original_profile: codex.clone(),
@@ -865,6 +873,83 @@ fn rollback_accepts_an_alias_of_the_generation_parent_without_reindexing() {
     assert!(legacy_rollback::run(&root, false).is_err());
     assert_eq!(rows(&db), before);
     assert_eq!(assets(&db), changed);
+}
+
+#[test]
+fn external_claude_requires_original_profile_native_proof_and_committed_cursor() {
+    use remodex_connect_native::{legacy_activation, profile_handoff::ProfileMode};
+    for (mode, resume, remote) in [
+        (ProfileMode::Copy, true, true),
+        (ProfileMode::Existing, false, true),
+        (ProfileMode::Existing, true, false),
+        (ProfileMode::Existing, true, true),
+    ] {
+        let f = Fixture::new(1);
+        f.codex_native_export(|_| {});
+        let mut public = read(&f.source.join("claude-0.json"));
+        public["external"] = json!(true);
+        public["bridgeId"] = json!("cse_existing_owner_fixture");
+        public["remoteSequence"] = json!(42);
+        write(&f.source.join("claude-0.json"), &public);
+        let native = public["nativeId"].as_str().unwrap();
+        let profile = f._dir.path().join("claude-export");
+        fs::create_dir_all(profile.join("projects/fixture")).unwrap();
+        let transcript = format!("projects/fixture/{native}.jsonl");
+        let user = json!({"type":"user","uuid":PROMPT,"sessionId":native,"parentUuid":null,"message":{"role":"user","content":public["thread"]["messages"][0]["text"]}});
+        let reply = json!({"type":"assistant","uuid":"00000000-0000-4000-8000-000000000002","sessionId":native,"parentUuid":PROMPT,"message":{"id":"reply","role":"assistant","content":[{"type":"text","text":"Keep reply"}]}});
+        let original = format!("{user}\n{reply}\n");
+        fs::write(profile.join(&transcript), &original).unwrap();
+        migration_snapshot::capture(&profile, &f.source.join("native"), ENV).unwrap();
+        let mut stage = read(&f.source.join("stage.json"));
+        stage["claude"][0]["native"] = json!({"snapshot":"native","transcript":transcript});
+        stage["claude"][0]["resume"] = json!(resume);
+        write(&f.source.join("stage.json"), &stage);
+        f.capture();
+        f.run().unwrap();
+        let config = f.activation_config_mode(Some(profile.clone()), mode);
+        let mut value = read(&config);
+        value["claude"]["remote_control"] = json!(remote);
+        write(&config, &value);
+        let before = rows(&f.db());
+        let result = legacy_activation::run(&f.generation.join("state"), &config);
+        assert_eq!(
+            result.is_ok(),
+            mode == ProfileMode::Existing && resume && remote,
+            "{result:?}"
+        );
+        assert_eq!(rows(&f.db()), before);
+        assert_eq!(
+            fs::read_to_string(profile.join(&transcript)).unwrap(),
+            original
+        );
+        let db = f.db();
+        let state: Value = serde_json::from_str(
+            &db.query_row("SELECT data FROM chats WHERE id='claude-0'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state["external_claude"], true);
+        assert_eq!(state["thread"]["session"]["statusConfidence"], "unknown");
+        if resume {
+            let cursor: Value = serde_json::from_str(
+                &db.query_row(
+                    "SELECT cursor FROM native_sync WHERE chat='claude-0'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(cursor["sequence"], 42);
+        }
+        legacy_rollback::run(&f.generation.join("state"), true).unwrap();
+        assert_eq!(
+            fs::read_to_string(profile.join(&transcript)).unwrap(),
+            original
+        );
+    }
 }
 
 #[test]

@@ -52,6 +52,7 @@ describe('source-owner native upgrade export', () => {
           const result = await exportOwnedUpgrade(output, { codex, claude }, owner);
           expect(result.chats).toBe(1);
           const receipt = JSON.parse(await readFile(result.receipt, 'utf8'));
+          expect(receipt.profile_mode).toBe('existing');
           expect(receipt.chats[0].transcript).toBe('rollout.jsonl');
           expect(receipt.chats[0].sha256).toHaveLength(64);
           expect(stopped).toBe(true); expect(released).toBe(false);

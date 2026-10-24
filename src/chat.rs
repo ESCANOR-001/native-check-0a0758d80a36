@@ -267,9 +267,6 @@ impl Chats {
                 })
                 .await?
                 .map_err(|_| "Cannot verify native profile ownership")?;
-            if external {
-                return Err("Externally owned Claude chats must remain with their original profile; automatic profile handoff was refused".into());
-            }
             let environment = db
                 .call(|a| a.store.environment_id())
                 .await?
@@ -281,6 +278,9 @@ impl Chats {
             })
             .await
             .map_err(|_| "Native profile handoff check failed")??;
+            if external && !session.retains_original_profiles() {
+                return Err("Externally owned Claude chats must remain with their original profile; automatic profile handoff was refused".into());
+            }
             let migration_config = config.clone();
             db.call(move |a| a.store.complete_migration_activation(&migration_config))
                 .await??;

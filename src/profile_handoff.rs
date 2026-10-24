@@ -62,8 +62,24 @@ pub struct Input {
 pub struct Plan {
     pub version: u32,
     pub environment: String,
+    /// Existing installations retain their agent directories. Copy mode is
+    /// retained for isolated rehearsals and already prepared generations.
+    #[serde(default, skip_serializing_if = "ProfileMode::is_copy")]
+    pub profile_mode: ProfileMode,
     pub codex: Input,
     pub claude: Input,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProfileMode {
+    #[default]
+    Copy,
+    Existing,
+}
+impl ProfileMode {
+    fn is_copy(&self) -> bool {
+        *self == Self::Copy
+    }
 }
 struct Journal {
     db: Connection,
@@ -75,10 +91,17 @@ struct Journal {
 pub struct Session {
     root: PathBuf,
     attempt: u32,
+    existing: Option<(PathBuf, PathBuf)>,
     _lease: profile_lock::Lease,
 }
 impl Session {
+    pub fn retains_original_profiles(&self) -> bool {
+        self.existing.is_some()
+    }
     pub fn profiles(&self) -> (PathBuf, PathBuf) {
+        if let Some(paths) = &self.existing {
+            return paths.clone();
+        }
         (
             self.root
                 .join(format!("attempt-{}", self.attempt))
@@ -254,6 +277,9 @@ impl Journal {
         Ok(())
     }
     fn verify_sources(&self, plan: &Plan) -> Result<()> {
+        self.verify_sources_at(plan, false)
+    }
+    fn verify_sources_at(&self, plan: &Plan, running_existing: bool) -> Result<()> {
         validate(plan, &self.root)?;
         let hashes: (String, String) = self
             .db
@@ -267,12 +293,21 @@ impl Journal {
             if snapshot_hash(&input.snapshot, &plan.environment)? != expected {
                 return Err(ERROR.into());
             }
+            // Once an existing installation has started, its original agent
+            // folders are the live data. Never require or restore an old tree.
+            // Snapshot hashes and canonical directory bindings still apply.
+            if running_existing {
+                continue;
+            }
             migration_snapshot::verify_tree(&input.snapshot, &input.original_profile, &plan.environment)
                 .map_err(|_| "The original native profile changed after export. Handoff was stopped to avoid losing or splitting history; both copies are intact".to_owned())?;
         }
         Ok(())
     }
     fn unchanged(&self, plan: &Plan) -> Result<()> {
+        if plan.profile_mode == ProfileMode::Existing {
+            return self.verify_sources(plan);
+        }
         for agent in ["codex", "claude"] {
             migration_snapshot::verify_tree(
                 &self.baseline(agent),
@@ -297,6 +332,11 @@ fn validate(plan: &Plan, root: &Path) -> Result<()> {
     }
     for input in [&plan.codex, &plan.claude] {
         isolated(&input.original_profile)?;
+        if plan.profile_mode == ProfileMode::Existing
+            && input.original_profile.canonicalize().map_err(|_| ERROR)? != input.original_profile
+        {
+            return Err(ERROR.into());
+        }
         storage_stage::open(&input.snapshot, true).map_err(|_| ERROR)?;
         ordinary_parents(&input.snapshot.canonicalize().map_err(|_| ERROR)?)?;
         for path in [&input.original_profile, &input.snapshot] {
@@ -312,9 +352,23 @@ fn validate(plan: &Plan, root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Create resumable working copies from already exported snapshots. Originals
-/// stay untouched. Changed or foreign partial copies block retry, never vanish.
+/// Bind original profiles, or create working copies for a copy-mode rehearsal.
+/// Preparation never changes originals; failed partial copies are retained.
 pub fn prepare(root: &Path, plan: &Plan) -> Result<Value> {
+    let mut canonical = plan.clone();
+    if canonical.profile_mode == ProfileMode::Existing {
+        canonical.codex.original_profile = plan
+            .codex
+            .original_profile
+            .canonicalize()
+            .map_err(|_| ERROR)?;
+        canonical.claude.original_profile = plan
+            .claude
+            .original_profile
+            .canonicalize()
+            .map_err(|_| ERROR)?;
+    }
+    let plan = &canonical;
     absolute(root)?;
     validate(
         plan,
@@ -362,6 +416,11 @@ pub fn prepare(root: &Path, plan: &Plan) -> Result<Value> {
             journal.unchanged(plan)?;
             return Ok(summary("prepared"));
         }
+    }
+    if plan.profile_mode == ProfileMode::Existing {
+        journal.verify_sources(plan)?;
+        journal.transition("copying", "prepared")?;
+        return Ok(summary("prepared"));
     }
     // Interrupted attempts remain intact. A fresh numbered copy avoids trusting
     // a half-rebased database or an incomplete checkpoint after power loss.
@@ -450,14 +509,27 @@ pub fn activate(root: &Path, environment: &str, codex: &Path, claude: &Path) -> 
     let journal = Journal::open(root, false)?;
     let (plan, phase) = journal.saved()?;
     if plan.environment != environment
-        || plan.codex.original_profile != codex
-        || plan.claude.original_profile != claude
+        || plan.codex.original_profile
+            != if plan.profile_mode == ProfileMode::Existing {
+                codex.canonicalize().map_err(|_| ERROR)?
+            } else {
+                codex.to_owned()
+            }
+        || plan.claude.original_profile
+            != if plan.profile_mode == ProfileMode::Existing {
+                claude.canonicalize().map_err(|_| ERROR)?
+            } else {
+                claude.to_owned()
+            }
     {
         return Err(
             "Native handoff does not belong to this connection or agent configuration".into(),
         );
     }
-    journal.verify_sources(&plan)?;
+    journal.verify_sources_at(
+        &plan,
+        phase == "active" && plan.profile_mode == ProfileMode::Existing,
+    )?;
     match phase.as_str() {
         "prepared" => {
             journal.unchanged(&plan)?;
@@ -466,8 +538,10 @@ pub fn activate(root: &Path, environment: &str, codex: &Path, claude: &Path) -> 
         "active" => {
             // Mutable profiles are expected to gain messages and refreshed
             // credentials. Never replace them from an old snapshot on restart.
-            for agent in ["codex", "claude"] {
-                ordinary_parents(&journal.data(agent))?;
+            if plan.profile_mode == ProfileMode::Copy {
+                for agent in ["codex", "claude"] {
+                    ordinary_parents(&journal.data(agent))?;
+                }
             }
         }
         _ => return Err("Native profile handoff is not ready to start".into()),
@@ -475,8 +549,28 @@ pub fn activate(root: &Path, environment: &str, codex: &Path, claude: &Path) -> 
     Ok(Session {
         root: journal.root,
         attempt: journal.attempt,
+        existing: (plan.profile_mode == ProfileMode::Existing).then(|| {
+            (
+                plan.codex.original_profile.clone(),
+                plan.claude.original_profile.clone(),
+            )
+        }),
         _lease: journal._lease,
     })
+}
+
+/// Check a stopped generation before selecting a replacement executable.
+pub(crate) fn retained_mode(root: &Path) -> Result<ProfileMode> {
+    let journal = Journal::open(root, false)?;
+    let (plan, phase) = journal.saved()?;
+    if !matches!(phase.as_str(), "prepared" | "active") {
+        return Err(ERROR.into());
+    }
+    journal.verify_sources_at(
+        &plan,
+        phase == "active" && plan.profile_mode == ProfileMode::Existing,
+    )?;
+    Ok(plan.profile_mode)
 }
 
 /// Hold a prepared generation while the offline migration verifies its native
@@ -491,8 +585,18 @@ pub(crate) fn inspect_prepared(
     let (plan, phase) = journal.saved()?;
     if phase != "prepared"
         || plan.environment != environment
-        || plan.codex.original_profile != codex
-        || plan.claude.original_profile != claude
+        || plan.codex.original_profile
+            != if plan.profile_mode == ProfileMode::Existing {
+                codex.canonicalize().map_err(|_| ERROR)?
+            } else {
+                codex.to_owned()
+            }
+        || plan.claude.original_profile
+            != if plan.profile_mode == ProfileMode::Existing {
+                claude.canonicalize().map_err(|_| ERROR)?
+            } else {
+                claude.to_owned()
+            }
     {
         return Err(ERROR.into());
     }
@@ -501,6 +605,12 @@ pub(crate) fn inspect_prepared(
     Ok(Session {
         root: journal.root,
         attempt: journal.attempt,
+        existing: (plan.profile_mode == ProfileMode::Existing).then(|| {
+            (
+                plan.codex.original_profile.clone(),
+                plan.claude.original_profile.clone(),
+            )
+        }),
         _lease: journal._lease,
     })
 }
@@ -519,6 +629,9 @@ pub fn rollback(root: &Path, environment: &str) -> Result<Value> {
     }
     if !matches!(phase.as_str(), "prepared" | "active") {
         return Err(ERROR.into());
+    }
+    if phase == "active" && plan.profile_mode == ProfileMode::Existing {
+        return Err("This existing installation has started. Keep its current agent directories when rolling back the executable; no old data was restored.".into());
     }
     journal.unchanged(&plan).map_err(|_| "This generation contains new or changed data. Automatic data rollback was refused; keep its native profiles when rolling back the executable. All histories and recovery copies remain intact.".to_owned())?;
     journal.transition(&phase, "rolled-back")?;

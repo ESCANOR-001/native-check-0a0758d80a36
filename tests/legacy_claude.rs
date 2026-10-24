@@ -1194,6 +1194,63 @@ fn trimmed_delivery_ledger_recovers_prompt_id_from_native_reply_parents_not_text
     }
 }
 #[test]
+fn external_reply_event_uuid_preserves_history_and_reconciles_its_prompt_by_parent() {
+    const REPLY: &str = "00000000-0000-4000-8000-000000000028";
+    for case in 0..4 {
+        let (dir, mut store, db) = setup();
+        let mut value = source(dir.path());
+        value["external"] = json!(true);
+        value["thread"]["messages"][1]["id"] = json!(REPLY);
+        let original = raw(&value);
+        store.prepare_legacy_claude(&original).unwrap();
+        let before = store.load_chat("original-android-chat").unwrap();
+        let export = native_export(|rows, _| match case {
+            1 => rows[1]["uuid"] = json!("00000000-0000-4000-8000-000000000029"),
+            2 => rows[1]["isSidechain"] = json!(true),
+            3 => rows[1]["parentUuid"] = Value::Null,
+            _ => {}
+        });
+        let result = store.prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        );
+        if case == 0 {
+            let report = result.unwrap();
+            assert_eq!(report["replies"], 1);
+            assert_eq!(report["reconciledPromptIds"], 1);
+            let binding = store
+                .claude_input("original-android-chat", NATIVE, INPUT_NATIVE)
+                .unwrap()
+                .unwrap();
+            assert_eq!(binding.input.message, "user-message");
+            drop(store);
+            store = Store::open(dir.path()).unwrap();
+            assert_eq!(
+                store
+                    .prepare_legacy_claude_native(
+                        "original-android-chat",
+                        &export.snapshot,
+                        &export.transcript,
+                    )
+                    .unwrap(),
+                report
+            );
+        } else {
+            assert!(
+                result.is_err(),
+                "case {case} must not guess from identical reply text"
+            );
+        }
+        assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+        assert_eq!(count(&db, "claude_outbox"), 0);
+        assert_eq!(
+            std::fs::read(export.root.path().join("export").join(&export.transcript)).unwrap(),
+            export.original
+        );
+    }
+}
+#[test]
 fn ambiguous_missing_or_changed_native_prompt_ancestry_never_guesses_an_alias() {
     for case in 0..7 {
         let (dir, mut store, db) = setup();

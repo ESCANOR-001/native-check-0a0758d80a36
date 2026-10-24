@@ -211,7 +211,7 @@ async fn serve(
     if args.len() == 2 && args[1] == "--version" {
         println!(
             "{}",
-            serde_json::json!({"name":"remodex-connect-native","version":env!("CARGO_PKG_VERSION"),"runtime":"rust","configurationVersion":1,"storageFormatVersion":1,"migrationComplete":false})
+            serde_json::json!({"name":"remodex-connect-native","version":env!("CARGO_PKG_VERSION"),"runtime":"rust","configurationVersion":1,"storageFormatVersion":1,"existingProfileHandoffVersion":1,"migrationComplete":false})
         );
         return Ok(0);
     }

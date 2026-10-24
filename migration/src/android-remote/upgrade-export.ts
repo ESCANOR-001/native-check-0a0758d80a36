@@ -190,7 +190,7 @@ export async function exportOwnedUpgrade(
     }
     const receipt = resolve(target, 'closed-owner.json');
     publishing = true;
-    await writePrivate(receipt, { version: 1, environment: owner.environment, source_hold: hold?.path, profiles, chats: chats.map(({ bytes, ...chat }) => chat),
+    await writePrivate(receipt, { version: 1, profile_mode: 'existing', environment: owner.environment, source_hold: hold?.path, profiles, chats: chats.map(({ bytes, ...chat }) => chat),
       connection: 'connection.json', codex_projects: 'codex-projects.json', claude_settings: 'claude-settings.json' });
     if (process.platform !== 'win32') {
       const dir = await open(target, 'r'); try { await dir.sync(); } finally { await dir.close(); }

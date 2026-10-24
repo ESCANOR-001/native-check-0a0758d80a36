@@ -187,8 +187,7 @@ impl Store {
                 Some("claude") => "legacy_claude_native",
                 _ => return Err(ERROR.into()),
             };
-            if value["external_claude"] == true
-                || !value["thread"]["session"]["activeTurnId"].is_null()
+            if !value["thread"]["session"]["activeTurnId"].is_null()
                 || value["queue"].as_array().is_none_or(|q| !q.is_empty())
                 || (!value["thread"]["latestTurn"].is_null()
                     && !matches!(
@@ -210,8 +209,11 @@ impl Store {
             if !known {
                 return Err(ERROR.into());
             }
-            value["thread"]["session"]["status"] = json!("ready");
-            value["thread"]["session"]["statusConfidence"] = json!("confirmed");
+            let external = value["external_claude"] == true;
+            value["thread"]["session"]["status"] =
+                json!(if external { "disconnected" } else { "ready" });
+            value["thread"]["session"]["statusConfidence"] =
+                json!(if external { "unknown" } else { "confirmed" });
             tx.execute(
                 "UPDATE chats SET data=?1 WHERE id=?2",
                 params![value.to_string(), id],
@@ -304,7 +306,8 @@ pub fn run(directory: &Path, config_path: &Path) -> Result<Value, String> {
     }
     for (id, agent, raw) in &chats {
         let chat: Value = serde_json::from_str(raw).map_err(|_| ERROR)?;
-        if chat["external_claude"] == true || chat["thread"]["session"]["activeTurnId"].is_string()
+        if (chat["external_claude"] == true && !session.retains_original_profiles())
+            || chat["thread"]["session"]["activeTurnId"].is_string()
         {
             return Err(ERROR.into());
         }
@@ -320,6 +323,9 @@ pub fn run(directory: &Path, config_path: &Path) -> Result<Value, String> {
             // Their complete native export is sufficient for owned resumption;
             // do not invent a relay identity or cursor just to activate them.
             let linked = !chat["remote_identity"].is_null();
+            if chat["external_claude"] == true && !linked {
+                return Err(ERROR.into());
+            }
             if (linked && (!resumed || !config.claude.remote_control)) || (!linked && resumed) {
                 return Err(ERROR.into());
             }

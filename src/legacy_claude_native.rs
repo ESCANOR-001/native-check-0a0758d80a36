@@ -106,9 +106,6 @@ fn required(
 }
 fn inspect(data: &Path, relative: &str, raw: &[u8]) -> Result<Report, String> {
     let source: Value = serde_json::from_slice(raw).map_err(|_| INVALID)?;
-    if source["external"] == true {
-        return Err("Externally owned Claude history must remain with its owner".into());
-    }
     let native = source["nativeId"].as_str().ok_or(INVALID)?;
     uuid::Uuid::parse_str(native).map_err(|_| INVALID)?;
     relative_path(relative, native)?;
@@ -171,7 +168,7 @@ fn inspect(data: &Path, relative: &str, raw: &[u8]) -> Result<Report, String> {
             }
         }
         if v["type"] == "assistant" && v["message"]["role"] == "assistant" {
-            if let Some(id) = v["message"]["id"].as_str() {
+            for id in crate::legacy_claude_reconcile::native_reply_ids(&v) {
                 replies.remove(id);
             }
         }
@@ -358,9 +355,6 @@ impl Store {
         crate::legacy_claude_bindings::validate(&prepared.source)?;
         let native = prepared.state["native_id"].as_str().ok_or(INVALID)?;
         relative_path(transcript, native)?;
-        if prepared.state["external_claude"] == true {
-            return Err("Externally owned Claude history must remain with its owner".into());
-        }
         let environment = self.environment_id().map_err(|_| INVALID)?;
         let summary = migration_snapshot::verify(snapshot, &environment).map_err(|_| INVALID)?;
         let bundle = fingerprint(&snapshot.join("snapshot.json"))?;
