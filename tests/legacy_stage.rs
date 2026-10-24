@@ -1362,7 +1362,8 @@ fn background_registration_requires_the_selected_idle_generation() {
     );
     service_cutover::select(&service, &plan).unwrap();
     let registration = f._dir.path().join("registration");
-    let executable = std::env::current_exe().unwrap();
+    let executable = f._dir.path().join("package-runtime");
+    fs::write(&executable, b"SYNTHETIC PACKAGE RUNTIME").unwrap();
     let lease = profile_lock::acquire(&service).unwrap();
     assert!(service_registration::prepare(&registration, &service, &executable).is_err());
     assert!(!registration.exists());
@@ -1376,6 +1377,12 @@ fn background_registration_requires_the_selected_idle_generation() {
         read(&registration.join("registration.json"))["service"],
         json!(service.canonicalize().unwrap())
     );
+    let registered = read(&registration.join("registration.json"));
+    assert_eq!(registered["version"], 2);
+    let pinned = PathBuf::from(registered["executable"].as_str().unwrap());
+    assert!(pinned.starts_with(registration.canonicalize().unwrap()));
+    fs::write(&executable, b"UPDATED PACKAGE RUNTIME").unwrap();
+    assert_eq!(fs::read(&pinned).unwrap(), b"SYNTHETIC PACKAGE RUNTIME");
     assert!(service_registration::prepare(&registration, &service, &executable).is_err());
     service_cutover::cancel(&service).unwrap();
     let other = f._dir.path().join("cancelled-registration");

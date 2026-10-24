@@ -6,9 +6,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const ERROR: &str = "Background registration is unavailable or changed; existing services and chat data were retained";
@@ -18,6 +18,81 @@ struct Plan {
     version: u32,
     service: PathBuf,
     executable: PathBuf,
+    binary_sha256: String,
+}
+
+fn binary_name() -> &'static str {
+    if cfg!(windows) {
+        "runtime.exe"
+    } else {
+        "runtime"
+    }
+}
+fn fingerprint(path: &Path, destination: Option<&Path>) -> Result<String, String> {
+    let (mut input, before) = profile_snapshot::open(path, 128 * 1024 * 1024).map_err(|_| ERROR)?;
+    if before.len() == 0 {
+        return Err(ERROR.into());
+    }
+    let identity = storage_stage::identity(&input).map_err(|_| ERROR)?;
+    let mut output = if let Some(path) = destination {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o700);
+        }
+        Some(options.open(path).map_err(|_| ERROR)?)
+    } else {
+        None
+    };
+    let mut hash = Sha256::new();
+    let mut bytes = 0;
+    let mut buffer = [0u8; 65536];
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(ERROR.into());
+        }
+        let n = input.read(&mut buffer).map_err(|_| ERROR)?;
+        if n == 0 {
+            break;
+        }
+        bytes += n as u64;
+        if bytes > before.len() {
+            return Err(ERROR.into());
+        }
+        hash.update(&buffer[..n]);
+        if let Some(file) = output.as_mut() {
+            file.write_all(&buffer[..n]).map_err(|_| ERROR)?;
+        }
+    }
+    let named = storage_stage::open(path, false).map_err(|_| ERROR)?;
+    for file in [&input, &named] {
+        let after = file.metadata().map_err(|_| ERROR)?;
+        if storage_stage::identity(file).map_err(|_| ERROR)? != identity
+            || after.len() != bytes
+            || before.modified().map_err(|_| ERROR)? != after.modified().map_err(|_| ERROR)?
+        {
+            return Err(ERROR.into());
+        }
+    }
+    if bytes != before.len() {
+        return Err(ERROR.into());
+    }
+    if let Some(file) = output {
+        file.sync_all().map_err(|_| ERROR)?;
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+fn verify_binary(plan: &Plan) -> Result<(), String> {
+    let file = storage_stage::open(&plan.executable, false).map_err(|_| ERROR)?;
+    if storage_stage::links(&file).map_err(|_| ERROR)? != 1
+        || fingerprint(&plan.executable, None)? != plan.binary_sha256
+    {
+        return Err(ERROR.into());
+    }
+    Ok(())
 }
 
 fn canonical(path: &Path, directory: bool) -> Result<PathBuf, String> {
@@ -88,9 +163,15 @@ fn read_plan(root: &Path) -> Result<Plan, String> {
     canonical(root, true)?;
     let raw = profile_snapshot::bytes(&root.join("registration.json"), 16384).map_err(|_| ERROR)?;
     let plan: Plan = serde_json::from_slice(&raw).map_err(|_| ERROR)?;
-    if plan.version != 1
+    if plan.version != 2
         || canonical(&plan.service, true)? != plan.service
-        || canonical(&plan.executable, false)? != plan.executable
+        || plan.executable != canonical(root, true)?.join(binary_name())
+        || !plan
+            .binary_sha256
+            .as_bytes()
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+        || plan.binary_sha256.len() != 64
     {
         return Err(ERROR.into());
     }
@@ -117,13 +198,20 @@ pub fn prepare(root: &Path, service: &Path, executable: &Path) -> Result<Value, 
     if root.starts_with(&service) || service.starts_with(&root) {
         return Err(ERROR.into());
     }
-    let plan = Plan {
-        version: 1,
-        service,
-        executable,
-    };
-    let bytes = unit(&plan)?;
+    // A package update/uninstall must not replace the service's live runtime.
+    // Copy with bounded memory into a private, versioned registration instead.
+    quoted(executable.to_str().ok_or(ERROR)?)?;
     crate::private_directory::prepare(&root).map_err(|_| ERROR)?;
+    let pinned = root.join(binary_name());
+    let binary_sha256 = fingerprint(&executable, Some(&pinned))?;
+    let plan = Plan {
+        version: 2,
+        service,
+        executable: pinned,
+        binary_sha256,
+    };
+    verify_binary(&plan)?;
+    let bytes = unit(&plan)?;
     private_new(
         &root.join("registration.json"),
         &serde_json::to_vec(&plan).map_err(|_| ERROR)?,
@@ -235,7 +323,7 @@ pub async fn run(operation: &str, root: &Path) -> Result<Value, String> {
     }
     if operation == "status" {
         return Ok(
-            json!({"registered":exists,"unit":unit_name,"state":state.get("ActiveState"),"pid":state.get("MainPID")}),
+            json!({"registered":exists,"unit":unit_name,"state":state.get("ActiveState"),"pid":state.get("MainPID"),"runtimeVerified":verify_binary(&plan).is_ok()}),
         );
     }
     stopped(&state)?;
@@ -267,6 +355,7 @@ pub async fn run(operation: &str, root: &Path) -> Result<Value, String> {
         }
         return Ok(json!({"phase":"uninstalled","historyRetained":true,"serviceStopped":false}));
     }
+    verify_binary(&plan)?;
     crate::service_cutover::registration(&plan.service)?;
     if operation == "install" {
         if !exists {
@@ -311,6 +400,48 @@ pub async fn run(operation: &str, root: &Path) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pinned_runtime_survives_package_replacement_and_detects_changed_copies() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let source = root.join("package-executable");
+        fs::write(&source, b"original binary").unwrap();
+        let private = root.join("registration");
+        fs::create_dir(&private).unwrap();
+        let executable = private.join(binary_name());
+        let digest = fingerprint(&source, Some(&executable)).unwrap();
+        let service = root.join("service");
+        fs::create_dir(&service).unwrap();
+        let plan = Plan {
+            version: 2,
+            service,
+            executable,
+            binary_sha256: digest,
+        };
+        private_new(
+            &private.join("registration.json"),
+            &serde_json::to_vec(&plan).unwrap(),
+        )
+        .unwrap();
+        assert!(fingerprint(&source, Some(&plan.executable)).is_err());
+        fs::write(&source, b"replacement").unwrap();
+        fs::remove_file(&source).unwrap();
+        verify_binary(&read_plan(&private).unwrap()).unwrap();
+        fs::write(&plan.executable, b"changed! binary").unwrap();
+        assert!(verify_binary(&plan).is_err());
+        // A stopped, exactly owned registration remains removable when its
+        // executable is missing/corrupt; removing it never deletes the data.
+        fs::remove_file(&plan.executable).unwrap();
+        assert!(read_plan(&private).is_ok());
+        assert!(verify_binary(&plan).is_err());
+        let huge = root.join("oversized-package");
+        fs::File::create(&huge)
+            .unwrap()
+            .set_len(128 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(fingerprint(&huge, Some(&plan.executable)).is_err());
+        assert!(!plan.executable.exists());
+    }
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn systemd_parser_accepts_literal_paths_with_spaces_and_specifiers() {
@@ -320,9 +451,10 @@ mod tests {
         fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let plan = Plan {
-            version: 1,
+            version: 2,
             executable,
             service: root.path().join("service $USER %h with spaces"),
+            binary_sha256: "test-only".into(),
         };
         let path = root.path().join(name(&plan.service).unwrap());
         private_new(&path, &unit(&plan).unwrap()).unwrap();
@@ -339,9 +471,10 @@ mod tests {
     #[test]
     fn systemd_arguments_are_literal_and_have_no_implicit_shell() {
         let plan = Plan {
-            version: 1,
+            version: 2,
             service: PathBuf::from("/tmp/a $x %h \\\" service"),
             executable: PathBuf::from("/tmp/a $x %h \\\" binary"),
+            binary_sha256: "test-only".into(),
         };
         let text = String::from_utf8(unit(&plan).unwrap()).unwrap();
         assert!(text.contains("ExecStart=:\"/tmp/a $x %%h \\\\\\\" binary\" --service-cutover run"));
