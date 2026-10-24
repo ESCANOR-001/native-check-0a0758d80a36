@@ -51,7 +51,16 @@ async fn bun_owner_retires_and_rust_recovers_the_exact_durable_plan() {
     )
     .await
     .unwrap()
-    .unwrap();
+    .unwrap_or_else(|error| {
+        // Synthetic fixture diagnostics only: never log the bearer descriptor.
+        let directory = descriptor.parent().unwrap();
+        panic!(
+            "{error}; attempt={}, plan={}, closedOwner={}",
+            directory.join("attempt.json").exists(),
+            directory.join("npm-plan.json").exists(),
+            directory.join("export/closed-owner.json").exists()
+        );
+    });
     let exit = tokio::time::timeout(Duration::from_secs(5), child.wait())
         .await
         .expect("The old source must release its last listener after publication")

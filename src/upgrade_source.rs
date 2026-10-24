@@ -143,11 +143,13 @@ async fn acquire_for(
     descriptor: &Path,
     deadline: Duration,
 ) -> Result<PathBuf, String> {
-    let source = load(root, descriptor)?;
+    let source = load(root, descriptor).map_err(|e| format!("{e} (source descriptor)"))?;
     let directory = descriptor.parent().ok_or(ERROR)?;
     // Once the owner published its plan, it may have exited. Read the immutable
     // receipt directly, without needing its old TCP port or issuing another POST.
-    if let Some(plan) = completed(&source, directory)? {
+    if let Some(plan) =
+        completed(&source, directory).map_err(|e| format!("{e} (published receipt)"))?
+    {
         return Ok(plan);
     }
     let client = reqwest::Client::builder()
@@ -160,7 +162,9 @@ async fn acquire_for(
     let until = tokio::time::Instant::now() + deadline;
     let mut started = false;
     loop {
-        if let Some(plan) = completed(&source, directory)? {
+        if let Some(plan) =
+            completed(&source, directory).map_err(|e| format!("{e} (published receipt)"))?
+        {
             return Ok(plan);
         }
         let method = if started {
@@ -177,7 +181,9 @@ async fn acquire_for(
             .await;
         if let Ok(mut response) = response {
             if response.status() != reqwest::StatusCode::OK {
-                return completed(&source, directory)?.ok_or_else(|| ERROR.into());
+                return completed(&source, directory)
+                    .map_err(|e| format!("{e} (published receipt)"))?
+                    .ok_or_else(|| format!("{ERROR} (source HTTP status {})", response.status()));
             }
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|_| ERROR)? {
@@ -191,14 +197,20 @@ async fn acquire_for(
                 return Err(ERROR.into());
             }
             match value["phase"].as_str() {
-                Some("ready") => return completed(&source, directory)?.ok_or_else(|| ERROR.into()),
+                Some("ready") => {
+                    return completed(&source, directory)
+                        .map_err(|e| format!("{e} (published receipt)"))?
+                        .ok_or_else(|| ERROR.into())
+                }
                 Some("exporting") => {}
                 // Idle after a lost POST is uncertain delivery. Do not retry a
                 // shutdown request or silently start a replacement runtime.
-                _ => return Err(ERROR.into()),
+                _ => return Err(format!("{ERROR} (source response phase)")),
             }
         }
-        if let Some(plan) = completed(&source, directory)? {
+        if let Some(plan) =
+            completed(&source, directory).map_err(|e| format!("{e} (published receipt)"))?
+        {
             return Ok(plan);
         }
         if tokio::time::Instant::now() >= until {
