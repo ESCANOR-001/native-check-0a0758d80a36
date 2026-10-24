@@ -294,10 +294,56 @@ pub(crate) fn retained_assets(
         .map_err(|_| INVALID)?
         .collect::<rusqlite::Result<_>>()
         .map_err(|_| INVALID)?;
-    if expected != rows {
+    // A stage uses the canonical generation parent, while a later offline
+    // rollback can arrive through /var on macOS or a non-verbatim Windows
+    // path. Compare the same verified files without rewriting the ledger.
+    let root = directory.canonicalize().map_err(|_| INVALID)?;
+    if normalized_asset_rows(expected, &root)? != normalized_asset_rows(rows, &root)? {
         return Err(INVALID.into());
     }
-    Ok(rows.len() as i64)
+    Ok(db
+        .query_row("SELECT count(*) FROM storage_assets", [], |r| r.get(0))
+        .map_err(|_| INVALID)?)
+}
+
+fn normalized_asset_rows(
+    rows: BTreeMap<String, i64>,
+    root: &Path,
+) -> Result<BTreeMap<PathBuf, i64>, String> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut result = BTreeMap::new();
+    for (raw, bytes) in rows {
+        let path = Path::new(&raw);
+        if Instant::now() >= deadline
+            || bytes < 0
+            || !path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(INVALID.into());
+        }
+        let canonical = path.canonicalize().map_err(|_| INVALID)?;
+        let relative = canonical.strip_prefix(root).map_err(|_| INVALID)?;
+        let depth = relative.components().count();
+        if depth == 0 {
+            return Err(INVALID.into());
+        }
+        // Only the profile's parent may have an OS alias. No link or reparse
+        // point below the profile is accepted, even if it resolves to a known
+        // file. Duplicate aliases must not hide an extra storage charge.
+        let prefix = path.ancestors().nth(depth).ok_or(INVALID)?;
+        if prefix.canonicalize().map_err(|_| INVALID)? != root {
+            return Err(INVALID.into());
+        }
+        for (i, part) in path.ancestors().take(depth + 1).enumerate() {
+            open(part, i != 0).map_err(|_| INVALID)?;
+        }
+        if result.insert(canonical, bytes).is_some() {
+            return Err(INVALID.into());
+        }
+    }
+    Ok(result)
 }
 struct Temporary(PathBuf);
 impl Drop for Temporary {

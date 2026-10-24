@@ -352,8 +352,50 @@ fn retries_incomplete_database_initialization_and_unreceipted_partial_file_copie
         }
         assert_eq!(f.run().unwrap()["resumed"], true);
         assert_eq!(rows(&f.db()).len(), 4);
-        assert!(legacy_rollback::run(&f.generation.join("state"), false).is_ok());
+        legacy_rollback::run(&f.generation.join("state"), false)
+            .unwrap_or_else(|error| panic!("partial_files={partial_files}: {error}"));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_accepts_an_alias_of_the_generation_parent_without_reindexing() {
+    let mut f = Fixture::new(1);
+    let alias = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(f._dir.path(), alias.path().join("parent")).unwrap();
+    f.generation = alias.path().join("parent/generation");
+    f.capture();
+    f.run().unwrap();
+    let db = f.db();
+    let before = rows(&db);
+    let assets = |db: &Connection| -> Vec<(String, i64)> {
+        db.prepare("SELECT path,bytes FROM storage_assets ORDER BY path")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let before_assets = assets(&db);
+    legacy_rollback::run(&f.generation.join("state"), false).unwrap();
+    assert_eq!(rows(&db), before);
+    assert_eq!(assets(&db), before_assets);
+    let (path, bytes) = &before_assets[0];
+    let root = f.generation.join("state");
+    let duplicate = root.join(
+        std::path::Path::new(path)
+            .strip_prefix(root.canonicalize().unwrap())
+            .unwrap(),
+    );
+    db.execute(
+        "INSERT INTO storage_assets VALUES(?1,?2)",
+        rusqlite::params![duplicate.to_str().unwrap(), bytes],
+    )
+    .unwrap();
+    let changed = assets(&db);
+    assert!(legacy_rollback::run(&root, false).is_err());
+    assert_eq!(rows(&db), before);
+    assert_eq!(assets(&db), changed);
 }
 
 #[test]
