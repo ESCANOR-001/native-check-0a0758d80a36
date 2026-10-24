@@ -326,23 +326,30 @@ fn retries_incomplete_database_initialization_and_unreceipted_partial_file_copie
         if partial_files {
             let db = f.db();
             db.execute_batch("DELETE FROM legacy_uploads; DELETE FROM legacy_upload_evidence; DELETE FROM legacy_upload_display; DELETE FROM legacy_upload_display_import;").unwrap();
-            let bundle = fs::read_dir(f.generation.join("state/legacy-uploads"))
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path();
+            let bundle = fs::read_dir(
+                f.generation
+                    .join("state/legacy-uploads")
+                    .canonicalize()
+                    .unwrap(),
+            )
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
             let copied = bundle
                 .join("data/client")
                 .join(CODEX)
                 .join("note-00000000-0000-4000-8000-000000000003.txt");
             for path in [copied, bundle.join("restored.json")] {
                 fs::remove_file(&path).unwrap();
-                db.execute(
-                    "DELETE FROM storage_assets WHERE path=?1",
-                    [path.to_str().unwrap()],
-                )
-                .unwrap();
+                let removed = db
+                    .execute(
+                        "DELETE FROM storage_assets WHERE path=?1",
+                        [path.to_str().unwrap()],
+                    )
+                    .unwrap();
+                assert_eq!(removed, 1, "simulate an unindexed interrupted copy");
             }
         } else {
             fs::remove_dir_all(f.generation.join("state")).unwrap();
