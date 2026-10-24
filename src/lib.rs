@@ -40,6 +40,7 @@ pub mod legacy_connection;
 mod legacy_preferences;
 pub mod legacy_rollback;
 pub mod legacy_stage;
+pub mod legacy_upgrade;
 mod legacy_upload_display;
 mod legacy_upload_native;
 mod legacy_uploads;

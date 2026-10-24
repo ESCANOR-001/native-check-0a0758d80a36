@@ -22,6 +22,30 @@ struct Fixture {
     original: PathBuf,
 }
 impl Fixture {
+    fn upgrade_plan(&self) -> (PathBuf, PathBuf) {
+        let config = self.activation_config();
+        let old = read(&config);
+        let db =
+            Connection::open(self._dir.path().join("native-generation/handoff.sqlite")).unwrap();
+        let native: String = db
+            .query_row("SELECT plan FROM handoff WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        let native_path = self._dir.path().join("upgrade-native-plan.json");
+        write(
+            &native_path,
+            &serde_json::from_str::<Value>(&native).unwrap(),
+        );
+        let root = self._dir.path().join("upgrade");
+        let mut next = old;
+        next["native_profile_handoff"] = json!(root.join("native"));
+        write(&config, &next);
+        let plan = self._dir.path().join("upgrade-plan.json");
+        write(
+            &plan,
+            &json!({"version":1,"environment":ENV,"export_snapshot":self.snapshot,"native_plan":native_path,"configuration":config}),
+        );
+        (root, plan)
+    }
     fn activation_config(&self) -> PathBuf {
         self.activation_config_using(None)
     }
@@ -159,6 +183,164 @@ impl Fixture {
             .arg(&self.generation)
             .arg(ENV);
         c
+    }
+}
+
+#[test]
+fn owned_upgrade_coordinator_preserves_pairing_and_rolls_back_only_unused_data() {
+    use remodex_connect_native::legacy_upgrade;
+    let f = Fixture::new(0);
+    f.codex_native_export(|_| {});
+    f.capture();
+    let before = fs::read(f.source.join("connection.json")).unwrap();
+    let (root, plan) = f.upgrade_plan();
+    assert_eq!(
+        legacy_upgrade::run("prepare", &root, &plan).unwrap()["phase"],
+        "owned-upgrade-prepared"
+    );
+    let db = Connection::open(root.join("bridge/state/native-connect.sqlite")).unwrap();
+    let original = rows(&db);
+    assert_eq!(
+        db.query_row(
+            "SELECT credential_digest FROM clients WHERE id='test-phone'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        auth::digest("TEST_ONLY_PHONE")
+    );
+    assert_eq!(
+        legacy_upgrade::run("prepare", &root, &plan).unwrap()["resumed"],
+        true
+    );
+    assert_eq!(
+        legacy_upgrade::run("check", &root, &plan).unwrap()["phase"],
+        "owned-upgrade-verified"
+    );
+    assert_eq!(rows(&db), original);
+    assert_eq!(
+        legacy_upgrade::run("rollback", &root, &plan).unwrap()["phase"],
+        "rolled-back"
+    );
+    assert_eq!(
+        legacy_upgrade::run("rollback", &root, &plan).unwrap()["phase"],
+        "rolled-back"
+    );
+    assert!(rows(&db).is_empty());
+    assert!(legacy_upgrade::run("prepare", &root, &plan).is_err());
+    assert_eq!(fs::read(f.source.join("connection.json")).unwrap(), before);
+    assert!(root
+        .join("native/attempt-1/working/codex/data/sessions/test.jsonl")
+        .exists());
+}
+
+#[test]
+fn owned_upgrade_refuses_changed_inputs_running_owner_and_started_data() {
+    use remodex_connect_native::{launch_config, legacy_activation, legacy_upgrade};
+    let f = Fixture::new(0);
+    f.codex_native_export(|_| {});
+    f.capture();
+    let (root, plan) = f.upgrade_plan();
+    legacy_upgrade::run("prepare", &root, &plan).unwrap();
+    let state = root.join("bridge/state");
+    let db = Connection::open(state.join("native-connect.sqlite")).unwrap();
+    let original = rows(&db);
+    let lease = profile_lock::acquire(&state).unwrap();
+    assert!(legacy_upgrade::run("rollback", &root, &plan).is_err());
+    assert!(legacy_upgrade::run("prepare", &root, &plan).is_err());
+    drop(lease);
+    let saved = fs::read(&plan).unwrap();
+    let mut wrong: Value = serde_json::from_slice(&saved).unwrap();
+    wrong["environment"] = json!("different");
+    write(&plan, &wrong);
+    assert!(legacy_upgrade::run("prepare", &root, &plan).is_err());
+    fs::write(&plan, saved).unwrap();
+    let cfg = launch_config::load(&root.join("configuration.json")).unwrap();
+    legacy_activation::before_start(&state, Some(&cfg)).unwrap();
+    assert!(legacy_upgrade::run("rollback", &root, &plan)
+        .unwrap_err()
+        .contains("started handling chats"));
+    assert!(legacy_upgrade::run("prepare", &root, &plan).is_err());
+    assert_eq!(rows(&db), original);
+    let journal = Connection::open(root.join("upgrade.sqlite")).unwrap();
+    assert_eq!(
+        journal
+            .query_row("SELECT phase FROM upgrade", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ready"
+    );
+}
+
+#[test]
+fn owned_upgrade_recovers_after_activation_or_rollback_commit_before_journal_update() {
+    use remodex_connect_native::legacy_upgrade;
+    let f = Fixture::new(0);
+    f.codex_native_export(|_| {});
+    f.capture();
+    let (root, plan) = f.upgrade_plan();
+    legacy_upgrade::run("prepare", &root, &plan).unwrap();
+    let journal = Connection::open(root.join("upgrade.sqlite")).unwrap();
+    journal
+        .execute("UPDATE upgrade SET phase='preparing'", [])
+        .unwrap();
+    assert_eq!(
+        legacy_upgrade::run("prepare", &root, &plan).unwrap()["phase"],
+        "owned-upgrade-prepared"
+    );
+    legacy_rollback::run(&root.join("bridge/state"), true).unwrap();
+    journal
+        .execute("UPDATE upgrade SET phase='rolling-back'", [])
+        .unwrap();
+    assert_eq!(
+        legacy_upgrade::run("rollback", &root, &plan).unwrap()["phase"],
+        "rolled-back"
+    );
+    assert!(legacy_upgrade::run("prepare", &root, &plan).is_err());
+}
+
+#[test]
+fn owned_upgrade_does_not_adopt_a_foreign_root_or_overlap_its_source() {
+    use remodex_connect_native::legacy_upgrade;
+    let f = Fixture::new(0);
+    f.codex_native_export(|_| {});
+    f.capture();
+    let (root, plan) = f.upgrade_plan();
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("user-file"), b"KEEP").unwrap();
+    assert!(legacy_upgrade::run("prepare", &root, &plan).is_err());
+    assert!(!root.join("server.lock").exists());
+    assert_eq!(fs::read(root.join("user-file")).unwrap(), b"KEEP");
+    assert!(legacy_upgrade::run("prepare", &f.source, &plan).is_err());
+    assert!(!f.source.join("server.lock").exists());
+}
+
+#[test]
+fn owned_upgrade_recovers_an_empty_journal_only_before_any_import_was_created() {
+    use remodex_connect_native::legacy_upgrade;
+    for (occupied, schema) in [(false, false), (true, false), (false, true), (true, true)] {
+        let f = Fixture::new(0);
+        f.codex_native_export(|_| {});
+        f.capture();
+        let (root, plan) = f.upgrade_plan();
+        fs::create_dir(&root).unwrap();
+        let db = Connection::open(root.join("upgrade.sqlite")).unwrap();
+        if schema {
+            db.execute_batch(
+                "CREATE TABLE upgrade(id INTEGER PRIMARY KEY,binding TEXT,phase TEXT);",
+            )
+            .unwrap();
+        }
+        drop(db);
+        if occupied {
+            fs::create_dir(root.join("bridge")).unwrap();
+        }
+        assert_eq!(
+            legacy_upgrade::run("prepare", &root, &plan).is_ok(),
+            !occupied
+        );
+        if occupied {
+            assert!(!root.join("configuration.json").exists());
+        }
     }
 }
 

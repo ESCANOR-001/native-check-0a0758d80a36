@@ -39,6 +39,20 @@ async fn serve(
     args: Vec<String>,
     parent: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    if args.get(1).is_some_and(|a| a == "--legacy-upgrade") {
+        if args.len() != 5 {
+            return Err(
+                "Usage: --legacy-upgrade prepare|check|rollback ABSOLUTE_NEW_ROOT PLAN_JSON".into(),
+            );
+        }
+        let report = remodex_connect_native::legacy_upgrade::run(
+            &args[2],
+            &PathBuf::from(&args[3]),
+            &PathBuf::from(&args[4]),
+        )?;
+        println!("{report}");
+        return Ok(0);
+    }
     if args.get(1).is_some_and(|a| a == "--legacy-activate") {
         if args.len() != 4 {
             return Err(
