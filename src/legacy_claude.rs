@@ -198,7 +198,19 @@ impl Prepared {
             if !seen.insert(id) {
                 return Err(INVALID.into());
             }
-            checkpoints.push((id.into(), text(&row["label"], 4096)?.into()));
+            // Checkpoint labels are prompt excerpts, so multiline text is valid.
+            // Keep IDs/path fields strict and preserve the label byte-for-byte.
+            let label = row["label"]
+                .as_str()
+                .filter(|s| {
+                    !s.is_empty()
+                        && s.len() <= 4096
+                        && !s
+                            .chars()
+                            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+                })
+                .ok_or(INVALID)?;
+            checkpoints.push((id.into(), label.into()));
         }
         thread["nativeSessionId"] = json!(native);
         thread["session"]["status"] = json!("disconnected");

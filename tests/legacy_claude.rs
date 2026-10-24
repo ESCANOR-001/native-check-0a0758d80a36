@@ -1838,3 +1838,22 @@ async fn reconciled_alias_native_replay_retains_original_prompt_and_turn() {
     assert_eq!(saved["thread"]["latestTurn"]["turnId"], "old-turn");
     assert_eq!(saved["thread"]["session"]["status"], "ready");
 }
+
+#[test]
+fn checkpoint_prompt_excerpts_keep_newlines_but_reject_terminal_controls() {
+    let (dir, mut store, db) = setup();
+    let mut original = source(dir.path());
+    let label = "Read the attachment.\n\nAttached files on this PC:\nexample.txt";
+    original["fileCheckpoints"][0]["label"] = json!(label);
+    let bytes = raw(&original);
+    store.prepare_legacy_claude(&bytes).unwrap();
+    let saved: Vec<u8> = db
+        .query_row("SELECT raw FROM legacy_claude_import", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(saved, bytes);
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    original["fileCheckpoints"][0]["label"] = json!("bad\u{1b}[2J");
+    assert!(store.prepare_legacy_claude(&raw(&original)).is_err());
+}
