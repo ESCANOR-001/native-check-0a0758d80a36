@@ -39,6 +39,18 @@ async fn serve(
     args: Vec<String>,
     parent: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    if args.get(1).is_some_and(|a| a == "--legacy-stage") {
+        if args.len() != 5 {
+            return Err("Usage: --legacy-stage ABSOLUTE_EXPORT_SNAPSHOT ABSOLUTE_NEW_GENERATION ENVIRONMENT_ID".into());
+        }
+        let report = remodex_connect_native::legacy_stage::run(
+            &PathBuf::from(&args[2]),
+            &PathBuf::from(&args[3]),
+            &args[4],
+        )?;
+        println!("{report}");
+        return Ok(0);
+    }
     if args.get(1).is_some_and(|a| a == "--legacy-rollback") {
         if args.len() != 4 || !matches!(args[2].as_str(), "check" | "apply") {
             return Err(

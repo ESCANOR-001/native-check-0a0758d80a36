@@ -37,6 +37,7 @@ mod legacy_codex_history;
 pub mod legacy_connection;
 mod legacy_preferences;
 pub mod legacy_rollback;
+pub mod legacy_stage;
 mod legacy_upload_display;
 mod legacy_upload_native;
 mod legacy_uploads;

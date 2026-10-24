@@ -203,6 +203,34 @@ impl Prepared {
             })
             .collect()
     }
+    pub(crate) fn verify_identity(&self, db: &rusqlite::Connection) -> Result<(), String> {
+        let matches: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM legacy_connection_import WHERE id=1 AND phase='prepared' AND digest=?1 AND environment=?2 AND raw=?3)", params![self.hash,self.environment,self.raw.as_bytes()],|r|r.get(0)).map_err(|_|INVALID)?;
+        let clients: i64 = db
+            .query_row("SELECT count(*) FROM clients", [], |r| r.get(0))
+            .map_err(|_| INVALID)?;
+        if !matches || clients != self.clients.len() as i64 {
+            return Err(CONFLICT.into());
+        }
+        for client in &self.clients {
+            let matches: bool=db.query_row("SELECT EXISTS(SELECT 1 FROM clients WHERE id=?1 AND label=?2 AND os=?3 AND created_at=?4 AND expires_at=?5 AND credential_digest=?6 AND installation_digest IS ?7)",params![client.id,client.label,client.os,client.created_at,client.expires_at,client.credential_digest,client.installation_digest],|r|r.get(0)).map_err(|_|INVALID)?;
+            if !matches {
+                return Err(CONFLICT.into());
+            }
+        }
+        for (key, value) in self.values() {
+            let matches: bool = db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM metadata WHERE key=?1 AND value=?2)",
+                    params![key, value],
+                    |r| r.get(0),
+                )
+                .map_err(|_| INVALID)?;
+            if !matches {
+                return Err(CONFLICT.into());
+            }
+        }
+        Ok(())
+    }
 }
 impl Store {
     /// Call offline, with exclusive ownership of a fresh destination. Source
@@ -362,24 +390,7 @@ fn verify(
     if counts != (prepared.clients.len() as i64, KEYS.len() as i64, retained) || has_chats(db)? {
         return Err(CONFLICT.into());
     }
-    for client in &prepared.clients {
-        let matches: bool=db.query_row("SELECT EXISTS(SELECT 1 FROM clients WHERE id=?1 AND label=?2 AND os=?3 AND created_at=?4 AND expires_at=?5 AND credential_digest=?6 AND installation_digest IS ?7)",params![client.id,client.label,client.os,client.created_at,client.expires_at,client.credential_digest,client.installation_digest],|r|r.get(0)).map_err(|_|INVALID)?;
-        if !matches {
-            return Err(CONFLICT.into());
-        }
-    }
-    for (key, value) in prepared.values() {
-        let matches: bool = db
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM metadata WHERE key=?1 AND value=?2)",
-                params![key, value],
-                |r| r.get(0),
-            )
-            .map_err(|_| INVALID)?;
-        if !matches {
-            return Err(CONFLICT.into());
-        }
-    }
+    prepared.verify_identity(db)?;
     Ok(())
 }
 
