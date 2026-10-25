@@ -36,8 +36,96 @@ struct State {
     /// Finished transcript rows predating a relay change stay immutable on replay.
     #[serde(default)]
     relink_before: Option<i64>,
+    #[serde(default)]
+    rejected_history: Option<(String, bool)>,
 }
 pub(crate) const OWNER_RESTARTED: &str = "The original Claude session restarted before this task finished. Its saved output is kept; nothing was resent.";
+
+/// Older relay transcripts omit consumption IDs on the result after a tool
+/// rejection. Require the structured rejection of this turn's actual tool,
+/// its generated interruption notice, and the following root result together.
+/// This only settles remote history; it cannot acknowledge an Android outbox.
+fn rejected_history_result(
+    state: &mut State,
+    chat: &Chat,
+    frame: &Value,
+    historical_worker: bool,
+) -> Option<crate::claude_turns::Change> {
+    if !historical_worker || !frame["parent_tool_use_id"].is_null() {
+        state.rejected_history = None;
+        return None;
+    }
+    let active = state.router.active().cloned();
+    let Some(turn) = active.filter(|t| {
+        !t.local
+            && !state.router.background().busy()
+            && state.router.pending().count() == t.inputs.len()
+            && state
+                .router
+                .pending()
+                .all(|p| !p.local && t.inputs.contains(&p.native))
+    }) else {
+        state.rejected_history = None;
+        return None;
+    };
+    if frame["type"] == "user" {
+        let blocks = frame["message"]["content"].as_array();
+        let rejected = frame["origin"].is_null()
+            && blocks.is_some_and(|blocks| {
+                blocks.iter().any(|b| {
+                    b["type"] == "tool_result"
+                        && b["is_error"] == true
+                        && b["tool_use_id"].is_string()
+                        && frame["tool_result_meta"].as_array().is_some_and(|meta| {
+                            meta.iter().any(|m| {
+                                m["id"] == b["tool_use_id"]
+                                    && m["non_execution_kind"] == "user-rejected"
+                            })
+                        })
+                        && chat.thread["activities"].as_array().is_some_and(|rows| {
+                            rows.iter().any(|r| {
+                                r["id"] == b["tool_use_id"] && r["turnId"] == turn.public_turn
+                            })
+                        })
+                })
+            });
+        if rejected {
+            state.rejected_history = Some((turn.public_turn, false));
+        } else if state
+            .rejected_history
+            .as_ref()
+            .is_some_and(|(id, _)| id == &turn.public_turn)
+            && frame["origin"].is_null()
+            && frame["isSynthetic"] == true
+            && blocks.is_some_and(|bs| {
+                bs.len() == 1
+                    && bs[0]["type"] == "text"
+                    && bs[0]["text"] == "[Request interrupted by user for tool use]"
+            })
+        {
+            state.rejected_history = Some((turn.public_turn, true));
+        } else {
+            state.rejected_history = None;
+        }
+    } else if frame["type"] == "result" {
+        let proof = state.rejected_history.take();
+        if proof == Some((turn.public_turn.clone(), true))
+            && frame.get("user_message_uuid").is_none()
+            && frame.get("user_message_uuids").is_none()
+            && state.router.confirm_stopped(&turn.public_turn)
+        {
+            return Some(crate::claude_turns::Change {
+                turn: Some(turn),
+                completed: true,
+                outcome: Some("interrupted".into()),
+                ..Default::default()
+            });
+        }
+    } else if frame["type"] == "assistant" {
+        state.rejected_history = None;
+    }
+    None
+}
 
 async fn delivery_receipts(
     db: &AuthService,
@@ -534,7 +622,15 @@ pub async fn project(
             }
         }
     }
-    let change = reduced.router.observe(&value)?;
+    let change = match rejected_history_result(
+        &mut reduced,
+        &chat,
+        &value,
+        catchup && event.source == "worker" && event.sequence.is_some(),
+    ) {
+        Some(change) => change,
+        None => reduced.router.observe(&value)?,
+    };
     if catchup
         && event.source == "worker"
         && value["type"] == "result"
@@ -872,6 +968,110 @@ mod tests {
             Cursor::new(identity).unwrap(),
             native,
         )
+    }
+    #[tokio::test]
+    async fn replayed_tool_rejection_requires_notice_result_and_exact_remote_turn() {
+        for case in [
+            "complete",
+            "wrong-tool",
+            "no-metadata",
+            "human-notice",
+            "no-result",
+            "queued",
+            "background",
+            "local",
+        ] {
+            let (_dir, db, mut cursor, native) = setup().await;
+            let input = uuid::Uuid::new_v4().to_string();
+            if case == "local" {
+                let record = Input {
+                    native: input.clone(),
+                    message: input.clone(),
+                    public_turn: format!("claude-{input}"),
+                    local: true,
+                    steer: false,
+                };
+                let payload = json!({"type":"user","uuid":input,"session_id":native,"message":{"role":"user","content":"Run a tool"}});
+                db.call(move |a| {
+                    a.store
+                        .offer_claude_input("history-chat", &native, &record, &payload)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            }
+            step(&db, &mut cursor, 1, json!({"type":"user","uuid":input,"origin":{"kind":"human"},"message":{"role":"user","content":"Run a tool"}})).await;
+            step(&db, &mut cursor, 2, json!({"type":"assistant","user_message_uuid":input,"message":{"id":"tool-reply","content":[{"type":"tool_use","id":"tool-a","name":"Bash","input":{"command":"echo fixture"}}]}})).await;
+            if case == "queued" {
+                step(&db,&mut cursor,3,json!({"type":"user","uuid":uuid::Uuid::new_v4().to_string(),"message":{"role":"user","content":"Next prompt"}})).await;
+            } else if case == "background" {
+                step(
+                    &db,
+                    &mut cursor,
+                    3,
+                    json!({"type":"system","subtype":"task_started","task_id":"bg","run_id":"1"}),
+                )
+                .await;
+            }
+            let tool = if case == "wrong-tool" {
+                "foreign-tool"
+            } else {
+                "tool-a"
+            };
+            let mut rejection = json!({"type":"user","uuid":uuid::Uuid::new_v4().to_string(),"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":tool,"is_error":true,"content":"The user doesn't want to proceed with this tool use."}]},"tool_result_meta":[{"id":tool,"non_execution_kind":"user-rejected"}]});
+            if case == "no-metadata" {
+                rejection
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("tool_result_meta");
+            }
+            step(&db, &mut cursor, 4, rejection).await;
+            let mut notice = json!({"type":"user","uuid":uuid::Uuid::new_v4().to_string(),"message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}});
+            if case == "human-notice" {
+                notice["origin"] = json!({"kind":"human"});
+            }
+            step(&db, &mut cursor, 5, notice).await;
+            // The interruption proof, like the stream cursor, must survive a restart.
+            let identity = cursor.identity.clone();
+            cursor = db
+                .call(move |a| a.store.claude_remote_cursor("history-chat", identity))
+                .await
+                .unwrap()
+                .unwrap();
+            step(
+                &db,
+                &mut cursor,
+                6,
+                json!({"type":"system","subtype":"init"}),
+            )
+            .await;
+            if case != "no-result" {
+                step(
+                    &db,
+                    &mut cursor,
+                    7,
+                    json!({"type":"result","is_error":false,"num_turns":0}),
+                )
+                .await;
+            }
+            let router = control_state(&cursor.projection).unwrap().0;
+            assert_eq!(router.active().is_none(), case == "complete", "{case}");
+            if case == "complete" {
+                assert_eq!(router.pending().count(), 0);
+                let next = uuid::Uuid::new_v4().to_string();
+                step(&db,&mut cursor,8,json!({"type":"user","uuid":next,"message":{"role":"user","content":"Continue"}})).await;
+                step(&db,&mut cursor,9,json!({"type":"assistant","user_message_uuid":next,"message":{"id":"next-reply","content":[{"type":"text","text":"Ready"}]}})).await;
+                let done = step(
+                    &db,
+                    &mut cursor,
+                    10,
+                    json!({"type":"result","user_message_uuid":next}),
+                )
+                .await;
+                assert_eq!(done["thread"]["latestTurn"]["state"], "completed");
+                assert_eq!(done["thread"]["messages"].as_array().unwrap().len(), 3);
+            }
+        }
     }
     #[tokio::test]
     async fn shared_session_approval_keeps_original_suggestions_across_cursor_reload() {
