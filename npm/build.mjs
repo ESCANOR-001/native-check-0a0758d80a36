@@ -35,12 +35,12 @@ export async function buildPackages(binary, destination) {
 export async function buildPublishedPackage(runtimeRoot, packages) {
   const root=resolve(runtimeRoot), destination=join(dirname(packages.launcher),'published');
   await mkdir(destination);
-  for (const name of ['bin','src']) await cp(join(root,name),join(destination,name),{recursive:true,errorOnExist:true,force:false});
+  for (const name of ['bin','src','gui/dist']) await cp(join(root,name),join(destination,name),{recursive:true,errorOnExist:true,force:false});
   const pkg=JSON.parse(await readFile(join(root,'package.json'),'utf8'));
   await mkdir(join(destination,'bin/native'));
   await copyFile(join(dirname(fileURLToPath(import.meta.url)),'launcher.mjs'),join(destination,'bin/native/launcher.mjs'));
   await writeFile(join(destination,'bin/native-runtime.json'),JSON.stringify({formatVersion:1,version:VERSION,backend:'rust',migrationComplete:false}));
-  await writeFile(join(destination,'package.json'),JSON.stringify({name:pkg.name,version:VERSION,private:true,type:'module',bin:pkg.bin,files:['bin','src'],engines:pkg.engines,
+  await writeFile(join(destination,'package.json'),JSON.stringify({name:pkg.name,version:VERSION,private:true,type:'module',bin:pkg.bin,files:['bin','src','gui/dist'],engines:pkg.engines,dependencies:pkg.dependencies,
     optionalDependencies:Object.fromEntries(['linux-x64-gnu','win32-x64','darwin-arm64'].map(t=>[`@remodex/native-connect-experiment-${t}`,VERSION]))},null,2));
   return destination;
 }

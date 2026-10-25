@@ -13,6 +13,10 @@ use std::{
     time::Duration,
 };
 
+#[path = "npm_control.rs"]
+mod control;
+pub use control::command;
+
 const ERROR: &str =
     "The npm upgrade could not be verified. Existing chat data and recovery files were retained";
 #[derive(Deserialize)]
@@ -326,6 +330,40 @@ pub async fn start<F: std::future::Future<Output = ()>>(
     launch_registered(root, None, stop).await
 }
 
+/// Finish the one-time compatible-source process before the npm launcher
+/// replaces itself. This publishes a selected generation but starts no agent.
+pub async fn prepare_registered(root: &Path) -> Result<Value, String> {
+    if root
+        .join("npm-upgrade.sqlite")
+        .try_exists()
+        .map_err(|_| ERROR)?
+        && resume_info(root).is_ok()
+    {
+        return resume_info(root);
+    }
+    let source = crate::upgrade_source::registered(root)?;
+    let plan = crate::upgrade_source::acquire(root, &source).await?;
+    prepare(root, &plan)
+}
+pub async fn start_on_port<F: std::future::Future<Output = ()>>(
+    root: &Path,
+    port: u16,
+    stop: F,
+) -> Result<i32, String> {
+    if port == 0 {
+        return Err(ERROR.into());
+    }
+    if resume_info(root).is_err() {
+        let source = crate::upgrade_source::registered(root)?;
+        let plan = crate::upgrade_source::acquire_on_port(root, &source, port).await?;
+        prepare(root, &plan)?;
+    }
+    if resume_info(root)?["dashboardPort"] != port {
+        return Err("The requested port differs from this installation's retained dashboard port; no runtime was started".into());
+    }
+    resume(root, stop).await
+}
+
 async fn launch_registered<F: std::future::Future<Output = ()>>(
     root: &Path,
     source: Option<&Path>,
@@ -402,9 +440,27 @@ fn selected(root: &Path) -> Result<Journal, String> {
 
 pub fn resume_info(root: &Path) -> Result<Value, String> {
     let journal = selected(root)?;
+    let (raw, attempt): (Vec<u8>, u32) = journal
+        .db
+        .query_row("SELECT plan,attempt FROM upgrade WHERE id=1", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .map_err(|_| ERROR)?;
+    let plan: Plan = serde_json::from_slice(&raw).map_err(|_| ERROR)?;
+    let config: crate::chat::Config = serde_json::from_slice(&read(
+        &journal
+            .root
+            .join(format!("attempt-{attempt}/generation/configuration.json")),
+        262144,
+    )?)
+    .map_err(|_| ERROR)?;
+    let dashboard = match config.connection {
+        Some(c) => c.dashboard_bind,
+        None => plan.bind.parse().map_err(|_| ERROR)?,
+    };
     Ok(
         json!({"resumable":true,"service":journal.root.join("service"),"profilesKeptInPlace":true,
-        "runtimeStarted":false,"migrationComplete":false}),
+        "runtimeStarted":false,"migrationComplete":false,"dashboardPort":dashboard.port()}),
     )
 }
 

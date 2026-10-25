@@ -11,7 +11,7 @@ use tokio::{
 
 #[tokio::test]
 async fn bun_owner_retires_and_rust_recovers_the_exact_durable_plan() {
-    for mode in ["", "preflight", "bad-config"] {
+    for mode in ["", "preflight", "warming", "bad-config", "wrong-port"] {
         qualify(mode).await;
     }
 }
@@ -55,10 +55,13 @@ async fn qualify(mode: &str) {
         upgrade_source::registered(&installation).unwrap(),
         descriptor
     );
-    if mode == "bad-config" {
-        assert!(upgrade_source::acquire(&installation, &descriptor)
-            .await
-            .is_err());
+    if mode == "bad-config" || mode == "wrong-port" {
+        let result = if mode == "wrong-port" {
+            upgrade_source::acquire_on_port(&installation, &descriptor, 4321).await
+        } else {
+            upgrade_source::acquire(&installation, &descriptor).await
+        };
+        assert!(result.is_err());
         assert!(
             !descriptor.parent().unwrap().join("attempt.json").exists(),
             "Failed preflight must not start source shutdown"

@@ -174,7 +174,31 @@ impl Hub {
         if !chat.external_claude || !claude_recoverable(chat) {
             return Err("No existing Claude link is available".into());
         }
-        let identity = chat.remote_identity.clone().unwrap();
+        if chat.remote_identity.is_none() {
+            let profile = self.config.claude.profile.clone();
+            let workspace = self.config.workspace.clone();
+            let native = chat.native_id.clone();
+            let link = tokio::task::spawn_blocking(move || {
+                crate::claude_link::read(&profile, &workspace, &native)
+            })
+            .await
+            .map_err(|_| "Claude history reader stopped")??;
+            let key = id.to_owned();
+            let (state, _) = self
+                .db
+                .call(move |a| a.store.attach_claude_link(&key, &link))
+                .await??;
+            self.chats.insert(
+                id.into(),
+                serde_json::from_value(state).map_err(|_| "Invalid recovered Claude chat")?,
+            );
+            self.dirty = true;
+        }
+        let chat = &self.chats[id];
+        let identity = chat
+            .remote_identity
+            .clone()
+            .ok_or("No existing Claude link is available")?;
         let key = id.to_owned();
         let mut cursor = self
             .db

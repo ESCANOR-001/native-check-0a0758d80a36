@@ -5,6 +5,79 @@ use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 
 impl Store {
+    /// Attach a previously unshared, migrated Desktop history only after the
+    /// original native transcript supplies its link. No outgoing delivery or
+    /// CLI ownership is created. Existing rows form an immutable replay prefix.
+    pub(crate) fn attach_claude_link(
+        &mut self,
+        id: &str,
+        link: &Link,
+    ) -> Result<(Value, Cursor), String> {
+        const ERROR: &str = "Claude's original connection is not ready; saved history was retained";
+        link.identity.validate()?;
+        let tx = self.db.transaction().map_err(|_| ERROR)?;
+        let source: Vec<u8> = tx.query_row("SELECT i.raw FROM legacy_claude_import i JOIN legacy_claude_native n ON n.chat=i.id AND n.source_hash=i.digest WHERE i.id=?1 AND i.phase='prepared' AND n.phase='prepared'", [id], |r| r.get(0)).map_err(|_| ERROR)?;
+        let source: Value = serde_json::from_slice(&source).map_err(|_| ERROR)?;
+        let raw: String = tx
+            .query_row("SELECT data FROM chats WHERE id=?1", [id], |r| r.get(0))
+            .map_err(|_| ERROR)?;
+        let mut state: Value = serde_json::from_str(&raw).map_err(|_| ERROR)?;
+        if source["external"] != true
+            || !source["bridgeId"].is_null()
+            || source["nativeId"] != link.identity.native_session
+            || state["agent"] != "claude"
+            || state["external_claude"] != true
+            || state["native_id"] != link.identity.native_session
+            || !state["remote_identity"].is_null()
+            || !state["thread"]["archivedAt"].is_null()
+            || !state["thread"]["deletedAt"].is_null()
+            || !state["thread"]["session"]["activeTurnId"].is_null()
+            || state["thread"]["latestTurn"]["state"] == "running"
+            || state["thread"]["session"]["status"] == "running"
+            || state["thread"]["hasPendingApprovals"] == true
+            || state["thread"]["hasPendingUserInput"] == true
+            || !state["external_stop"].is_null()
+            || (!state["native_control"].is_null() && state["native_control"]["result"].is_null())
+            || std::path::Path::new(state["thread"]["worktreePath"].as_str().ok_or(ERROR)?)
+                .canonicalize()
+                .map_err(|_| ERROR)?
+                != link.cwd
+        {
+            return Err(ERROR.into());
+        }
+        let conflict: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM native_sync WHERE chat=?1) OR EXISTS(SELECT 1 FROM claude_outbox WHERE chat=?1 AND state NOT IN ('completed','cancelled','orphaned'))", [id], |r| r.get(0)).map_err(|_| ERROR)?;
+        if conflict {
+            return Err(ERROR.into());
+        }
+        let high: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(seq),0) FROM chat_rows WHERE chat=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(|_| ERROR)?;
+        let mut cursor = Cursor::new(link.identity.clone())?;
+        cursor.projection = crate::claude_history::relink_projection(&Value::Null, high)?;
+        state["remote_identity"] = json!(link.identity);
+        state["paused"] = json!(true);
+        state["thread"]["session"]["statusConfidence"] = json!("unknown");
+        tx.execute(
+            "INSERT INTO native_sync(chat,native,cursor) VALUES(?1,?2,?3)",
+            params![
+                id,
+                format!("claude:{}", link.identity.native_session),
+                serde_json::to_string(&cursor).map_err(|_| ERROR)?
+            ],
+        )
+        .map_err(|_| ERROR)?;
+        tx.execute(
+            "UPDATE chats SET data=?2 WHERE id=?1",
+            params![id, state.to_string()],
+        )
+        .map_err(|_| ERROR)?;
+        tx.commit().map_err(|_| ERROR)?;
+        Ok((state, cursor))
+    }
     pub(crate) fn claude_relink_request(
         &self,
         chat: &str,
@@ -204,6 +277,75 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap()
+    }
+    #[test]
+    fn first_link_is_atomic_preserves_history_and_rejects_wrong_owner_or_pending_work() {
+        for reject in [
+            "none", "folder", "native", "owned", "pending", "cursor", "proof",
+        ] {
+            let (_dir, mut store, _, link) = fixture();
+            let mut state = store.load_chat("chat").unwrap();
+            state["remote_identity"] = Value::Null;
+            store.save_chat(&state, None).unwrap();
+            store.db.execute_batch("CREATE TABLE legacy_claude_import(id TEXT PRIMARY KEY,digest TEXT,raw BLOB,phase TEXT); CREATE TABLE legacy_claude_native(chat TEXT PRIMARY KEY,source_hash TEXT,phase TEXT);").unwrap();
+            let source = json!({"nativeId":link.identity.native_session,"external":true});
+            store
+                .db
+                .execute(
+                    "INSERT INTO legacy_claude_import VALUES('chat','fixture',?1,'prepared')",
+                    [source.to_string().as_bytes()],
+                )
+                .unwrap();
+            store
+                .db
+                .execute(
+                    "INSERT INTO legacy_claude_native VALUES('chat','fixture','prepared')",
+                    [],
+                )
+                .unwrap();
+            let mut link = link;
+            match reject {
+                "folder" => link.cwd = link.cwd.join("another-folder"),
+                "native" => link.identity.native_session = uuid::Uuid::new_v4().to_string(),
+                "owned" => state["external_claude"] = json!(false),
+                "pending" => state["thread"]["hasPendingApprovals"] = json!(true),
+                "cursor" => {
+                    store
+                        .db
+                        .execute("INSERT INTO native_sync VALUES('chat','other','{}')", [])
+                        .unwrap();
+                }
+                "proof" => {
+                    store
+                        .db
+                        .execute("DELETE FROM legacy_claude_native", [])
+                        .unwrap();
+                }
+                _ => {}
+            }
+            store.save_chat(&state, None).unwrap();
+            let rows = raw(&store, "chat_rows");
+            let chats = raw(&store, "chats");
+            let result = store.attach_claude_link("chat", &link);
+            assert_eq!(result.is_ok(), reject == "none", "{reject}: {result:?}");
+            assert_eq!(raw(&store, "chat_rows"), rows);
+            if reject == "none" {
+                let (after, cursor) = result.unwrap();
+                assert_eq!(after["external_claude"], true);
+                assert_eq!(after["queue"], state["queue"]);
+                assert_eq!(cursor.sequence, 0);
+                assert!(!cursor.projection.is_null());
+                assert_eq!(
+                    store
+                        .claude_remote_cursor("chat", link.identity.clone())
+                        .unwrap(),
+                    cursor
+                );
+                assert!(store.attach_claude_link("chat", &link).is_err());
+            } else {
+                assert_eq!(raw(&store, "chats"), chats);
+            }
+        }
     }
     #[test]
     fn relink_preserves_history_and_queue_and_is_atomic_and_durable() {

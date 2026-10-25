@@ -4,20 +4,24 @@ This is an isolated Rust foundation, **not a completed backend migration** and
 not an npm release. The production entrypoint still uses the TypeScript backend.
 The React dashboard and Android app are unchanged by this crate.
 
-Current upgrade qualification: an installed experimental npm launcher can ask a
-hook-enabled source bridge to export, drain, stop and launch the Rust generation
-on the same endpoint. Realme retained its pairing, original Desktop-owned Codex
-chat ID, messages and project label. This does **not** yet qualify an arbitrary
-published older package without that source hook. Desktop-native history is read
+Current upgrade qualification: the locally packed `@remodex/rmx` entry can start
+one compatible source owner for an existing installation without an export
+hook, obtain its closed-owner export, then launch Rust on the same endpoint.
+Realme retained its pairing, open original Desktop-owned Codex chat and messages
+and sent a new prompt after that packaged handoff. This is local package
+qualification, **not** an npm publication or normal-service replacement.
+Desktop-native history is read
 without resuming it in a second CLI; mutations stay with the original IPC owner.
 The source exporter also discovers chats without an Android alias through bounded
 read-only inventory pages, preserving their native IDs and last-used settings.
-Unknown owners, changing transcripts and partial inventories stop the upgrade
+Unknown owners, changed transcript identities and partial inventories stop the upgrade
 before cutover. Desktop pending approvals and questions now travel through that
 same verified owner, with bounded request inventories and native acknowledgments.
 Approval and decline, including an approval pending across a bridge restart,
-have passed on realme with the original isolated Desktop chat. Production Windows
-Desktop endpoint discovery remains a release gate.
+have passed on realme with the original isolated Desktop chat. Windows discovery
+now verifies the named-pipe server's user and login session before sending IPC;
+CI covers this transport, while authenticated Windows Desktop acceptance remains
+separate from those checks.
 
 Task presentation now has an optional persisted `session.executionState`:
 `starting`, `running`, `paused`, `compacting`, `idle`, or `unknown`. Sending a
@@ -109,8 +113,9 @@ Implemented here:
   verified native transcript, shared-session identity and committed event cursor.
   Its worker remains with the original owner; migration closes only the observer
   connection and reattaches it after startup. Pending deliveries and missing
-  ownership evidence remain blocked. Normal agent folders are still excluded by
-  this experiment's isolation checks; this is not a shipping first-run upgrader.
+  ownership evidence remain blocked. Existing-install mode binds the original
+  agent folders through the closed-owner receipt; ordinary isolated copy mode
+  still refuses normal profiles. This is not a shipping first-run installer.
 - npm launch handoff: `rmx-native-experiment upgrade INSTALL_DIR PLAN_JSON`
   invokes the Rust coordinator on an explicit launch (never an npm install
   hook). The plan contains `version: 1`, `closed_owner`, `configuration`, `bind`,
@@ -127,10 +132,20 @@ Implemented here:
   validate the retained selection and run the current package against the same data. This
   does not need the original external plan/configuration/receipt files and
   cannot rerun an old export. Missing source registrations or cancelled selections remain blocked.
-  `.codex` and `.claude` stay at their configured paths. This connects the
-  closed-owner export to the launcher; acquiring that export from an older
-  published installation without the hook is still a release gate. It is not
-  a claim that updating the published package is ready.
+  `.codex` and `.claude` stay at their configured paths. The actual package's
+  `rmx start` now bootstraps a compatible source once when an older installation
+  has no registration. It waits for readiness, retires only that owned child,
+  and never bootstraps over an existing journal, registration or source hold.
+  Existing Bun service entries forward to the native selection, including
+  `start --port PORT`; a port mismatch is refused before source shutdown.
+  Explicit LAN selection retains its address even if the old backend has an
+  unused quick tunnel. A selected temporary remote URL cannot yet survive
+  migration, so that case stops before export. Named connections retain their
+  private OS-keyring reference without exporting the token.
+  The native package also implements `status`, `stop` and `restart` through the
+  selected bridge's local dashboard session. It validates installation and
+  process identity, waits for completion, and never locates or signals another
+  process. Restart uses the existing bounded work-drain behavior.
   A saved original-Desktop endpoint may be offline at startup: the bridge can
   still start and display retained history. Live controls continue to require
   the original owner; no fallback CLI resumes that chat. Saved idle observations

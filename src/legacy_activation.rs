@@ -364,9 +364,10 @@ pub fn run(directory: &Path, config_path: &Path) -> Result<Value, String> {
             // Their complete native export is sufficient for owned resumption;
             // do not invent a relay identity or cursor just to activate them.
             let linked = !chat["remote_identity"].is_null();
-            if chat["external_claude"] == true && !linked {
-                return Err(ERROR.into());
-            }
+            // An unshared Desktop chat remains external and offline. Complete
+            // native-history proof above preserves it without requiring a live
+            // relay or inventing an observer cursor. Only the original profile
+            // may supply its link later; never resume this chat through a CLI.
             if (linked && (!resumed || !config.claude.remote_control)) || (!linked && resumed) {
                 return Err(ERROR.into());
             }

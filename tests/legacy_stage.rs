@@ -878,17 +878,24 @@ fn rollback_accepts_an_alias_of_the_generation_parent_without_reindexing() {
 #[test]
 fn external_claude_requires_original_profile_native_proof_and_committed_cursor() {
     use remodex_connect_native::{legacy_activation, profile_handoff::ProfileMode};
-    for (mode, resume, remote) in [
-        (ProfileMode::Copy, true, true),
-        (ProfileMode::Existing, false, true),
-        (ProfileMode::Existing, true, false),
-        (ProfileMode::Existing, true, true),
+    for (mode, resume, remote, linked) in [
+        (ProfileMode::Copy, true, true, true),
+        (ProfileMode::Existing, false, true, true),
+        (ProfileMode::Existing, true, false, true),
+        (ProfileMode::Existing, true, true, true),
+        (ProfileMode::Copy, false, false, false),
+        (ProfileMode::Existing, false, false, false),
+        (ProfileMode::Existing, false, true, false),
     ] {
         let f = Fixture::new(1);
         f.codex_native_export(|_| {});
         let mut public = read(&f.source.join("claude-0.json"));
         public["external"] = json!(true);
-        public["bridgeId"] = json!("cse_existing_owner_fixture");
+        public["bridgeId"] = if linked {
+            json!("cse_existing_owner_fixture")
+        } else {
+            Value::Null
+        };
         public["remoteSequence"] = json!(42);
         write(&f.source.join("claude-0.json"), &public);
         let native = public["nativeId"].as_str().unwrap();
@@ -914,7 +921,7 @@ fn external_claude_requires_original_profile_native_proof_and_committed_cursor()
         let result = legacy_activation::run(&f.generation.join("state"), &config);
         assert_eq!(
             result.is_ok(),
-            mode == ProfileMode::Existing && resume && remote,
+            mode == ProfileMode::Existing && ((!linked && !resume) || (linked && resume && remote)),
             "{result:?}"
         );
         assert_eq!(rows(&f.db()), before);
@@ -1255,6 +1262,128 @@ fn npm_upgrade_fixture() -> (Fixture, PathBuf, PathBuf, PathBuf) {
     );
     let root = f._dir.path().join("npm-install");
     (f, root, plan, receipt)
+}
+
+fn native_control_fixture(port: u16) -> (Fixture, PathBuf, PathBuf) {
+    let (f, root, plan, _) = npm_upgrade_fixture();
+    let mut p = read(&plan);
+    p["bind"] = json!(format!("127.0.0.1:{port}"));
+    p["public_url"] = json!(format!("http://127.0.0.1:{port}"));
+    let config = PathBuf::from(p["configuration"].as_str().unwrap());
+    let mut cfg = read(&config);
+    for agent in ["codex", "claude"] {
+        cfg[agent]["executable"] = json!(env!("CARGO_BIN_EXE_chat-fixture"));
+    }
+    write(&config, &cfg);
+    write(&plan, &p);
+    remodex_connect_native::npm_upgrade::prepare(&root, &plan).unwrap();
+    (f, root, plan)
+}
+
+#[tokio::test]
+async fn installed_native_controls_work_while_owner_holds_journal_and_preserve_history() {
+    use remodex_connect_native::npm_upgrade;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let (_f, root, _plan) = native_control_fixture(port);
+    assert_eq!(
+        npm_upgrade::command(&root, "status").await.unwrap()["running"],
+        false
+    );
+    {
+        let _owner = profile_lock::acquire(&root).unwrap();
+        assert!(
+            npm_upgrade::command(&root, "status").await.is_err(),
+            "unreachable owner must not be called stopped"
+        );
+    }
+    let state = root.join("attempt-1/generation/bridge/state/native-connect.sqlite");
+    let row_count = || {
+        Connection::open(&state)
+            .unwrap()
+            .query_row("SELECT count(*) FROM chat_rows", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    let before = row_count();
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_remodex-connect-native"));
+    cmd.args(["--npm-upgrade", "start"])
+        .arg(&root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    let mut child = cmd.spawn().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let first = tokio::time::timeout(Duration::from_secs(20), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&first).unwrap()["ready"],
+        true
+    );
+    let live = npm_upgrade::command(&root, "status").await.unwrap();
+    assert_eq!(live["running"], true);
+    let restarted = npm_upgrade::command(&root, "restart").await.unwrap();
+    assert_eq!(restarted["restarted"], true);
+    assert_ne!(live["pid"], restarted["pid"]);
+    assert_eq!(
+        npm_upgrade::command(&root, "status").await.unwrap()["pid"],
+        restarted["pid"]
+    );
+    assert_eq!(
+        npm_upgrade::command(&root, "stop").await.unwrap()["stopped"],
+        true
+    );
+    assert!(tokio::time::timeout(Duration::from_secs(15), child.wait())
+        .await
+        .unwrap()
+        .unwrap()
+        .success());
+    assert_eq!(
+        npm_upgrade::command(&root, "status").await.unwrap()["running"],
+        false
+    );
+    assert_eq!(before, row_count());
+    assert!(!root.join("attempt-2").exists());
+}
+
+#[tokio::test]
+async fn installed_native_controls_refuse_foreign_listener_and_tampered_selection() {
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
+    use remodex_connect_native::npm_upgrade;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (_f, root, _plan) = native_control_fixture(listener.local_addr().unwrap().port());
+    let posts = Arc::new(AtomicUsize::new(0));
+    let written = posts.clone();
+    let router=Router::new()
+        .route("/opencodex-session",get(||async {"<meta name=\"opencodex-session-token\" content=\"ocx_session_fixture\"><meta name=\"opencodex-session-csrf\" content=\"fixture\">"}))
+        .route("/api/connect/runtime",get(||async {Json(json!({"runtime":"rust","pid":123,"environmentId":"wrong-installation"}))}))
+        .route("/api/stop",post(move || {let posts=written.clone();async move {posts.fetch_add(1,Ordering::SeqCst);Json(json!({"success":true}))}}));
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    for command in ["status", "stop", "restart"] {
+        assert!(npm_upgrade::command(&root, command).await.is_err());
+    }
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    let p = root.join("cutover.json");
+    let mut value = read(&p);
+    value["bind"] = json!("127.0.0.1:1");
+    write(&p, &value);
+    assert!(npm_upgrade::command(&root, "stop").await.is_err());
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+    server.abort();
 }
 
 #[test]
@@ -1889,7 +2018,14 @@ fn existing_install_upgrade_can_bind_standard_profiles_without_moving_or_copying
 fn desktop_reference_upgrade_allows_live_appends_and_preserves_original_history() {
     use remodex_connect_native::{legacy_activation, legacy_export};
     use std::io::Write;
-    for change in ["append", "identity", "owned", "mixed", "other-profile"] {
+    for change in [
+        "append",
+        "identity",
+        "owned",
+        "mixed",
+        "other-profile",
+        "hard-link",
+    ] {
         let (f, receipt, config) = automatic_export_fixture();
         let mut cfg = read(&config);
         let codex = PathBuf::from(cfg["codex"]["profile"].as_str().unwrap());
@@ -1924,7 +2060,10 @@ fn desktop_reference_upgrade_allows_live_appends_and_preserves_original_history(
         }
         write(&receipt, &document);
         let root = f._dir.path().join("reference-upgrade");
-        if change == "owned" || change == "mixed" {
+        if change == "hard-link" {
+            fs::hard_link(&path, f._dir.path().join("external-reference.jsonl")).unwrap();
+        }
+        if change == "owned" || change == "mixed" || change == "hard-link" {
             assert!(
                 legacy_export::run(&root, &receipt, &config).is_err(),
                 "{change}"

@@ -68,8 +68,7 @@ export async function verifyBinary(root, target, glibc = process.report?.getRepo
   if (after.ino !== before.ino || after.size !== before.size || after.mtimeMs !== before.mtimeMs || hash.digest('hex') !== m.sha256) throw new Error('Native executable checksum failed; reinstall the package.');
   return path;
 }
-export async function main(args = process.argv.slice(2)) {
-  args = nativeArguments(args);
+export async function resolveBinary() {
   const key = platformKey();
   let root;
   try {
@@ -77,7 +76,36 @@ export async function main(args = process.argv.slice(2)) {
   } catch {
     throw new Error(`Native package for ${key} is missing. Reinstall with optional dependencies enabled. No runtime was downloaded or fallback started.`);
   }
-  const binary = await verifyBinary(root, key);
+  return verifyBinary(root, key);
+}
+// A bounded one-time migration check. Unlike main(), this must return to the
+// npm parent so it can reap the compatible source before starting Rust.
+export async function prepareSource(installation, signal) {
+  const binary = await resolveBinary();
+  const child = spawn(binary, ['--npm-upgrade', 'prepare-source', installation], {
+    stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, shell: false, signal,
+  });
+  let stdout = '', stderr = '', exceeded = false;
+  for (const [stream, collect] of [[child.stdout, chunk => { stdout += chunk; }], [child.stderr, chunk => { stderr += chunk; }]]) {
+    stream.setEncoding('utf8');
+    stream.on('data', chunk => {
+      if (stdout.length + stderr.length + chunk.length > 32768) { exceeded = true; child.kill(); }
+      else collect(chunk);
+    });
+  }
+  const timer = setTimeout(() => child.kill(), 15 * 60_000);
+  try {
+    const code = await new Promise((resolve, reject) => {
+      child.once('error', reject); child.once('close', resolve);
+    });
+    if (code !== 0 || exceeded) throw new Error('Native upgrade preparation failed. The original profiles and recovery files were retained.');
+    const result = JSON.parse(stdout);
+    if (result.phase !== 'selected' && result.resumable !== true) throw new Error('Native upgrade did not select a verified generation.');
+  } finally { clearTimeout(timer); }
+}
+export async function main(args = process.argv.slice(2)) {
+  args = nativeArguments(args);
+  const binary = await resolveBinary();
   // Newer POSIX Node can replace the bootstrap, leaving no JS process resident.
   // Older Node and Windows keep only this forwarding launcher, not a JS backend.
   if (process.platform !== 'win32' && typeof process.execve === 'function') {

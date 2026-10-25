@@ -5515,10 +5515,14 @@ fn claude_recoverable(chat: &Chat) -> bool {
     chat.agent == AgentKind::Claude
         && chat.thread["deletedAt"].is_null()
         && chat.thread["archivedAt"].is_null()
-        && ((chat.fork_from.is_none()
-            && chat.remote_identity.as_ref().is_some_and(|identity| {
-                identity.native_session == chat.native_id && identity.validate().is_ok()
-            }))
+        && ((chat.external_claude
+            && chat.remote_identity.is_none()
+            && chat.fork_from.is_none()
+            && uuid::Uuid::parse_str(&chat.native_id).is_ok())
+            || (chat.fork_from.is_none()
+                && chat.remote_identity.as_ref().is_some_and(|identity| {
+                    identity.native_session == chat.native_id && identity.validate().is_ok()
+                }))
             || (!chat.external_claude
                 && chat.sync_replacement.is_some()
                 && (chat.fork_from.is_some() || chat.resumed)))

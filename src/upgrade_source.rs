@@ -173,10 +173,21 @@ fn completed(source: &Source, directory: &Path) -> Result<Option<PathBuf>, Strin
 pub async fn acquire(root: &Path, descriptor: &Path) -> Result<PathBuf, String> {
     acquire_for(root, descriptor, Duration::from_secs(300)).await
 }
+pub async fn acquire_on_port(root: &Path, descriptor: &Path, port: u16) -> Result<PathBuf, String> {
+    acquire_expected(root, descriptor, Duration::from_secs(300), Some(port)).await
+}
 async fn acquire_for(
     root: &Path,
     descriptor: &Path,
     deadline: Duration,
+) -> Result<PathBuf, String> {
+    acquire_expected(root, descriptor, deadline, None).await
+}
+async fn acquire_expected(
+    root: &Path,
+    descriptor: &Path,
+    deadline: Duration,
+    expected_dashboard_port: Option<u16>,
 ) -> Result<PathBuf, String> {
     let source = load(root, descriptor).map_err(|e| format!("{e} (source descriptor)"))?;
     let directory = descriptor.parent().ok_or(ERROR)?;
@@ -197,13 +208,25 @@ async fn acquire_for(
     let until = tokio::time::Instant::now() + deadline;
     let configuration_hash = if source.preflight {
         let endpoint = source.endpoint.strip_suffix("/upgrade").ok_or(ERROR)?;
-        let mut response = client
-            .get(format!("{endpoint}/configuration"))
-            .bearer_auth(&source.token)
-            .header("x-remodex-upgrade-instance", &source.instance)
-            .send()
-            .await
-            .map_err(|_| ERROR)?;
+        // CLI registration precedes the asynchronous phone gateway startup.
+        // Retry only read-only readiness probes, never the source export POST.
+        let ready_until = until.min(tokio::time::Instant::now() + Duration::from_secs(30));
+        let mut response = loop {
+            let response = client
+                .get(format!("{endpoint}/configuration"))
+                .bearer_auth(&source.token)
+                .header("x-remodex-upgrade-instance", &source.instance)
+                .send()
+                .await
+                .map_err(|_| ERROR)?;
+            if response.status() != reqwest::StatusCode::CONFLICT
+                || tokio::time::Instant::now() >= ready_until
+            {
+                break response;
+            }
+            drop(response);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
         if response.status() != reqwest::StatusCode::OK {
             return Err("The original bridge is not ready for upgrade; it remains running".into());
         }
@@ -226,6 +249,16 @@ async fn acquire_for(
         let configuration: crate::chat::Config =
             serde_json::from_slice(&bytes).map_err(|_| ERROR)?;
         configuration.validate_export()?;
+        if expected_dashboard_port.is_some_and(|port| {
+            port == 0
+                || configuration
+                    .connection
+                    .as_ref()
+                    .map(|c| c.dashboard_bind.port())
+                    != Some(port)
+        }) {
+            return Err("The requested dashboard port differs from the running source; its owner remains running".into());
+        }
         if let Some(named) = configuration
             .connection
             .as_ref()
@@ -235,6 +268,12 @@ async fn acquire_for(
         }
         Some(hash)
     } else {
+        if expected_dashboard_port.is_some() {
+            return Err(
+                "This source cannot verify the requested port before shutdown; it remains running"
+                    .into(),
+            );
+        }
         None
     };
     let mut started = false;

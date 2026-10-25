@@ -1914,3 +1914,43 @@ fn checkpoint_prompt_excerpts_keep_newlines_but_reject_terminal_controls() {
     original["fileCheckpoints"][0]["label"] = json!("bad\u{1b}[2J");
     assert!(store.prepare_legacy_claude(&raw(&original)).is_err());
 }
+
+#[test]
+fn external_native_replay_needs_complete_proof_and_keeps_an_immutable_history_boundary() {
+    let (dir, mut store, db) = setup();
+    let mut value = source(dir.path());
+    value["external"] = json!(true);
+    value["upgradeNativeReplay"] = json!(true);
+    value["remoteSequence"] = json!(0);
+    store.prepare_legacy_claude(&raw(&value)).unwrap();
+    let rows = count(&db, "chat_rows");
+    assert!(store
+        .prepare_legacy_claude_resume("original-android-chat")
+        .is_err());
+    let export = native_export(|_, _| {});
+    store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        )
+        .unwrap();
+    let checkpoint = store
+        .prepare_legacy_claude_resume("original-android-chat")
+        .unwrap();
+    assert_eq!(checkpoint["sequence"], 0);
+    assert_eq!(count(&db, "chat_rows"), rows);
+    let cursor: Value = serde_json::from_str(
+        &db.query_row("SELECT cursor FROM native_sync", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cursor["sequence"], 0);
+    assert!(!cursor["projection"].is_null());
+    assert!(cursor["legacy_source"].is_null());
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+}

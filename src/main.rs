@@ -40,8 +40,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(PathBuf::from)
             .ok_or("An installation directory is required")?;
         match (args.get(2).map(String::as_str), args.len()) {
+            (Some("prepare-source"), 4) => println!("{}", remodex_connect_native::npm_upgrade::prepare_registered(&root).await?),
             (Some("start"), 4) => {
                 let code = remodex_connect_native::npm_upgrade::start(&root, shutdown()?).await?;
+                if code != 0 { std::process::exit(code); }
+            }
+            (Some("start"), 5) => {
+                let port: u16 = args[4].parse().map_err(|_| "Invalid dashboard port")?;
+                let code = remodex_connect_native::npm_upgrade::start_on_port(&root, port, shutdown()?).await?;
                 if code != 0 { std::process::exit(code); }
             }
             (Some("automatic"), 5) => {
@@ -53,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let code=remodex_connect_native::npm_upgrade::resume(&root,shutdown()?).await?;
                 if code!=0 {std::process::exit(code);}
             }
-            (Some("status"), 4) => println!("{}",remodex_connect_native::npm_upgrade::resume_info(&root)?),
+            (Some(operation @ ("status"|"stop"|"restart")), 4) => println!("{}",remodex_connect_native::npm_upgrade::command(&root,operation).await?),
             (Some("prepare"), 5) => println!(
                 "{}",
                 remodex_connect_native::npm_upgrade::prepare(&root, &PathBuf::from(&args[4]))?

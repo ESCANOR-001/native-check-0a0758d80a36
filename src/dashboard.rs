@@ -197,6 +197,7 @@ fn secure(mut r: Response) -> Response {
 pub(crate) fn routes(app: App) -> Router<App> {
     Router::new()
         .route("/api/connect/activity", get(activity))
+        .route("/api/connect/runtime", get(runtime_identity))
         .route("/api/storage", get(storage_report))
         .route("/api/storage/cleanup/preview", post(storage_preview))
         .route("/api/storage/trash", get(storage_trash))
@@ -243,6 +244,13 @@ async fn diagnostics(State(app): State<App>) -> Response {
     }
 }
 async fn stop(State(app): State<App>, headers: HeaderMap) -> Response {
+    if header(&headers, "x-remodex-expected-environment").is_some_and(|id| id != app.environment_id)
+    {
+        return error(
+            StatusCode::CONFLICT,
+            "The selected bridge changed; refresh its status",
+        );
+    }
     if let Some(raw) = headers.get("x-opencodex-expected-pid") {
         let pid = raw
             .to_str()
@@ -274,6 +282,13 @@ async fn stop(State(app): State<App>, headers: HeaderMap) -> Response {
     )
 }
 async fn restart(State(app): State<App>, headers: HeaderMap) -> Response {
+    if header(&headers, "x-remodex-expected-environment").is_some_and(|id| id != app.environment_id)
+    {
+        return error(
+            StatusCode::CONFLICT,
+            "The selected bridge changed; refresh its status",
+        );
+    }
     if let Some(raw) = headers.get("x-opencodex-expected-pid") {
         let Some(pid) = raw
             .to_str()
@@ -349,6 +364,12 @@ async fn activity(State(app): State<App>) -> Response {
         Ok(value) => response(StatusCode::OK, value),
         Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, &e),
     }
+}
+async fn runtime_identity(State(app): State<App>) -> Response {
+    response(
+        StatusCode::OK,
+        json!({"runtime":"rust","pid":std::process::id(),"environmentId":app.environment_id}),
+    )
 }
 async fn memory(State(app): State<App>) -> Response {
     match app.metrics.read() {

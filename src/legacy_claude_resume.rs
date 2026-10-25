@@ -19,7 +19,7 @@ fn expected(raw: &[u8], hash: &str) -> Result<Cursor, String> {
         native_session: source["nativeId"].as_str().ok_or(INVALID)?.into(),
         bridge_session: source["bridgeId"].as_str().ok_or(INVALID)?.into(),
     };
-    if source["external"] == true {
+    if source["external"] == true && source["upgradeNativeReplay"] != true {
         let sequence = source["remoteSequence"]
             .as_u64()
             .filter(|v| *v > 0 && *v <= 9_007_199_254_740_991)
@@ -34,7 +34,7 @@ fn expected(raw: &[u8], hash: &str) -> Result<Cursor, String> {
 }
 fn native_proof(db: &rusqlite::Connection, id: &str, raw: &[u8], hash: &str) -> Result<(), String> {
     let source: Value = serde_json::from_slice(raw).map_err(|_| INVALID)?;
-    if source["external"] == true {
+    if source["external"] == true && source["upgradeNativeReplay"] != true {
         return Ok(());
     }
     let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='legacy_claude_native')",[],|r|r.get(0)).map_err(|_|INVALID)?;

@@ -7,10 +7,13 @@ const [module, root, installation, mode] = process.argv.slice(2);
 const { startUpgradeControl } = await import(pathToFileURL(module!).href);
 const source = await realpath(root!);
 let prepared: Promise<string> | undefined;
+let probes = 0;
 const control = await startUpgradeControl({ sourceRoot: source, installation,
-  ...(mode ? {prepareConfiguration(){return prepared ??= (async()=>{
+  ...(mode ? {prepareConfiguration(){
+    if (mode === 'warming' && ++probes <= 2) throw new Error('Gateway is starting');
+    return prepared ??= (async()=>{
     for(const agent of ['codex','claude'])await mkdir(join(source,agent));
-    const bytes=JSON.stringify({workspace:source,codex:{profile:join(source,'codex'),executable:mode==='bad-config'?join(source,'missing'):process.execPath,model:'test'},claude:{profile:join(source,'claude'),executable:process.execPath,model:'test'}});
+    const bytes=JSON.stringify({workspace:source,connection:{dashboard_bind:'127.0.0.1:1234'},codex:{profile:join(source,'codex'),executable:mode==='bad-config'?join(source,'missing'):process.execPath,model:'test'},claude:{profile:join(source,'claude'),executable:process.execPath,model:'test'}});
     await writeFile(join(dirname(control.descriptor),'configuration.json'),bytes,{mode:0o600});
     return createHash('sha256').update(bytes).digest('hex');
   })()}} : {}),
