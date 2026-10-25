@@ -5,7 +5,13 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { platformKey, VERSION } from './launcher.mjs';
 
-export async function buildPackages(binary, destination) {
+function packageVersion(version) {
+  if (typeof version !== 'string' || version.length > 48 || !/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(version)
+    || !version.split('.').every(v => Number.isSafeInteger(Number(v)))) throw new Error('A canonical stable package version is required');
+  return version;
+}
+export async function buildPackages(binary, destination, version = VERSION) {
+  packageVersion(version);
   const target = platformKey();
   const source = resolve(binary), root = resolve(destination);
   const stat = await lstat(source);
@@ -19,29 +25,33 @@ export async function buildPackages(binary, destination) {
   await copyFile(source, path); await chmod(path, 0o755);
   const hash = createHash('sha256');
   for await (const b of createReadStream(path, { highWaterMark: 64 * 1024 })) hash.update(b);
-  const manifest = { formatVersion: 1, version: VERSION, target, migrationComplete: false, bytes: stat.size, sha256: hash.digest('hex') };
+  const manifest = { formatVersion: 1, version, target, migrationComplete: false, bytes: stat.size, sha256: hash.digest('hex') };
   if (target.endsWith('-gnu')) manifest.minimumGlibc = process.report.getReport().header.glibcVersionRuntime; // Conservative tested build baseline.
   await writeFile(join(native, 'native.json'), JSON.stringify(manifest, null, 2));
-  await writeFile(join(native, 'package.json'), JSON.stringify({ name, version: VERSION, private: true, os: [process.platform], cpu: [process.arch], files: [executable, 'native.json'], exports: { './package.json': './package.json' } }, null, 2));
-  const optionalDependencies = Object.fromEntries(['linux-x64-gnu', 'win32-x64', 'darwin-arm64'].map(t => [`@remodex/native-connect-experiment-${t}`, VERSION]));
-  await writeFile(join(launcher, 'package.json'), JSON.stringify({ name: '@remodex/native-connect-experiment', version: VERSION, private: true, type: 'module', bin: { 'rmx-native-experiment': 'bin/launcher.mjs' }, files: ['bin'], engines: { node: '>=20.9.0' }, optionalDependencies }, null, 2));
-  await copyFile(join(dirname(fileURLToPath(import.meta.url)), 'launcher.mjs'), join(launcher, 'bin/launcher.mjs'));
+  await writeFile(join(native, 'package.json'), JSON.stringify({ name, version, private: true, os: [process.platform], cpu: [process.arch], files: [executable, 'native.json'], exports: { './package.json': './package.json' } }, null, 2));
+  const optionalDependencies = Object.fromEntries(['linux-x64-gnu', 'win32-x64', 'darwin-arm64'].map(t => [`@remodex/native-connect-experiment-${t}`, version]));
+  await writeFile(join(launcher, 'package.json'), JSON.stringify({ name: '@remodex/native-connect-experiment', version, private: true, type: 'module', bin: { 'rmx-native-experiment': 'bin/launcher.mjs' }, files: ['bin'], engines: { node: '>=20.9.0' }, optionalDependencies }, null, 2));
+  const template = await readFile(join(dirname(fileURLToPath(import.meta.url)), 'launcher.mjs'), 'utf8');
+  const declaration = `export const VERSION = '${VERSION}';`;
+  if (template.split(declaration).length !== 2) throw new Error('Native launcher version declaration is unavailable');
+  await writeFile(join(launcher, 'bin/launcher.mjs'), template.replace(declaration, `export const VERSION = '${version}';`));
   await chmod(join(launcher, 'bin/launcher.mjs'), 0o755);
-  return { native, launcher, target, name };
+  return { native, launcher, target, name, version };
 }
 // Rehearse the actual published bin aliases without publishing or installing
 // globally. Keep compatibility source files for inspection/recovery, but native
 // selection cannot fall back to them after its durable handoff.
 export async function buildPublishedPackage(runtimeRoot, packages) {
+  const version = packageVersion(packages.version);
   const root=resolve(runtimeRoot), destination=join(dirname(packages.launcher),'published');
   await mkdir(destination);
   for (const name of ['bin','src','gui/dist']) await cp(join(root,name),join(destination,name),{recursive:true,errorOnExist:true,force:false});
   const pkg=JSON.parse(await readFile(join(root,'package.json'),'utf8'));
   await mkdir(join(destination,'bin/native'));
-  await copyFile(join(dirname(fileURLToPath(import.meta.url)),'launcher.mjs'),join(destination,'bin/native/launcher.mjs'));
-  await writeFile(join(destination,'bin/native-runtime.json'),JSON.stringify({formatVersion:1,version:VERSION,backend:'rust',migrationComplete:false}));
-  await writeFile(join(destination,'package.json'),JSON.stringify({name:pkg.name,version:VERSION,private:true,type:'module',bin:pkg.bin,files:['bin','src','gui/dist'],engines:pkg.engines,dependencies:pkg.dependencies,
-    optionalDependencies:Object.fromEntries(['linux-x64-gnu','win32-x64','darwin-arm64'].map(t=>[`@remodex/native-connect-experiment-${t}`,VERSION]))},null,2));
+  await copyFile(join(packages.launcher,'bin/launcher.mjs'),join(destination,'bin/native/launcher.mjs'));
+  await writeFile(join(destination,'bin/native-runtime.json'),JSON.stringify({formatVersion:1,version,backend:'rust',migrationComplete:false}));
+  await writeFile(join(destination,'package.json'),JSON.stringify({name:pkg.name,version,private:true,type:'module',bin:pkg.bin,files:['bin','src','gui/dist'],engines:pkg.engines,dependencies:pkg.dependencies,
+    optionalDependencies:Object.fromEntries(['linux-x64-gnu','win32-x64','darwin-arm64'].map(t=>[`@remodex/native-connect-experiment-${t}`,version]))},null,2));
   return destination;
 }
 if (process.argv[1] && await realpath(process.argv[1]).catch(() => '') === await realpath(fileURLToPath(import.meta.url))) {

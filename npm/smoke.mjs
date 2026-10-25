@@ -35,7 +35,8 @@ const exited = (child, ms = 10_000) => new Promise((resolve, reject) => {
 });
 try {
   const built = await buildPackages(binary, join(root, 'packages'));
-  const tarballs = [built.native, built.launcher].map(dir => join(dir, JSON.parse(npm(['pack', '--json'], dir))[0].filename));
+  const pack = candidate => [candidate.native, candidate.launcher].map(dir => join(dir, JSON.parse(npm(['pack', '--json'], dir))[0].filename));
+  let tarballs = pack(built);
   const mainName = '@remodex/native-connect-experiment';
   const install = () => npm(['install', '--prefix', prefix, '--package-lock=false', ...tarballs]);
   install();
@@ -99,14 +100,21 @@ try {
     assert.equal((await (await req('/api/stop', { method: 'POST', headers: { ...headers, 'x-opencodex-expected-pid': String(memory.pid) } })).json()).success, true);
     assert.equal(await exited(child), 0); children.delete(child);
     assert.equal(await exists(ready.invitationFile), false);
-    if (attempt === 0) install(); // Package replacement must preserve the external state.
+    if (attempt === 0) {
+      const next = await buildPackages(binary, join(root, 'packages-upgrade'), '0.0.1');
+      tarballs = pack(next);
+      install(); // Exercise an actual npm dependency/version change, not a same-version reinstall.
+      for (const name of [mainName, built.name]) {
+        assert.equal(JSON.parse(await readFile(join(prefix, 'node_modules', name, 'package.json'), 'utf8')).version, '0.0.1');
+      }
+    }
   }
   npm(['uninstall', '--prefix', prefix, '--package-lock=false', mainName, built.name]);
   assert.equal(await readFile(join(state, 'sentinel'), 'utf8'), 'Keep state across package replacement and removal');
   assert(await exists(join(state, 'native-connect.sqlite')));
   assert.equal(await exists(launcher), false);
   assert.equal((await readdir(state)).filter(n => n.startsWith('pairing-')).length, 0);
-  console.log(JSON.stringify({ platform: built.target, offlinePackInstall: true, helpVersion: true, twoStarts: true, samePairing: true, dashboardStop: true, replacementPreservedState: true, uninstallPreservedState: true, noGlobalInstall: true }));
+  console.log(JSON.stringify({ platform: built.target, offlinePackInstall: true, helpVersion: true, twoStarts: true, samePairing: true, dashboardStop: true, versionUpgrade: '0.0.0 -> 0.0.1', replacementPreservedState: true, uninstallPreservedState: true, noGlobalInstall: true }));
 } finally {
   for (const child of children) {
     if (child.exitCode === null) {

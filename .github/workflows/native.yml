@@ -44,7 +44,7 @@ jobs:
       - name: Formatting
         run: cargo +1.98.0 fmt --all -- --check
       - name: Validate native npm launcher
-        run: node --test npm/launcher.test.mjs
+        run: node --test npm/launcher.test.mjs npm/build.test.mjs
       - name: Lint all targets
         run: cargo +1.98.0 clippy --locked --all-targets -- -D warnings
       - name: Qualify source handoff before the full suite
