@@ -30,6 +30,10 @@ pub(crate) struct Binding {
     pub message: String,
     pub turn: String,
 }
+pub(crate) struct Reconciled {
+    pub inputs: Vec<Binding>,
+    pub summaries: Vec<String>,
+}
 fn root(
     start: &str,
     parents: &HashMap<String, Option<String>>,
@@ -55,7 +59,7 @@ fn root(
     }
     Ok(result)
 }
-pub(crate) fn reconcile(path: &Path, source: &Value) -> Result<Vec<Binding>, String> {
+pub(crate) fn reconcile(path: &Path, source: &Value) -> Result<Reconciled, String> {
     let messages = source["thread"]["messages"].as_array().ok_or(INVALID)?;
     let deliveries = source["deliveries"]
         .as_array()
@@ -70,7 +74,10 @@ pub(crate) fn reconcile(path: &Path, source: &Value) -> Result<Vec<Binding>, Str
         .filter(|m| m["role"] == "user" && !known.contains(m["id"].as_str().unwrap_or("")))
         .collect();
     if pending.is_empty() {
-        return Ok(vec![]);
+        return Ok(Reconciled {
+            inputs: vec![],
+            summaries: vec![],
+        });
     }
     let wanted: BTreeSet<_> = messages
         .iter()
@@ -101,6 +108,7 @@ pub(crate) fn reconcile(path: &Path, source: &Value) -> Result<Vec<Binding>, Str
     let mut count = 0usize;
     let mut parents = HashMap::new();
     let mut users = BTreeMap::new();
+    let mut summaries = BTreeMap::new();
     let mut anchors: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     loop {
         row.clear();
@@ -150,6 +158,43 @@ pub(crate) fn reconcile(path: &Path, source: &Value) -> Result<Vec<Binding>, Str
         {
             return Err(INVALID.into());
         }
+        // Older SDK history omitted this flag and exposed a native compaction
+        // summary as a user bubble. Preserve that saved history, but never
+        // invent an input/delivery binding for it. Require exact native UUID
+        // and content; summary-like human text alone is not evidence.
+        if v["type"] == "user"
+            && v["message"]["role"] == "user"
+            && v["isCompactSummary"] == true
+            && v["parent_tool_use_id"].is_null()
+        {
+            let content = &v["message"]["content"];
+            let text = content
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| {
+                    content
+                        .as_array()
+                        .filter(|a| {
+                            !a.is_empty()
+                                && a.iter()
+                                    .all(|b| b["type"] == "text" && b["text"].is_string())
+                        })
+                        .map(|a| {
+                            a.iter()
+                                .map(|b| b["text"].as_str().unwrap())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                })
+                .ok_or(INVALID)?;
+            let digest = auth::digest(&text);
+            if summaries
+                .insert(uuid.to_owned(), digest.clone())
+                .is_some_and(|old| old != digest)
+            {
+                return Err(INVALID.into());
+            }
+        }
         if let Some((id, text)) = claude_turns::user_input(&v)? {
             let content = &v["message"]["content"];
             let plain = v["isMeta"] != true
@@ -184,11 +229,24 @@ pub(crate) fn reconcile(path: &Path, source: &Value) -> Result<Vec<Binding>, Str
         .filter_map(|d| d["uuid"].as_str().map(str::to_owned))
         .collect();
     let mut result = Vec::new();
+    let mut preserved_summaries = Vec::new();
     for message in pending {
         if Instant::now() >= deadline {
             return Err(INVALID.into());
         }
         let id = message["id"].as_str().ok_or(INVALID)?;
+        if let Some(digest) = summaries.get(id) {
+            if users.contains_key(id)
+                || digest != &auth::digest(message["text"].as_str().ok_or(INVALID)?)
+                || !used.insert(id.to_owned())
+                || !(message["attachments"].is_null()
+                    || message["attachments"].as_array().is_some_and(Vec::is_empty))
+            {
+                return Err(INVALID.into());
+            }
+            preserved_summaries.push(id.to_owned());
+            continue;
+        }
         let turn = message["turnId"]
             .as_str()
             .filter(|s| !s.is_empty() && s.len() <= 128)
@@ -238,5 +296,9 @@ pub(crate) fn reconcile(path: &Path, source: &Value) -> Result<Vec<Binding>, Str
         });
     }
     result.sort_by(|a, b| a.native.cmp(&b.native));
-    Ok(result)
+    preserved_summaries.sort();
+    Ok(Reconciled {
+        inputs: result,
+        summaries: preserved_summaries,
+    })
 }

@@ -28,6 +28,8 @@ struct Report {
     checkpoints: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     reconciled: Vec<crate::legacy_claude_reconcile::Binding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    summaries: Vec<String>,
 }
 fn fingerprint(path: &Path) -> Result<String, String> {
     let raw = profile_snapshot::bytes(path, MAX_ROW).map_err(|_| INVALID)?;
@@ -59,7 +61,9 @@ struct Required {
 fn required(
     raw: &Value,
     reconciled: &[crate::legacy_claude_reconcile::Binding],
+    summaries: &[String],
 ) -> Result<Required, String> {
+    let summaries: BTreeSet<_> = summaries.iter().map(String::as_str).collect();
     let reconciled: BTreeMap<_, _> = reconciled
         .iter()
         .map(|b| (b.message.as_str(), b.native.as_str()))
@@ -70,6 +74,9 @@ fn required(
         let id = message["id"].as_str().ok_or(INVALID)?;
         match message["role"].as_str() {
             Some("user") => {
+                if summaries.contains(id) {
+                    continue;
+                }
                 let mapped = raw["deliveries"]
                     .as_array()
                     .and_then(|v| v.iter().find(|d| d["messageId"] == id));
@@ -110,12 +117,14 @@ fn inspect(data: &Path, relative: &str, raw: &[u8]) -> Result<Report, String> {
     uuid::Uuid::parse_str(native).map_err(|_| INVALID)?;
     relative_path(relative, native)?;
     let path = data.join(relative);
-    let reconciled = crate::legacy_claude_reconcile::reconcile(&path, &source)?;
+    let reconciliation = crate::legacy_claude_reconcile::reconcile(&path, &source)?;
+    let reconciled = reconciliation.inputs;
+    let summaries = reconciliation.summaries;
     let Required {
         mut users,
         mut replies,
         mut checkpoints,
-    } = required(&source, &reconciled)?;
+    } = required(&source, &reconciled, &summaries)?;
     let (prompts, reply_count, checkpoint_count) = (users.len(), replies.len(), checkpoints.len());
     open(data, true).map_err(|_| INVALID)?;
     open(path.parent().ok_or(INVALID)?, true).map_err(|_| INVALID)?;
@@ -228,6 +237,7 @@ fn inspect(data: &Path, relative: &str, raw: &[u8]) -> Result<Report, String> {
         replies: reply_count,
         checkpoints: checkpoint_count,
         reconciled,
+        summaries,
     })
 }
 fn exists(db: &rusqlite::Connection) -> Result<bool, String> {

@@ -1123,6 +1123,84 @@ fn partial_native_copy_and_ambiguous_prompt_identity_refuse_without_overwrite() 
     }
 }
 #[test]
+fn native_compaction_summary_is_preserved_without_becoming_a_sendable_prompt() {
+    const SUMMARY: &str = "00000000-0000-4000-8000-000000000080";
+    for case in 0..5 {
+        let (dir, mut store, db) = setup();
+        let mut value = source(dir.path());
+        value["thread"]["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id":SUMMARY,"role":"user","text":"Internal compaction summary",
+                "createdAt":TIME,"turnId":"old-summary","sequence":55,"streaming":false
+            }));
+        if case == 1 {
+            value["thread"]["messages"][2]["text"] = json!("Changed text");
+        }
+        if case == 4 {
+            value["thread"]["messages"][2]["attachments"] = json!([{"path":"unproven"}]);
+        }
+        let original = raw(&value);
+        store.prepare_legacy_claude(&original).unwrap();
+        let before = store.load_chat("original-android-chat").unwrap();
+        let export = native_export(|rows, _| {
+            rows.push(
+                json!({"type":"user","uuid":SUMMARY,"parentUuid":INPUT_NATIVE,
+                "sessionId":NATIVE,"isCompactSummary":true,"isVisibleInTranscriptOnly":true,
+                "message":{"role":"user","content":"Internal compaction summary"}}),
+            );
+            if case == 2 {
+                rows.last_mut().unwrap()["uuid"] = json!("00000000-0000-4000-8000-000000000081");
+            }
+            if case == 3 {
+                rows.last_mut().unwrap()["isCompactSummary"] = json!(false);
+            }
+        });
+        let report = store.prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        );
+        if case == 0 {
+            let report = report.unwrap();
+            assert_eq!(report["prompts"], 1);
+            assert_eq!(report["reconciledPromptIds"], 1);
+            assert!(store
+                .claude_input("original-android-chat", NATIVE, SUMMARY)
+                .unwrap()
+                .is_none());
+            assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+            assert_eq!(count(&db, "claude_outbox"), 0);
+            drop(store);
+            store = Store::open(dir.path()).unwrap();
+            assert_eq!(
+                store
+                    .prepare_legacy_claude_native(
+                        "original-android-chat",
+                        &export.snapshot,
+                        &export.transcript
+                    )
+                    .unwrap(),
+                report
+            );
+            store
+                .rollback_legacy_claude("original-android-chat")
+                .unwrap();
+        } else {
+            assert!(
+                report.is_err(),
+                "case {case} must not infer a summary from text alone"
+            );
+        }
+        assert_eq!(
+            std::fs::read(export.root.path().join("export").join(&export.transcript)).unwrap(),
+            export.original
+        );
+    }
+}
+
+#[test]
 fn trimmed_delivery_ledger_recovers_prompt_id_from_native_reply_parents_not_text() {
     for public in [
         "user-message",
