@@ -432,8 +432,8 @@ async fn runtime_uses_only_handed_off_profiles_and_holds_lease_through_setup() {
         storage: Default::default(),
         max_active_chats: 1,
         workspace: state.path().into(),
-        codex: provider(f.plan.codex.original_profile.clone()),
-        claude: provider(f.plan.claude.original_profile.clone()),
+        codex: Some(provider(f.plan.codex.original_profile.clone())),
+        claude: Some(provider(f.plan.claude.original_profile.clone())),
     };
     let service = AuthService::new(Auth::new(store)).unwrap();
     let hub = Chats::start(service.clone(), config.clone()).await.unwrap();

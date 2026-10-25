@@ -41,6 +41,7 @@ impl Settings {
 
 impl Hub {
     pub(super) async fn configure_claude(&mut self, p: &Value) -> Result<Value, String> {
+        self.config.claude()?;
         let object = p
             .as_object()
             .filter(|o| !o.is_empty())
@@ -58,24 +59,25 @@ impl Hub {
         };
         let executable = binary
             .clone()
-            .unwrap_or_else(|| self.claude_default_binary.clone());
-        let binary_changed = executable != self.config.claude.executable;
+            .or_else(|| self.claude_default_binary.clone())
+            .ok_or("Claude Code is not configured on this PC")?;
+        let binary_changed = executable != self.config.claude()?.executable;
         let next = Settings {
             binary,
             enabled: p["enabled"].as_bool().unwrap_or(self.claude_enabled),
             desktop_sync: p["desktopSync"]
                 .as_bool()
-                .unwrap_or(self.config.claude.remote_control),
+                .unwrap_or(self.config.claude_sync_enabled()),
         };
         if next.enabled == self.claude_enabled
-            && next.desktop_sync == self.config.claude.remote_control
+            && next.desktop_sync == self.config.claude_sync_enabled()
             && next.binary == self.claude_binary_override
         {
             return Ok(json!({}));
         }
         let reconnect = binary_changed
             || next.enabled != self.claude_enabled
-            || next.desktop_sync != self.config.claude.remote_control;
+            || next.desktop_sync != self.config.claude_sync_enabled();
         // The native owner can be running while its observer is temporarily
         // absent. Check saved state as well as live workers and pending controls.
         if self.chats.iter().any(|(id, c)| {
@@ -109,9 +111,17 @@ impl Hub {
             tx.commit()
         }).await?.map_err(|_| "Cannot save Claude bridge settings; nothing changed")?;
         self.claude_enabled = next.enabled;
-        self.config.claude.remote_control = next.desktop_sync;
+        self.config
+            .claude
+            .as_mut()
+            .ok_or("Claude Code is not configured on this PC")?
+            .remote_control = next.desktop_sync;
         self.claude_binary_override = next.binary;
-        self.config.claude.executable = executable;
+        self.config
+            .claude
+            .as_mut()
+            .ok_or("Claude Code is not configured on this PC")?
+            .executable = executable;
         // Saving the already-effective path (or clearing an equivalent override)
         // changes only persistence, not the worker or its outstanding history.
         if !reconnect {

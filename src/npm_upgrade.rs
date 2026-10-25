@@ -202,8 +202,8 @@ pub fn prepare(root: &Path, plan_path: &Path) -> Result<Value, String> {
     for input in [
         &plan.closed_owner,
         &plan.configuration,
-        &parsed.codex.profile,
-        &parsed.claude.profile,
+        &parsed.codex()?.profile,
+        &parsed.claude()?.profile,
         &plan.gui,
         plan_path,
     ] {

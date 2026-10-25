@@ -134,14 +134,14 @@ impl Fixture {
             connection: None,
             max_active_chats: 1,
             workspace: dir.path().into(),
-            claude: agent.clone(),
-            codex: AgentConfig {
+            claude: Some(agent.clone()),
+            codex: Some(AgentConfig {
                 shared_server: Some(SharedServer::Capability {
                     address,
                     token_file: token,
                 }),
                 ..agent
-            },
+            }),
         };
         let db = AuthService::new(Auth::new(Store::open(dir.path()).unwrap())).unwrap();
         let hub = Chats::start(db, config).await.unwrap();

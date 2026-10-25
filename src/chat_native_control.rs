@@ -314,7 +314,7 @@ impl Hub {
             .models
             .get(AgentKind::Claude.instance())
             .cloned()
-            .unwrap_or_else(|| crate::models::fallback(&self.config.claude.model));
+            .unwrap_or_else(|| self.config.fallback_models(AgentKind::Claude));
         let current = &self.chats[id].thread["modelSelection"];
         let target = crate::native_control::shared_selection(&catalog, requested, current)?;
         Ok(crate::native_control::settings_steps(&target, current))
@@ -983,9 +983,10 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let profile = dir.path().join("claude-profile");
             std::fs::create_dir(&profile).unwrap();
-            // A directory cannot be launched: model discovery fails at once
-            // and the saved catalog below remains the CLI's reported list.
-            let unused = dir.path().to_path_buf();
+            // A non-executable fixture fails discovery at once. No real CLI
+            // or nested test process is launched; the reported catalog remains.
+            let unused = dir.path().join("unused-cli.exe");
+            std::fs::write(&unused, b"not an executable").unwrap();
             let agent = |profile: PathBuf, remote_control| AgentConfig {
                 executable: unused.clone(),
                 profile,
@@ -1000,8 +1001,8 @@ mod tests {
                 connection: None,
                 max_active_chats: 1,
                 workspace: dir.path().into(),
-                codex: agent(dir.path().into(), false),
-                claude: agent(profile.clone(), false),
+                codex: Some(agent(dir.path().into(), false)),
+                claude: Some(agent(profile.clone(), false)),
             };
             let mut rows = json!([
                 {"value":"default","displayName":"Default","resolvedModel":"claude-wire-sonnet","supportedEffortLevels":["low","high"]},
@@ -1050,7 +1051,7 @@ mod tests {
                 }
             });
             let mut config = config;
-            config.claude.remote_control = true;
+            config.claude.as_mut().unwrap().remote_control = true;
             let hub = Chats::start(db.clone(), config.clone()).await.unwrap();
             let fixture = Self {
                 _dir: dir,
@@ -1169,7 +1170,14 @@ mod tests {
     async fn retry_follows_changed_local_link_without_replaying_a_paused_queue() {
         let mut f = Fixture::start().await;
         let before = f.thread().await;
-        let folder = f.config.claude.profile.join("projects").join("fixture");
+        let folder = f
+            .config
+            .claude
+            .as_ref()
+            .unwrap()
+            .profile
+            .join("projects")
+            .join("fixture");
         std::fs::create_dir_all(&folder).unwrap();
         let binding = json!({"type":"bridge-session","sessionId":NATIVE,
             "bridgeSessionId":"cse_updated_fixture", "cwd":before["worktreePath"]});

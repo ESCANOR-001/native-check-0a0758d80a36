@@ -78,7 +78,7 @@ impl Hub {
         agent: AgentKind,
         p: &Value,
     ) -> Result<Value, String> {
-        if agent != AgentKind::Claude || !self.claude_enabled || !self.config.claude.remote_control
+        if agent != AgentKind::Claude || !self.claude_enabled || !self.config.claude_sync_enabled()
         {
             return Err("Enable Claude synchronization in this isolated profile first".into());
         }
@@ -111,7 +111,7 @@ impl Hub {
         {
             return Err("This Claude session already has a Remodex chat".into());
         }
-        let profile = self.config.claude.profile.clone();
+        let profile = self.config.claude()?.profile.clone();
         let root = self.config.workspace.clone();
         let native = native.to_owned();
         let link =
@@ -152,7 +152,7 @@ impl Hub {
     }
 
     pub(super) async fn launch_external_claude(&mut self, id: &str) -> Result<(), String> {
-        if !self.claude_enabled || !self.config.claude.remote_control {
+        if !self.claude_enabled || !self.config.claude_sync_enabled() {
             return Err("Enable Claude Code sharing in this bridge first".into());
         }
         if self.active.contains_key(id) {
@@ -175,7 +175,7 @@ impl Hub {
             return Err("No existing Claude link is available".into());
         }
         if chat.remote_identity.is_none() {
-            let profile = self.config.claude.profile.clone();
+            let profile = self.config.claude()?.profile.clone();
             let workspace = self.config.workspace.clone();
             let native = chat.native_id.clone();
             let link = tokio::task::spawn_blocking(move || {
@@ -205,7 +205,7 @@ impl Hub {
             .call(move |a| a.store.claude_remote_cursor(&key, identity))
             .await?
             .map_err(|_| "Saved Claude cursor is unavailable")?;
-        let profile = self.config.claude.profile.clone();
+        let profile = self.config.claude()?.profile.clone();
         let workspace = self.config.workspace.clone();
         let native = chat.native_id.clone();
         // Only a complete local bridge-session record for this native session
@@ -234,7 +234,7 @@ impl Hub {
         let chat = &self.chats[id];
         let (_, requests) = crate::claude_history::control_state(&cursor.projection)?;
         let connection = Connection::observe_claude(
-            self.config.claude.profile.clone(),
+            self.config.claude()?.profile.clone(),
             self.config.workspace.clone(),
             chat.native_id.clone(),
             cursor.clone(),

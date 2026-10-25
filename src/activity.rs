@@ -499,14 +499,14 @@ struct State {
 }
 #[derive(Clone)]
 pub(crate) struct Reader {
-    home: PathBuf,
+    home: Option<PathBuf>,
     state: Arc<Mutex<State>>,
     gate: Arc<tokio::sync::Semaphore>,
 }
 impl Reader {
-    pub fn new(home: PathBuf) -> Self {
+    pub fn new(home: impl Into<Option<PathBuf>>) -> Self {
         Self {
-            home,
+            home: home.into(),
             state: Arc::default(),
             gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
@@ -517,7 +517,10 @@ impl Reader {
             .clone()
             .try_acquire_owned()
             .map_err(|_| "Activity is being scanned; retry shortly")?;
-        let home = self.home.clone();
+        let home = self
+            .home
+            .clone()
+            .ok_or("Codex is not configured on this PC")?;
         let state = self.state.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;

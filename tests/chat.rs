@@ -19,7 +19,7 @@ impl Test {
     async fn hosted() -> Self {
         let mut test = Self::new().await;
         test.stop().await;
-        test.config.claude.remote_control = true;
+        test.config.claude.as_mut().unwrap().remote_control = true;
         test.hub = Chats::start(test.db.clone(), test.config.clone())
             .await
             .unwrap();
@@ -29,6 +29,9 @@ impl Test {
         Self::with_workers(1).await
     }
     async fn with_workers(workers: usize) -> Self {
+        Self::with_agents(workers, true, true).await
+    }
+    async fn with_agents(workers: usize, codex: bool, claude: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             storage: Default::default(),
@@ -36,22 +39,22 @@ impl Test {
             connection: None,
             max_active_chats: workers,
             workspace: dir.path().into(),
-            codex: AgentConfig {
+            codex: codex.then(|| AgentConfig {
                 executable: PathBuf::from(env!("CARGO_BIN_EXE_chat-fixture")),
                 profile: dir.path().into(),
                 model: "test".into(),
                 tools: Default::default(),
                 shared_server: None,
                 remote_control: false,
-            },
-            claude: AgentConfig {
+            }),
+            claude: claude.then(|| AgentConfig {
                 executable: PathBuf::from(env!("CARGO_BIN_EXE_chat-fixture")),
                 profile: dir.path().into(),
                 model: "test".into(),
                 tools: Default::default(),
                 shared_server: None,
                 remote_control: false,
-            },
+            }),
         };
         let db = AuthService::new(Auth::new(Store::open(dir.path()).unwrap())).unwrap();
         let hub = Chats::start(db.clone(), config.clone()).await.unwrap();
@@ -123,6 +126,132 @@ impl Test {
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn optional_agents_start_independently_and_missing_agents_cannot_execute() {
+    for (codex, claude) in [(true, false), (false, true), (false, false)] {
+        let t = Test::with_agents(1, codex, claude).await;
+        for (agent, enabled) in [(AgentKind::Codex, codex), (AgentKind::Claude, claude)] {
+            let config = t
+                .hub
+                .call(agent, "phone", "server.getConfig", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(config["providers"][0]["installed"], enabled);
+            assert_eq!(config["providers"][0]["enabled"], enabled);
+            if enabled {
+                t.create(agent, "available").await;
+                t.call(agent, prompt("available", "SINGLE_AGENT_OK", "normal"))
+                    .await
+                    .unwrap();
+                let reply = t.wait(agent, "available", "ready").await;
+                assert!(reply["messages"].to_string().contains("SINGLE_AGENT_OK"));
+            } else {
+                assert_eq!(config["providers"][0]["availability"], "unavailable");
+                assert_eq!(config["providers"][0]["models"], json!([]));
+                let error = t.call(agent,json!({"type":"thread.create","commandId":"absent-create","threadId":"absent","projectId":"native-test-project"})).await.unwrap_err();
+                assert!(error.contains("not configured"), "{error}");
+                let db = rusqlite::Connection::open_with_flags(
+                    t.dir.path().join("native-connect.sqlite"),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let count: i64 = db
+                    .query_row("SELECT count(*) FROM chats WHERE id='absent'", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    count, 0,
+                    "An unavailable agent must not create a phantom chat"
+                );
+            }
+        }
+        if !claude {
+            let status = t
+                .hub
+                .call(
+                    AgentKind::Claude,
+                    "phone",
+                    "claude.getSyncSettings",
+                    json!({}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(status["installed"], false);
+            assert_eq!(status["enabled"], false);
+            assert_eq!(status["activeSessions"], 0);
+            assert!(t
+                .hub
+                .call(
+                    AgentKind::Claude,
+                    "phone",
+                    "claude.setAutoConnect",
+                    json!({"enabled":true})
+                )
+                .await
+                .is_err());
+        }
+        t.hub.prepare_restart().await.unwrap().commit();
+        t.stop().await;
+        // The same state can restart without forcing setup of the absent agent.
+        let hub = Chats::start(t.db.clone(), t.config.clone()).await.unwrap();
+        hub.call(AgentKind::Codex, "local", "native.shutdown", json!({}))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unavailable_agent_keeps_history_and_restoring_configuration_does_not_replay() {
+    for agent in [AgentKind::Codex, AgentKind::Claude] {
+        let mut t =
+            Test::with_agents(1, agent == AgentKind::Codex, agent == AgentKind::Claude).await;
+        t.create(agent, "retained").await;
+        t.call(agent, prompt("retained", "KEEP_HISTORY", "normal"))
+            .await
+            .unwrap();
+        let before = t.wait(agent, "retained", "ready").await["messages"].clone();
+        t.stop().await;
+        let original = t.config.clone();
+        t.config.codex = None;
+        t.config.claude = None;
+        t.hub = Chats::start(t.db.clone(), t.config.clone()).await.unwrap();
+        let offline = t.detail(agent, "retained").await;
+        assert_eq!(offline["messages"], before);
+        assert_eq!(offline["session"]["statusConfidence"], "unknown");
+        assert!(t
+            .call(agent, prompt("retained", "DO_NOT_REPLAY", "normal"))
+            .await
+            .unwrap_err()
+            .contains("not configured"));
+        t.stop().await;
+        t.hub = Chats::start(t.db.clone(), original).await.unwrap();
+        assert_eq!(t.detail(agent, "retained").await["messages"], before);
+        t.call(agent, prompt("retained", "AFTER_RESTORE", "normal"))
+            .await
+            .unwrap();
+        let after = t.wait(agent, "retained", "ready").await;
+        assert!(!after["messages"].to_string().contains("DO_NOT_REPLAY"));
+        t.stop().await;
+    }
+}
+
+#[test]
+fn omitted_agent_configuration_is_distinct_from_broken_agent_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let value = json!({"workspace":dir.path()});
+    let config: Config = serde_json::from_value(value.clone()).unwrap();
+    assert!(config.codex.is_none() && config.claude.is_none());
+    config.validate().unwrap();
+    let mut broken = value;
+    broken["claude"] =
+        json!({"executable":dir.path().join("missing"),"profile":dir.path(),"model":"default"});
+    assert!(serde_json::from_value::<Config>(broken)
+        .unwrap()
+        .validate()
+        .is_err());
 }
 
 async fn configure_switches(test: &Test, value: Value) -> Value {
@@ -384,7 +513,7 @@ fn alternate_claude(test: &Test) -> PathBuf {
     let folder = test.dir.path().join("CLI with spaces");
     std::fs::create_dir_all(&folder).unwrap();
     let path = folder.join(format!("claude-fixture{}", std::env::consts::EXE_SUFFIX));
-    std::fs::copy(&test.config.claude.executable, &path).unwrap();
+    std::fs::copy(&test.config.claude.as_ref().unwrap().executable, &path).unwrap();
     path
 }
 
@@ -399,7 +528,10 @@ async fn claude_executable_changes_use_new_probe_reconnect_same_host_and_survive
         .unwrap();
     let before = test.wait(a, "binary-host", "ready").await;
     let initial = configure_switches(&test, json!({"enabled":true})).await;
-    assert_eq!(initial["binary"], json!(test.config.claude.executable));
+    assert_eq!(
+        initial["binary"],
+        json!(test.config.claude.as_ref().unwrap().executable)
+    );
     let codex = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let v = test
@@ -462,7 +594,10 @@ async fn claude_executable_changes_use_new_probe_reconnect_same_host_and_survive
         .unwrap();
     assert_eq!(restored["binary"], json!(alternate));
     let reset = configure_switches(&test, json!({"binary":""})).await;
-    assert_eq!(reset["binary"], json!(test.config.claude.executable));
+    assert_eq!(
+        reset["binary"],
+        json!(test.config.claude.as_ref().unwrap().executable)
+    );
     wait_links(&test, 4).await;
     let links: Vec<Value> =
         std::fs::read_to_string(test.dir.path().join("host-remote-links.jsonl"))
@@ -501,7 +636,10 @@ async fn claude_executable_same_path_does_not_reconnect_and_invalid_or_failed_wr
         .await
         .unwrap();
     let before = test.wait(a, "binary-safe", "ready").await;
-    for path in [json!(test.config.claude.executable), json!("")] {
+    for path in [
+        json!(test.config.claude.as_ref().unwrap().executable),
+        json!(""),
+    ] {
         let status = configure_switches(&test, json!({"binary":path})).await;
         assert_eq!(status["connectedSessions"], 1);
     }
@@ -563,7 +701,10 @@ async fn claude_executable_same_path_does_not_reconnect_and_invalid_or_failed_wr
         .call(a, "phone", "claude.getSyncSettings", json!({}))
         .await
         .unwrap();
-    assert_eq!(current["binary"], json!(test.config.claude.executable));
+    assert_eq!(
+        current["binary"],
+        json!(test.config.claude.as_ref().unwrap().executable)
+    );
     assert_eq!(current["connectedSessions"], 1);
     assert_eq!(
         test.detail(a, "binary-safe").await["messages"],
@@ -870,7 +1011,7 @@ async fn external_claude_restart_keeps_owner_history_without_launching_another_c
         chat["thread"]["messages"]=json!([{"id":"original","role":"user","text":"Keep the original task intact","turnId":"owner-turn","streaming":false}]);
         a.store.save_chat(&chat,None).unwrap();
     }).await.unwrap();
-    test.config.claude.remote_control = true;
+    test.config.claude.as_mut().unwrap().remote_control = true;
     test.hub = Chats::start(test.db.clone(), test.config.clone())
         .await
         .unwrap();
@@ -1613,7 +1754,7 @@ async fn hosted_claude_recovery_keeps_interrupted_queue_paused_and_respects_opt_
         1
     );
     test.stop().await;
-    test.config.claude.remote_control = false;
+    test.config.claude.as_mut().unwrap().remote_control = false;
     test.hub = Chats::start(test.db.clone(), test.config.clone())
         .await
         .unwrap();

@@ -430,15 +430,15 @@ pub(crate) enum Mutation {
 }
 #[derive(Clone)]
 pub(crate) struct Reader {
-    home: PathBuf,
+    home: Option<PathBuf>,
     cache: Arc<Mutex<Option<(Instant, Value)>>>,
     gate: Arc<tokio::sync::Semaphore>,
     waiting: Arc<tokio::sync::Semaphore>,
 }
 impl Reader {
-    pub fn new(home: PathBuf) -> Self {
+    pub fn new(home: impl Into<Option<PathBuf>>) -> Self {
         Self {
-            home,
+            home: home.into(),
             cache: Arc::default(),
             gate: Arc::new(tokio::sync::Semaphore::new(1)),
             waiting: Arc::new(tokio::sync::Semaphore::new(4)),
@@ -486,7 +486,10 @@ impl Reader {
             .clone()
             .try_acquire_owned()
             .map_err(|_| crate::storage_cleanup::Failure::from("storage_mutation_busy"))?;
-        let home = self.home.clone();
+        let home = self
+            .home
+            .clone()
+            .ok_or_else(|| crate::storage_cleanup::Failure::from("codex_unavailable"))?;
         let cache = self.cache.clone();
         tokio::task::spawn_blocking(move || {
             // HTTP cancellation cannot release admission or allow a second scan
@@ -503,7 +506,10 @@ impl Reader {
     }
     pub async fn read(&self) -> Result<Value, String> {
         let permit = self.read_permit().await?;
-        let home = self.home.clone();
+        let home = self
+            .home
+            .clone()
+            .ok_or("Codex is not configured on this PC")?;
         let cache = self.cache.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -522,7 +528,10 @@ impl Reader {
     }
     pub async fn preview(&self, percent: f64) -> Result<Value, String> {
         let permit = self.read_permit().await?;
-        let home = self.home.clone();
+        let home = self
+            .home
+            .clone()
+            .ok_or("Codex is not configured on this PC")?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             crate::storage_preview::preview(&home, percent).map_err(str::to_owned)
@@ -532,7 +541,10 @@ impl Reader {
     }
     pub async fn trash(&self) -> Result<Value, String> {
         let permit = self.read_permit().await?;
-        let home = self.home.clone();
+        let home = self
+            .home
+            .clone()
+            .ok_or("Codex is not configured on this PC")?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             crate::storage_trash::list(&home).map_err(str::to_owned)
@@ -568,7 +580,7 @@ mod mutation_tests {
     #[tokio::test]
     async fn cancelled_http_owner_cannot_release_storage_or_chat_admission_early() {
         let root = tempfile::tempdir().unwrap();
-        let reader = Reader::new(root.path().into());
+        let reader = Reader::new(root.path().to_path_buf());
         reader.read().await.unwrap();
         assert!(reader.cache.lock().unwrap().is_some());
         let reserved = Arc::new(AtomicBool::new(true));
@@ -608,7 +620,7 @@ mod mutation_tests {
     #[tokio::test]
     async fn concurrent_dashboard_reads_queue_behind_one_scan_with_bounded_waiters() {
         let root = tempfile::tempdir().unwrap();
-        let reader = Reader::new(root.path().into());
+        let reader = Reader::new(root.path().to_path_buf());
         let gate = reader.gate.clone().acquire_owned().await.unwrap();
         let r = reader.clone();
         let task = tokio::spawn(async move { tokio::join!(r.read(), r.trash(), r.preview(100.0)) });

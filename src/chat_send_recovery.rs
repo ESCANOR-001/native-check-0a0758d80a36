@@ -45,7 +45,7 @@ impl Sends {
         !r.reply.is_closed()
             && token.started.elapsed() < WAIT
             && hub.claude_enabled
-            && hub.config.claude.remote_control
+            && hub.config.claude_sync_enabled()
             && hub.chats.get(s(&r.params["threadId"])).is_some_and(|c| {
                 c.native_id == token.native
                     && c.remote_identity == token.link
@@ -127,7 +127,7 @@ impl Sends {
                 Some("Caller disconnected; prompt was not sent")
             } else if p.token.started.elapsed() >= WAIT {
                 Some("Claude is still reconnecting. Your prompt was not sent; wait for Live sync connected and try again.")
-            } else if !hub.claude_enabled || !hub.config.claude.remote_control {
+            } else if !hub.claude_enabled || !hub.config.claude_sync_enabled() {
                 Some("Claude sharing was disabled; prompt was not sent")
             } else if hub.chats.get(&id).is_none_or(|c| {
                 c.native_id != p.token.native

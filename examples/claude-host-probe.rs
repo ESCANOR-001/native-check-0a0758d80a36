@@ -26,7 +26,11 @@ async fn main() -> Result<(), String> {
     let config: Config =
         serde_json::from_value(read(&args[1])?).map_err(|_| "Invalid isolated config")?;
     config.validate()?;
-    for p in [&config.claude.profile, &config.workspace] {
+    let claude = config
+        .claude
+        .as_ref()
+        .ok_or("Configure Claude Code before using this probe")?;
+    for p in [&claude.profile, &config.workspace] {
         if !p.components().any(|c| c.as_os_str() == ".tmp") {
             return Err("This live check requires disposable .tmp paths".into());
         }
@@ -59,11 +63,11 @@ async fn main() -> Result<(), String> {
             .collect();
         env.insert(
             "CLAUDE_CONFIG_DIR".into(),
-            config.claude.profile.to_string_lossy().into_owned(),
+            claude.profile.to_string_lossy().into_owned(),
         );
         let connection = Connection::start(Launch {
             agent: Agent::Claude,
-            executable: config.claude.executable.clone(),
+            executable: claude.executable.clone(),
             cwd: config.workspace.clone(),
             env,
             extra_args: vec![
@@ -79,7 +83,7 @@ async fn main() -> Result<(), String> {
                 "--resume".into(),
                 identity.native_session.clone(),
                 "--model".into(),
-                config.claude.model.clone(),
+                claude.model.clone(),
                 "--replay-user-messages".into(),
             ],
         })

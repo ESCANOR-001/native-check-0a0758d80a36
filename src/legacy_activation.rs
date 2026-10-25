@@ -17,8 +17,8 @@ const ERROR:&str="This migration is not ready to activate; original installation
 
 fn binding(config: &Config) -> Result<String, String> {
     config.validate()?;
-    if (config.codex.shared_server.is_some() && !config.desktop_endpoint())
-        || config.claude.shared_server.is_some()
+    if (config.codex()?.shared_server.is_some() && !config.desktop_endpoint())
+        || config.claude()?.shared_server.is_some()
     {
         return Err("Shared owners require their existing connection; this owned-profile migration cannot take them over".into());
     }
@@ -28,7 +28,7 @@ fn binding(config: &Config) -> Result<String, String> {
         .ok_or(ERROR)?
         .canonicalize()
         .map_err(|_| ERROR)?;
-    let mut value = json!({"root":root,"codex":config.codex.profile.canonicalize().map_err(|_|ERROR)?,"claude":config.claude.profile.canonicalize().map_err(|_|ERROR)?,"workspace":config.workspace.canonicalize().map_err(|_|ERROR)?});
+    let mut value = json!({"root":root,"codex":config.codex()?.profile.canonicalize().map_err(|_|ERROR)?,"claude":config.claude()?.profile.canonicalize().map_err(|_|ERROR)?,"workspace":config.workspace.canonicalize().map_err(|_|ERROR)?});
     if let Some(connection) = &config.connection {
         value["connection"] = json!({"dashboardBind": connection.dashboard_bind, "namedTunnel": connection.named_tunnel});
         if let Some(label) = &connection.label {
@@ -44,7 +44,7 @@ fn binding(config: &Config) -> Result<String, String> {
         reader_executable,
         reader_workspace,
         activation,
-    }) = &config.codex.shared_server
+    }) = &config.codex()?.shared_server
     {
         value["desktopOwner"] = json!({"endpoint":desktop_endpoint.path,"reader":reader_executable.canonicalize().map_err(|_|ERROR)?,"workspace":reader_workspace.canonicalize().map_err(|_|ERROR)?});
         // Preserve the binding of generations created before activation existed.
@@ -155,8 +155,8 @@ pub(crate) fn rollback_lease(
     profile_handoff::inspect_prepared(
         config.native_profile_handoff.as_ref().ok_or(ERROR)?,
         &environment,
-        &config.codex.profile,
-        &config.claude.profile,
+        &config.codex()?.profile,
+        &config.claude()?.profile,
     )
     .map(Some)
 }
@@ -228,7 +228,7 @@ impl Store {
                 && crate::legacy_desktop_reference::verify(
                     &tx,
                     &value,
-                    Some(&config.codex.profile),
+                    Some(&config.codex()?.profile),
                 )?;
             let known: bool = reference
                 || tx
@@ -323,8 +323,8 @@ pub fn run(directory: &Path, config_path: &Path) -> Result<Value, String> {
     let session = profile_handoff::inspect_prepared(
         config.native_profile_handoff.as_ref().ok_or(ERROR)?,
         &environment,
-        &config.codex.profile,
-        &config.claude.profile,
+        &config.codex()?.profile,
+        &config.claude()?.profile,
     )?;
     let (codex, claude) = session.profiles();
     let chats: Vec<(String, String, String)> = store
@@ -368,7 +368,7 @@ pub fn run(directory: &Path, config_path: &Path) -> Result<Value, String> {
             // native-history proof above preserves it without requiring a live
             // relay or inventing an observer cursor. Only the original profile
             // may supply its link later; never resume this chat through a CLI.
-            if (linked && (!resumed || !config.claude.remote_control)) || (!linked && resumed) {
+            if (linked && (!resumed || !config.claude_sync_enabled())) || (!linked && resumed) {
                 return Err(ERROR.into());
             }
             ("legacy_claude_native", &claude)

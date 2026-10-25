@@ -104,8 +104,10 @@ pub struct Config {
     #[serde(default = "default_workers")]
     pub max_active_chats: usize,
     pub workspace: PathBuf,
-    pub codex: AgentConfig,
-    pub claude: AgentConfig,
+    #[serde(default)]
+    pub codex: Option<AgentConfig>,
+    #[serde(default)]
+    pub claude: Option<AgentConfig>,
 }
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
@@ -151,21 +153,28 @@ impl Config {
         if !(1..=8).contains(&self.max_active_chats) {
             return Err("Choose between one and eight active chats".into());
         }
-        for p in [
-            &self.workspace,
-            &self.codex.executable,
-            &self.claude.executable,
-            &self.codex.profile,
-            &self.claude.profile,
-        ] {
-            if !p.is_absolute() || !p.exists() {
-                return Err("Existing absolute test paths required".into());
-            }
+        if !self.workspace.is_absolute() || !self.workspace.is_dir() {
+            return Err("An existing absolute workspace directory is required".into());
         }
-        for p in [&self.codex.profile, &self.claude.profile] {
-            let path = p
+        for (agent, config) in [
+            (AgentKind::Codex, &self.codex),
+            (AgentKind::Claude, &self.claude),
+        ] {
+            let Some(config) = config else { continue };
+            if !config.executable.is_absolute()
+                || !config.executable.is_file()
+                || !config.profile.is_absolute()
+                || !config.profile.is_dir()
+            {
+                return Err(format!(
+                    "{} requires an existing executable and profile directory",
+                    agent.instance()
+                ));
+            }
+            let path = config
+                .profile
                 .canonicalize()
-                .map_err(|_| "Cannot resolve test profile")?;
+                .map_err(|_| "Cannot resolve agent profile")?;
             for key in ["HOME", "USERPROFILE"] {
                 if let Some(home) = std::env::var_os(key) {
                     if !allow_existing
@@ -175,54 +184,79 @@ impl Config {
                     }
                 }
             }
+            if config.model.is_empty() {
+                return Err("Explicit test models required".into());
+            }
+            if agent == AgentKind::Claude && config.shared_server.is_some() {
+                return Err("Shared transport is only supported for Codex".into());
+            }
+            if agent == AgentKind::Codex {
+                if config.remote_control {
+                    return Err("Claude Remote Control cannot be enabled for Codex".into());
+                }
+                if !config.tools.is_empty() {
+                    return Err("Explicit plugin overrides currently apply to Claude only".into());
+                }
+                if let Some(server) = &config.shared_server {
+                    server.validate(&config.profile)?;
+                }
+            } else {
+                config.tools.validate(&self.workspace, &config.profile)?;
+            }
         }
-        if self.codex.model.is_empty() || self.claude.model.is_empty() {
-            return Err("Explicit test models required".into());
-        }
-        if self.claude.shared_server.is_some() {
-            return Err("Shared transport is only supported for Codex".into());
-        }
-        if self.codex.remote_control {
-            return Err("Claude Remote Control cannot be enabled for Codex".into());
-        }
-        if let Some(server) = &self.codex.shared_server {
-            server.validate(&self.codex.profile)?;
-        }
-        if !self.codex.tools.is_empty() {
-            return Err("Explicit plugin overrides currently apply to Claude only".into());
-        }
-        self.claude
-            .tools
-            .validate(&self.workspace, &self.claude.profile)?;
         Ok(())
     }
     pub(crate) fn desktop_endpoint(&self) -> bool {
         matches!(
-            self.codex.shared_server,
+            self.codex.as_ref().and_then(|c| c.shared_server.as_ref()),
             Some(crate::agent::SharedServer::Desktop { .. })
         )
     }
     fn shared_codex(&self, chat: &Chat) -> bool {
         chat.agent == AgentKind::Codex
-            && self.codex.shared_server.is_some()
+            && self
+                .codex
+                .as_ref()
+                .is_some_and(|c| c.shared_server.is_some())
             && (!self.desktop_endpoint() || chat.external_codex)
     }
     fn for_chat(&self, chat: &Chat) -> Result<AgentConfig, String> {
         if chat.external_codex && !self.desktop_endpoint() {
             return Err("Connect this chat through its original Codex Desktop owner; no replacement CLI was started".into());
         }
-        let mut config = self.provider(chat.agent).clone();
+        let mut config = self.provider(chat.agent)?.clone();
         if chat.agent == AgentKind::Codex && self.desktop_endpoint() && !chat.external_codex {
             config.shared_server = None;
         }
         Ok(config)
     }
-    fn provider(&self, agent: AgentKind) -> &AgentConfig {
-        if agent == AgentKind::Codex {
+    pub(crate) fn provider(&self, agent: AgentKind) -> Result<&AgentConfig, String> {
+        (if agent == AgentKind::Codex {
             &self.codex
         } else {
             &self.claude
-        }
+        })
+        .as_ref()
+        .ok_or_else(|| {
+            format!(
+                "{} is not configured on this PC. Set it up in Agents before starting a task.",
+                agent.instance()
+            )
+        })
+    }
+    pub(crate) fn codex(&self) -> Result<&AgentConfig, String> {
+        self.provider(AgentKind::Codex)
+    }
+    pub(crate) fn claude(&self) -> Result<&AgentConfig, String> {
+        self.provider(AgentKind::Claude)
+    }
+    pub(crate) fn claude_sync_enabled(&self) -> bool {
+        self.claude.as_ref().is_some_and(|c| c.remote_control)
+    }
+    fn fallback_models(&self, agent: AgentKind) -> Value {
+        self.provider(agent)
+            .map(|c| crate::models::fallback(&c.model))
+            .unwrap_or_else(|_| json!([]))
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -318,7 +352,7 @@ pub struct Chats {
     restart_gate: Arc<AtomicU8>,
     send: mpsc::Sender<Request>,
     changes: watch::Receiver<u64>,
-    setup: crate::agent_setup::ClaudeSetup,
+    setup: Option<crate::agent_setup::ClaudeSetup>,
     pub(crate) activity: crate::activity::Reader,
     pub(crate) storage_report: crate::storage_report::Reader,
 }
@@ -334,7 +368,7 @@ impl Chats {
         })
         .await??;
         let profile_handoff = if let Some(root) = config.native_profile_handoff.clone() {
-            if config.codex.shared_server.is_some() && !config.desktop_endpoint() {
+            if config.codex()?.shared_server.is_some() && !config.desktop_endpoint() {
                 return Err("Shared Codex ownership must be handed off by its original server; a copied profile cannot adopt that transport".into());
             }
             let external = db
@@ -350,8 +384,8 @@ impl Chats {
                 .call(|a| a.store.environment_id())
                 .await?
                 .map_err(|_| "Cannot verify handoff environment")?;
-            let codex = config.codex.profile.clone();
-            let claude = config.claude.profile.clone();
+            let codex = config.codex()?.profile.clone();
+            let claude = config.claude()?.profile.clone();
             let session = tokio::task::spawn_blocking(move || {
                 crate::profile_handoff::activate(&root, &environment, &codex, &claude)
             })
@@ -363,7 +397,17 @@ impl Chats {
             let migration_config = config.clone();
             db.call(move |a| a.store.complete_migration_activation(&migration_config))
                 .await??;
-            (config.codex.profile, config.claude.profile) = session.profiles();
+            let (codex, claude) = session.profiles();
+            config
+                .codex
+                .as_mut()
+                .ok_or("Codex handoff configuration is missing")?
+                .profile = codex;
+            config
+                .claude
+                .as_mut()
+                .ok_or("Claude handoff configuration is missing")?
+                .profile = claude;
             Some(Arc::new(session))
         } else {
             None
@@ -373,22 +417,32 @@ impl Chats {
             db.call(move |a| a.store.bind_native_profiles(&root))
                 .await??;
         }
-        let switches = setup::Settings::load(&db, config.claude.remote_control).await?;
-        let claude_default_binary = config.claude.executable.clone();
-        if let Some(binary) = &switches.binary {
-            if !binary.is_absolute() || binary.as_os_str().len() > 2048 {
-                return Err("Saved Claude executable path is invalid".into());
+        let switches = setup::Settings::load(&db, config.claude_sync_enabled()).await?;
+        let claude_default_binary = config.claude.as_ref().map(|c| c.executable.clone());
+        if let Some(claude) = config.claude.as_mut() {
+            if let Some(binary) = &switches.binary {
+                if !binary.is_absolute() || binary.as_os_str().len() > 2048 {
+                    return Err("Saved Claude executable path is invalid".into());
+                }
+                claude.executable = binary.clone();
             }
-            config.claude.executable = binary.clone();
+            claude.remote_control = switches.desktop_sync;
         }
-        config.claude.remote_control = switches.desktop_sync;
-        let setup = crate::agent_setup::ClaudeSetup::new(
-            config.claude.clone(),
-            config.workspace.clone(),
-            profile_handoff.clone(),
-        )?;
-        let activity = crate::activity::Reader::new(config.codex.profile.clone());
-        let storage_report = crate::storage_report::Reader::new(config.codex.profile.clone());
+        let setup = config
+            .claude
+            .clone()
+            .map(|c| {
+                crate::agent_setup::ClaudeSetup::new(
+                    c,
+                    config.workspace.clone(),
+                    profile_handoff.clone(),
+                )
+            })
+            .transpose()?;
+        let activity =
+            crate::activity::Reader::new(config.codex.as_ref().map(|c| c.profile.clone()));
+        let storage_report =
+            crate::storage_report::Reader::new(config.codex.as_ref().map(|c| c.profile.clone()));
         let limits = config.storage.clone();
         db.call(move |a| a.store.configure_storage(limits))
             .await??;
@@ -426,7 +480,15 @@ impl Chats {
                     "Reconnecting to the shared Codex session. Saved prompts will not be resent."
                 );
             }
-            if matches!(s(&chat.thread["session"]["status"]), "starting" | "running")
+            let configured = config.provider(chat.agent).is_ok();
+            if !configured {
+                chat.thread["session"]["status"] = json!("disconnected");
+                chat.thread["session"]["statusConfidence"] = json!("unknown");
+                chat.thread["session"]["executionState"] = json!("unknown");
+                chat.thread["session"]["lastError"] = json!("This agent is not configured on this PC. Saved history is available; messages will not be resent.");
+            }
+            if configured
+                && matches!(s(&chat.thread["session"]["status"]), "starting" | "running")
                 && !chat.external_claude
                 && !recover_shared
             {
@@ -445,7 +507,7 @@ impl Chats {
                     .await?
                     .map_err(|_| "Cannot retain uncertain Claude delivery records")?;
             }
-            if switches.enabled && config.claude.remote_control && claude_recoverable(&chat) {
+            if switches.enabled && config.claude_sync_enabled() && claude_recoverable(&chat) {
                 projection::activity(
                     &mut chat,
                     "claude-native-sync",
@@ -489,7 +551,7 @@ impl Chats {
         let (send, receive) = mpsc::channel(16);
         let (changes_tx, changes) = watch::channel(0);
         let mut claude_recovery = crate::claude_reconnect::Recovery::default();
-        if switches.enabled && config.claude.remote_control {
+        if switches.enabled && config.claude_sync_enabled() {
             let mut owned: Vec<_> = chats
                 .iter()
                 .filter(|(_, c)| claude_recoverable(c))
@@ -520,7 +582,7 @@ impl Chats {
                 _profile_handoff: profile_handoff,
                 db,
                 config,
-                claude_enabled: switches.enabled,
+                claude_enabled: switches.enabled && setup.is_some(),
                 claude_default_binary,
                 claude_binary_override: switches.binary,
                 chats,
@@ -643,7 +705,14 @@ impl Chats {
             if enabled == Some(true) && (state["enabled"] != true || state["desktopSync"] != true) {
                 return Err("Enable Claude Code and Desktop sharing in this bridge before automatic connection".into());
             }
-            state["autoConnect"] = self.setup.preference(enabled).await?;
+            state["autoConnect"] = if let Some(setup) = &self.setup {
+                setup.preference(enabled).await?
+            } else {
+                if enabled.is_some() {
+                    return Err("Claude Code is not configured on this PC".into());
+                }
+                json!({"preference":null,"blockedByUserSettings":false,"desktopPreference":"unknown","error":"Claude Code is not configured on this PC"})
+            };
             return Ok(state);
         }
         self.send_request(agent, client, method, params).await
@@ -661,7 +730,12 @@ impl Chats {
             return Ok(state);
         }
         let executable = PathBuf::from(s(&state["binary"]));
-        let account = self.setup.account(refresh, &executable).await;
+        let account = self
+            .setup
+            .as_ref()
+            .ok_or("Claude Code is not configured on this PC")?
+            .account(refresh, &executable)
+            .await;
         state["ready"] = json!(account["ready"] == true && state["catalogReady"] == true);
         state["account"] = account["account"].clone();
         if account["error"].is_string() {
@@ -767,7 +841,7 @@ struct Hub {
     db: AuthService,
     config: Config,
     claude_enabled: bool,
-    claude_default_binary: PathBuf,
+    claude_default_binary: Option<PathBuf>,
     claude_binary_override: Option<PathBuf>,
     chats: HashMap<String, Chat>,
     projects: Value,
@@ -837,7 +911,7 @@ pub(crate) fn finish(chat: &mut Chat, state: &str, error: Option<&str>) {
 }
 impl Hub {
     async fn reconnect_claude(&mut self) {
-        if !self.claude_enabled || !self.config.claude.remote_control {
+        if !self.claude_enabled || !self.config.claude_sync_enabled() {
             return;
         }
         // One launch per tick and at most two handshakes; never compete with
@@ -1353,7 +1427,9 @@ impl Hub {
                     .pop()
                     .filter(|a| *a != AgentKind::Claude || self.claude_enabled)
                 {
-                    let mut config = self.config.provider(agent).clone();
+                    let Ok(mut config) = self.config.provider(agent).cloned() else {
+                        continue;
+                    };
                     if agent == AgentKind::Codex && self.config.desktop_endpoint() {
                         config.shared_server = None;
                     }
@@ -1394,6 +1470,9 @@ impl Hub {
                         } else {self.configure_claude(&r.params).await};
                         if result.is_ok() && self.claude_enabled && !self.models.contains_key(AgentKind::Claude.instance()) && !to_discover.contains(&AgentKind::Claude) {to_discover.push(AgentKind::Claude);}
                         let _=r.reply.send(result);continue;
+                    }
+                    if r.method=="orchestration.dispatchCommand" || r.method=="native.createChat" || r.method.starts_with("claude.") {
+                        if let Err(error) = self.config.provider(r.agent) { let _=r.reply.send(Err(error));continue; }
                     }
                     if r.agent==AgentKind::Claude && !self.claude_enabled && (r.method=="orchestration.dispatchCommand" || r.method=="native.createChat" || r.method.starts_with("claude.")) {
                         let _=r.reply.send(Err("Enable Claude Code in the Remodex dashboard first".into()));continue;
@@ -1495,7 +1574,7 @@ impl Hub {
                             Ok(None)=>{let _=r.reply.send(Ok(json!({"sequence":self.seq})));},
                             Ok(Some(target))=>{
                                 if edit_jobs.len()>=2 {let _=r.reply.send(Err("Two edits are already being prepared; try again shortly".into()));continue;}
-                                self.tool_controls.insert(id.clone());let chat=self.chats[&id].clone();let config=self.config.provider(r.agent).clone();
+                                self.tool_controls.insert(id.clone());let chat=self.chats[&id].clone();let config=match self.config.provider(r.agent).cloned() {Ok(c)=>c,Err(e)=>{let _=r.reply.send(Err(e));continue;}};
                                 edit_jobs.spawn(async move {let result=crate::editing::prepare(config,chat,target).await;(r,result)});
                             },
                             Err(e)=>{let _=r.reply.send(Err(e));},
@@ -1531,7 +1610,7 @@ impl Hub {
                             let point=s(&r.params["point"]).to_owned();let lookup=id.clone();let pid=point.clone();
                             let valid=self.db.call(move|a|a.store.has_checkpoint(&lookup,&pid)).await;
                             if !matches!(valid,Ok(Ok(true))) {let _=r.reply.send(Err("This checkpoint does not belong to the chat".into()));continue;}
-                            let chat=chat.clone();let config=self.config.claude.clone();let client=r.client.clone();self.tool_controls.insert(id);
+                            let chat=chat.clone();let config=match self.config.claude().cloned() {Ok(c)=>c,Err(e)=>{let _=r.reply.send(Err(e));continue;}};let client=r.client.clone();self.tool_controls.insert(id);
                             file_jobs.spawn(async move {let result=crate::checkpoints::preview(config,chat,client,point).await;(r,FileJob::Preview(result))});
                         } else {
                             let token=s(&r.params["token"]);
@@ -1548,7 +1627,7 @@ impl Hub {
                                 if worktree_jobs.len()+bootstrap_jobs.len()>=2 || self.chats.len()+worktree_jobs.len()+bootstrap_jobs.len()>=10000 {let _=r.reply.send(Err("Worktree creation is busy; try again shortly".into()));continue;}
                                 let id=s(&r.params["threadId"]).to_owned();let source=self.chats[&id].clone();
                                 let setup=self.project_setup(&source,true);
-                                let base=self.config.workspace.clone();let profile=self.config.claude.profile.clone();let db=self.db.clone();self.tool_controls.insert(id);
+                                let base=self.config.workspace.clone();let profile=match self.config.claude() {Ok(c)=>c.profile.clone(),Err(e)=>{let _=r.reply.send(Err(e));continue;}};let db=self.db.clone();self.tool_controls.insert(id);
                                 worktree_jobs.spawn(async move {let result=if r.params["action"]=="branchChat" {crate::branches::create(db,profile,source,key,digest).await} else {crate::worktrees::create(db,base,source,key,digest,setup).await};(r,result)});
                             },
                             Ok((_,_,Some(value)))=>{let _=r.reply.send(Ok(value));},
@@ -1570,7 +1649,7 @@ impl Hub {
                                 if tool_jobs.len()+capability_jobs.len()>=2 {let _=r.reply.send(Err("Tool controls are busy; try again shortly".into()));continue;}
                                 let id=s(&r.params["threadId"]).to_owned();
                                 let chat=&self.chats[&id];let cwd=PathBuf::from(s(&chat.thread["worktreePath"]));let disabled=chat.disabled_mcp.clone();
-                                let config=self.config.claude.clone();self.tool_controls.insert(id.clone());idle_capabilities.remove(&id);
+                                let config=match self.config.claude().cloned() {Ok(c)=>c,Err(e)=>{let _=r.reply.send(Err(e));continue;}};self.tool_controls.insert(id.clone());idle_capabilities.remove(&id);
                                 tool_jobs.spawn(async move {let result=crate::capabilities::probe(config,cwd,disabled,Some(control.clone())).await;(r,key,digest,control,result)});
                             },
                             Ok(PreparedTool::Cached(value))=>{let _=r.reply.send(crate::native_control::response(value));},
@@ -1596,7 +1675,7 @@ impl Hub {
                         }
                         if capability_jobs.len()+tool_jobs.len()>=2 {let _=r.reply.send(Err("Claude tools are busy; try again shortly".into()));continue;}
                         let cwd=PathBuf::from(s(&self.chats[&id].thread["worktreePath"]));
-                        let config=self.config.claude.clone();
+                        let config=match self.config.claude().cloned() {Ok(c)=>c,Err(e)=>{let _=r.reply.send(Err(e));continue;}};
                         let disabled=self.chats[&id].disabled_mcp.clone();
                         capability_waiters.insert(id.clone(),vec![r.reply]);
                         capability_jobs.spawn(async move {(id,crate::capabilities::inspect(config,cwd,disabled).await)});
@@ -2152,7 +2231,7 @@ impl Hub {
             .models
             .get(r.agent.instance())
             .cloned()
-            .unwrap_or_else(|| crate::models::fallback(&self.config.provider(r.agent).model));
+            .unwrap_or_else(|| self.config.fallback_models(r.agent));
         crate::models::selection(
             &catalog,
             &c["modelSelection"],
@@ -2252,7 +2331,7 @@ impl Hub {
             .models
             .get(r.agent.instance())
             .cloned()
-            .unwrap_or_else(|| crate::models::fallback(&self.config.provider(r.agent).model));
+            .unwrap_or_else(|| self.config.fallback_models(r.agent));
         crate::models::selection(
             &catalog,
             &c["modelSelection"],
@@ -2400,7 +2479,7 @@ impl Hub {
             .ok_or_else(|| "Chat not found for this agent".into())
     }
     fn config(&self, agent: AgentKind) -> Value {
-        let p = self.config.provider(agent);
+        let installed = self.config.provider(agent).is_ok();
         let title = if agent == AgentKind::Codex {
             "Codex"
         } else {
@@ -2408,9 +2487,9 @@ impl Hub {
         };
         let error = self.discovery_errors.get(agent.instance());
         let known = self.models.contains_key(agent.instance());
-        let enabled = agent != AgentKind::Claude || self.claude_enabled;
+        let enabled = installed && (agent != AgentKind::Claude || self.claude_enabled);
         json!({"cwd":self.config.workspace,"keybindingsConfigPath":"","keybindings":[],"issues":[],"availableEditors":[],
-        "providers":[{"instanceId":agent.instance(),"driver":agent.driver(),"displayName":title,"enabled":enabled,"installed":true,"status":if !enabled{"disabled"}else if error.is_some(){"error"}else if known{"ready"}else{"unknown"},"version":null,"auth":{"status":"unknown"},"checkedAt":now(),"availability":if enabled{"available"}else{"unavailable"},"showInteractionModeToggle":true,"message":error.map(String::as_str).unwrap_or(if known {"Model list loaded. Account access is checked when a request is sent."}else{"Checking the isolated CLI's available models..."}),"models":self.models.get(agent.instance()).cloned().unwrap_or_else(||crate::models::fallback(&p.model)),"skills":[],"plugins":[],"slashCommands":[]}],
+        "providers":[{"instanceId":agent.instance(),"driver":agent.driver(),"displayName":title,"enabled":enabled,"installed":installed,"status":if !enabled{"disabled"}else if error.is_some(){"error"}else if known{"ready"}else{"unknown"},"version":null,"auth":{"status":"unknown"},"checkedAt":now(),"availability":if enabled{"available"}else{"unavailable"},"showInteractionModeToggle":true,"message":error.map(String::as_str).unwrap_or(if !installed {"This agent is not configured on this PC. Set it up in Agents before starting a task."}else if known {"Model list loaded. Account access is checked when a request is sent."}else{"Checking the isolated CLI's available models..."}),"models":if installed {self.models.get(agent.instance()).cloned().unwrap_or_else(||self.config.fallback_models(agent))} else {json!([])},"skills":[],"plugins":[],"slashCommands":[]}],
         "settings":{"addProjectBaseDirectory":self.config.workspace,"providerInstances":{agent.instance():{"driver":agent.driver(),"displayName":title,"enabled":enabled}},"providers":{agent.driver():{"enabled":enabled}}},
         "environment":{"capabilities":{"androidRemoteAtomicPromptEdit":true,"androidRemoteOptimisticPromptAcknowledgement":true,"androidRemoteLatestPromptEditOnly":agent==AgentKind::Codex}},
         "observability":{"logsDirectoryPath":"","localTracingEnabled":false,"otlpTracesEnabled":false,"otlpMetricsEnabled":false}})
@@ -2531,7 +2610,7 @@ impl Hub {
                     issue = error.and_then(|e| crate::agent_setup::verification_issue(e));
                 }
                 Ok(
-                    json!({"enabled":self.claude_enabled,"desktopSync":self.config.claude.remote_control,"installed":self.config.claude.executable.is_file(),"catalogReady":known && error.is_none(),"ready":false,"error":error,"account":{},"binary":self.config.claude.executable,"activeSessions":active,"connectedSessions":connected,"connection":{"connectedSessions":connected,"verificationRequiredSessions":verification_count,"verificationIssue":issue,"desktopVerification":"unconfirmed"},"models":self.models.get(AgentKind::Claude.instance()).cloned().unwrap_or_else(||json!([]))}),
+                    json!({"enabled":self.claude_enabled,"desktopSync":self.config.claude_sync_enabled(),"installed":self.config.claude.as_ref().is_some_and(|c| c.executable.is_file()),"catalogReady":known && error.is_none(),"ready":false,"error":error,"account":{},"binary":self.config.claude.as_ref().map(|c| &c.executable),"activeSessions":active,"connectedSessions":connected,"connection":{"connectedSessions":connected,"verificationRequiredSessions":verification_count,"verificationIssue":issue,"desktopVerification":"unconfirmed"},"models":self.models.get(AgentKind::Claude.instance()).cloned().unwrap_or_else(||json!([]))}),
                 )
             }
             "server.getConfig" | "subscribeServerConfig" => Ok(self.config(agent)),
@@ -2572,7 +2651,7 @@ impl Hub {
                         self.usage_reads.push(id);
                     }
                     if self.usage_task.is_none() {
-                        let config = self.config.claude.clone();
+                        let config = self.config.claude()?.clone();
                         let cwd = self.config.workspace.clone();
                         self.usage_task = Some(tokio::spawn(async move {
                             crate::discovery::claude_usage(config, &cwd).await
@@ -2790,7 +2869,7 @@ impl Hub {
         if c.get("workspaceKind").is_some() && !projectless {
             return Err("Unsupported workspace kind".into());
         }
-        let model = self.config.provider(agent).model.clone();
+        let model = self.config.provider(agent)?.model.clone();
         let catalog = self
             .models
             .get(agent.instance())
@@ -3018,7 +3097,7 @@ impl Hub {
                 if !value.is_object() || !value["model"].is_string() {
                     return Err("Select a default model for this agent".into());
                 }
-                let catalog=self.models.get(agent.instance()).cloned().unwrap_or_else(|| crate::models::fallback(&self.config.provider(agent).model));
+                let catalog=self.models.get(agent.instance()).cloned().unwrap_or_else(|| self.config.fallback_models(agent));
                 c["defaultModelSelection"]=crate::models::project_selection(&catalog,value,agent.instance(),c["type"]=="project.create")?;
             }
             let base = self.config.workspace.clone();
@@ -3145,7 +3224,7 @@ impl Hub {
                         .get(agent.instance())
                         .cloned()
                         .unwrap_or_else(|| {
-                            crate::models::fallback(&self.config.provider(agent).model)
+                            self.config.fallback_models(agent)
                         });
                     let selection = if self.confirmed_settings.as_deref() == Some(id.as_str()) {
                         // Acknowledged by the worker, which reports wire IDs for aliases.
@@ -3383,7 +3462,7 @@ impl Hub {
                                     .get(agent.instance())
                                     .cloned()
                                     .unwrap_or_else(|| {
-                                        crate::models::fallback(&self.config.provider(agent).model)
+                                        self.config.fallback_models(agent)
                                     });
                                 next.thread["modelSelection"] = crate::models::selection(
                                     &catalog,
@@ -3482,7 +3561,7 @@ impl Hub {
             return Err("Active chat limit reached; wait for a free worker".into());
         }
         if self.chats[id].agent == AgentKind::Claude
-            && self.config.claude.remote_control
+            && self.config.claude_sync_enabled()
             && !self.active.contains_key(id)
             && self
                 .active
@@ -3623,7 +3702,7 @@ impl Hub {
             }
             return self.launch_external_claude(id).await;
         }
-        if recovering && (!self.config.claude.remote_control || !claude_recoverable(chat)) {
+        if recovering && (!self.config.claude_sync_enabled() || !claude_recoverable(chat)) {
             return Err("This chat has no owned Claude connection to recover".into());
         }
         if let Some(w) = self.active.get_mut(id) {
@@ -3640,7 +3719,7 @@ impl Hub {
         // completed copies cannot both take the last available shared worker.
         if chat.agent == AgentKind::Claude
             && (self.busy_count() >= self.config.max_active_chats
-                || (self.config.claude.remote_control
+                || (self.config.claude_sync_enabled()
                     && self
                         .active
                         .values()
@@ -4066,7 +4145,7 @@ impl Hub {
                     .is_none_or(|router| !router.pending().any(|i| i.native == native && i.local))
             })
             && crate::claude_link::is_proven_internal_input(
-                self.config.claude.profile.clone(),
+                self.config.claude()?.profile.clone(),
                 self.config.workspace.clone(),
                 self.chats[&id].native_id.clone(),
                 &v,
@@ -4473,7 +4552,7 @@ impl Hub {
                 crate::models::catalog(
                     rows,
                     agent == AgentKind::Codex,
-                    &self.config.provider(agent).model,
+                    &self.config.provider(agent)?.model,
                 ),
             );
         }
@@ -5599,11 +5678,11 @@ mod desktop_routing_tests {
             storage: Default::default(),
             max_active_chats: 1,
             workspace: "/fixture/workspace".into(),
-            codex: provider.clone(),
-            claude: provider,
+            codex: Some(provider.clone()),
+            claude: Some(provider),
         };
         assert!(config.for_chat(&chat(true)).is_err());
-        config.codex.shared_server = Some(crate::agent::SharedServer::Desktop {
+        config.codex.as_mut().unwrap().shared_server = Some(crate::agent::SharedServer::Desktop {
             desktop_endpoint: crate::desktop_ipc::Endpoint {
                 path: "/fixture/profile/ipc.sock".into(),
             },

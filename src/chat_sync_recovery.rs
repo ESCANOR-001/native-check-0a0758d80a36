@@ -94,7 +94,7 @@ impl Hub {
         {
             return Err("Provide the Claude chat, recovery mode and command ID".into());
         }
-        if !self.claude_enabled || !self.config.claude.remote_control {
+        if !self.claude_enabled || !self.config.claude_sync_enabled() {
             return Err("Enable Claude Code and Desktop sharing in this bridge first".into());
         }
         let replace = match s(&p["mode"]) {
@@ -167,7 +167,7 @@ impl Hub {
         if self.recovery_checks.len() >= 2 || self.tool_controls.contains(id) {
             return Err("Claude history recovery is waiting for an available worker".into());
         }
-        let profile = self.config.claude.profile.clone();
+        let profile = self.config.claude()?.profile.clone();
         let target = chat.native_id.clone();
         let native = target.clone();
         let pending = chat.fork_from.is_some();
@@ -322,7 +322,7 @@ impl Hub {
             // which this bridge has not observed. Never kill that worker.
             return Err("Wait for the current Claude connection attempt to finish before replacing its link".into());
         }
-        let profile = self.config.claude.profile.clone();
+        let profile = self.config.claude()?.profile.clone();
         let source = chat.native_id.clone();
         let native = source.clone();
         let point = tokio::task::spawn_blocking(move || crate::branches::point(&profile, &native))

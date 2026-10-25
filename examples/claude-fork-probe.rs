@@ -19,6 +19,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let config: Config = serde_json::from_slice(&std::fs::read(&args[1])?)?;
     config.validate()?;
+    let claude = config
+        .claude
+        .as_ref()
+        .ok_or("Configure Claude Code before using this probe")?;
     let mut env = HashMap::new();
     for k in [
         "HOME",
@@ -35,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     env.insert(
         "CLAUDE_CONFIG_DIR".into(),
-        config.claude.profile.to_string_lossy().into_owned(),
+        claude.profile.to_string_lossy().into_owned(),
     );
     let extra_args = vec![
         "--settings".into(),
@@ -57,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
     let mut connection = Connection::start(Launch {
         agent: Agent::Claude,
-        executable: config.claude.executable,
+        executable: claude.executable.clone(),
         cwd: config.workspace,
         env,
         extra_args,

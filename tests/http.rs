@@ -188,8 +188,8 @@ async fn first_pairing_recovers_a_lost_exchange_and_opens_its_first_socket() {
             connection: None,
             max_active_chats: 1,
             workspace: dir.path().into(),
-            codex: provider.clone(),
-            claude: provider,
+            codex: Some(provider.clone()),
+            claude: Some(provider),
         },
     )
     .await
@@ -337,8 +337,8 @@ async fn android_http_chat_creation_and_websocket_reads_share_native_state() {
             connection: None,
             max_active_chats: 1,
             workspace: dir.path().into(),
-            codex: agent.clone(),
-            claude: agent,
+            codex: Some(agent.clone()),
+            claude: Some(agent),
         },
     )
     .await
@@ -471,8 +471,8 @@ async fn previews_require_an_authorized_exact_file_and_stop_after_phone_revocati
             native_profile_handoff: None,
             connection: None,
             max_active_chats: 1,
-            codex: a.clone(),
-            claude: a,
+            codex: Some(a.clone()),
+            claude: Some(a),
         },
     )
     .await

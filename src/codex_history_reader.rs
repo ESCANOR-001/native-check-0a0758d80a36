@@ -27,7 +27,7 @@ pub async fn capture_from_config(
     let bytes = crate::profile_snapshot::bytes(configuration, 262144).map_err(|_| ERROR)?;
     let config: crate::chat::Config = serde_json::from_slice(&bytes).map_err(|_| ERROR)?;
     config.validate()?;
-    capture(&config.codex, &config.workspace, native, destination).await
+    capture(config.codex()?, &config.workspace, native, destination).await
 }
 
 pub struct Reader {

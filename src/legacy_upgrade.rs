@@ -169,10 +169,10 @@ pub fn run(operation: &str, root: &Path, plan_file: &Path) -> Result<Value, Stri
     if plan.version != 1
         || native.version != 1
         || native.environment != plan.environment
-        || (config.codex.shared_server.is_some()
+        || (config.codex()?.shared_server.is_some()
             && !(config.desktop_endpoint()
                 && native.profile_mode == profile_handoff::ProfileMode::Existing))
-        || config.claude.shared_server.is_some()
+        || config.claude()?.shared_server.is_some()
     {
         return Err(ERROR.into());
     }
@@ -192,8 +192,8 @@ pub fn run(operation: &str, root: &Path, plan_file: &Path) -> Result<Value, Stri
     }
     storage_stage::open(root.parent().ok_or(ERROR)?, true).map_err(|_| ERROR)?;
     if location(config.native_profile_handoff.as_deref().ok_or(ERROR)?)? != root.join("native")
-        || location(&config.codex.profile)? != location(&native.codex.original_profile)?
-        || location(&config.claude.profile)? != location(&native.claude.original_profile)?
+        || location(&config.codex()?.profile)? != location(&native.codex.original_profile)?
+        || location(&config.claude()?.profile)? != location(&native.claude.original_profile)?
     {
         return Err(ERROR.into());
     }

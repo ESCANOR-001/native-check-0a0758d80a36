@@ -708,8 +708,8 @@ async fn agents_dashboard_uses_real_profile_status_and_isolated_preferences() {
         connection: None,
         max_active_chats: 1,
         workspace: f._root.path().into(),
-        codex: agent,
-        claude,
+        codex: Some(agent),
+        claude: Some(claude),
     };
     let hub = Chats::start(f.app.auth.clone(), config).await.unwrap();
     f.app.chats = Some(hub.clone());
@@ -1940,8 +1940,8 @@ async fn storage_fixture() -> (Fixture, remodex_connect_native::chat::Chats) {
         connection: None,
         max_active_chats: 1,
         workspace: f._root.path().into(),
-        codex: agent.clone(),
-        claude: agent,
+        codex: Some(agent.clone()),
+        claude: Some(agent),
     };
     let hub = Chats::start(f.app.auth.clone(), config).await.unwrap();
     f.app.chats = Some(hub.clone());
