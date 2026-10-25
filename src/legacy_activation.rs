@@ -29,13 +29,29 @@ fn binding(config: &Config) -> Result<String, String> {
         .canonicalize()
         .map_err(|_| ERROR)?;
     let mut value = json!({"root":root,"codex":config.codex.profile.canonicalize().map_err(|_|ERROR)?,"claude":config.claude.profile.canonicalize().map_err(|_|ERROR)?,"workspace":config.workspace.canonicalize().map_err(|_|ERROR)?});
+    if let Some(connection) = &config.connection {
+        value["connection"] = json!({"dashboardBind": connection.dashboard_bind, "namedTunnel": connection.named_tunnel});
+        if let Some(label) = &connection.label {
+            value["connection"]["label"] = json!(label);
+        }
+        if let Some(executable) = &connection.cloudflared {
+            value["connection"]["cloudflared"] =
+                json!(executable.canonicalize().map_err(|_| ERROR)?);
+        }
+    }
     if let Some(crate::agent::SharedServer::Desktop {
         desktop_endpoint,
         reader_executable,
         reader_workspace,
+        activation,
     }) = &config.codex.shared_server
     {
         value["desktopOwner"] = json!({"endpoint":desktop_endpoint.path,"reader":reader_executable.canonicalize().map_err(|_|ERROR)?,"workspace":reader_workspace.canonicalize().map_err(|_|ERROR)?});
+        // Preserve the binding of generations created before activation existed.
+        if let Some(activation) = activation {
+            value["desktopOwner"]["activation"] =
+                serde_json::to_value(activation).map_err(|_| ERROR)?;
+        }
     }
     Ok(crate::auth::digest(&value.to_string()))
 }
@@ -208,15 +224,22 @@ impl Store {
             {
                 return Err(ERROR.into());
             }
-            let known: bool = tx
-                .query_row(
-                    &format!(
+            let reference = value["agent"] == "codex"
+                && crate::legacy_desktop_reference::verify(
+                    &tx,
+                    &value,
+                    Some(&config.codex.profile),
+                )?;
+            let known: bool = reference
+                || tx
+                    .query_row(
+                        &format!(
                         "SELECT EXISTS(SELECT 1 FROM {proof} WHERE chat=?1 AND phase='prepared')"
                     ),
-                    [&id],
-                    |r| r.get(0),
-                )
-                .map_err(|_| ERROR)?;
+                        [&id],
+                        |r| r.get(0),
+                    )
+                    .map_err(|_| ERROR)?;
             if !known {
                 return Err(ERROR.into());
             }
@@ -323,6 +346,11 @@ pub fn run(directory: &Path, config_path: &Path) -> Result<Value, String> {
             || chat["thread"]["session"]["activeTurnId"].is_string()
         {
             return Err(ERROR.into());
+        }
+        if agent == "codex"
+            && crate::legacy_desktop_reference::verify(&store.db, &chat, Some(&codex))?
+        {
+            continue;
         }
         let (proof, profile) = if agent == "codex" {
             crate::legacy_codex_native::verify(&store.db, directory, id)?;

@@ -1844,3 +1844,139 @@ fn desktop_owned_upgrade_retains_original_profiles_and_never_activates_as_a_cli_
     );
     legacy_activation::run(&state, &migrated_config).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn existing_install_upgrade_can_bind_standard_profiles_without_moving_or_copying_credentials() {
+    let (f, root, plan, receipt) = npm_upgrade_fixture();
+    let owner = read(&receipt);
+    let home = f._dir.path().join("fixture-home");
+    fs::create_dir(&home).unwrap();
+    for agent in ["codex", "claude"] {
+        let original = PathBuf::from(owner["profiles"][agent].as_str().unwrap());
+        std::os::unix::fs::symlink(&original, home.join(format!(".{agent}"))).unwrap();
+        fs::write(
+            original.join("credential-sentinel"),
+            b"KEEP_IN_ORIGINAL_PROFILE",
+        )
+        .unwrap();
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_remodex-connect-native"))
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .args(["--npm-upgrade", "prepare"])
+        .arg(&root)
+        .arg(&plan)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = remodex_connect_native::npm_upgrade::resume_info(&root).unwrap();
+    assert_eq!(report["profilesKeptInPlace"], true);
+    for agent in ["codex", "claude"] {
+        assert_eq!(
+            fs::read(home.join(format!(".{agent}/credential-sentinel"))).unwrap(),
+            b"KEEP_IN_ORIGINAL_PROFILE"
+        );
+    }
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("KEEP_IN_ORIGINAL_PROFILE"));
+}
+
+#[test]
+fn desktop_reference_upgrade_allows_live_appends_and_preserves_original_history() {
+    use remodex_connect_native::{legacy_activation, legacy_export};
+    use std::io::Write;
+    for change in ["append", "identity", "owned", "mixed", "other-profile"] {
+        let (f, receipt, config) = automatic_export_fixture();
+        let mut cfg = read(&config);
+        let codex = PathBuf::from(cfg["codex"]["profile"].as_str().unwrap());
+        #[cfg(not(windows))]
+        let endpoint = codex.join("ipc.sock");
+        #[cfg(windows)]
+        let endpoint = PathBuf::from(format!(
+            r"\\.\pipe\remodex-desktop-test-{:x}",
+            Sha256::digest(codex.canonicalize().unwrap().as_os_str().as_encoded_bytes())
+        ));
+        cfg["codex"]["shared_server"] = json!({"desktop_endpoint":{"path":endpoint},"reader_executable":std::env::current_exe().unwrap(),"reader_workspace":f._dir.path()});
+        write(&config, &cfg);
+        let owner = receipt.parent().unwrap();
+        let mut conn = read(&owner.join("connection.json"));
+        conn["threadAliases"][0]["externalCodex"] = json!(change != "owned");
+        conn["threadAliases"][0]["nativeModelProvider"] = json!("test-custom-provider");
+        write(&owner.join("connection.json"), &conn);
+        let path = codex.join("sessions/test.jsonl");
+        let original = fs::read(&path).unwrap();
+        let first = &original[..original.iter().position(|b| *b == b'\n').unwrap() + 1];
+        let hash = format!("{:x}", Sha256::digest(first));
+        write(
+            &owner.join("codex.json"),
+            &json!({"version":1,"threadId":"codex","nativeId":CODEX,"profile":codex,"transcript":"sessions/test.jsonl","firstLineSha256":hash,"firstLineBytes":first.len()}),
+        );
+        let mut document = read(&receipt);
+        document["profile_mode"] = json!("existing");
+        document["chats"][0]["desktopReference"] = json!(true);
+        document["chats"][0]["sha256"] = json!(hash);
+        if change == "mixed" {
+            document["chats"][0]["images"] = json!({"original_root":f.original,"export":"never"});
+        }
+        write(&receipt, &document);
+        let root = f._dir.path().join("reference-upgrade");
+        if change == "owned" || change == "mixed" {
+            assert!(
+                legacy_export::run(&root, &receipt, &config).is_err(),
+                "{change}"
+            );
+            continue;
+        }
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "{}",
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"still-running"}})
+        )
+        .unwrap();
+        legacy_export::run(&root, &receipt, &config).unwrap();
+        let state = root.join("generation/bridge/state");
+        let db = Connection::open(state.join("native-connect.sqlite")).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM legacy_desktop_reference WHERE phase='prepared'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM chat_rows", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "Native history is referenced, never falsely imported as an empty transcript"
+        );
+        drop(db);
+        let migrated = root.join("configuration.json");
+        if change == "identity" {
+            fs::write(&path,format!("{}\n",json!({"type":"session_meta","payload":{"id":"00000000-0000-4000-8000-000000000099"}}))).unwrap();
+            assert!(legacy_activation::run(&state, &migrated).is_err());
+        } else if change == "other-profile" {
+            let mut wrong = read(&migrated);
+            wrong["codex"]["profile"] = wrong["claude"]["profile"].clone();
+            write(&migrated, &wrong);
+            assert!(legacy_activation::run(&state, &migrated).is_err());
+        } else {
+            writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(),"{}",json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"still-running"}})).unwrap();
+            let before = fs::read(&path).unwrap();
+            legacy_activation::run(&state, &migrated).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert!(before.starts_with(&original));
+            legacy_rollback::run(&state, true).unwrap();
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                before,
+                "Rollback cannot rewind Desktop work"
+            );
+        }
+    }
+}

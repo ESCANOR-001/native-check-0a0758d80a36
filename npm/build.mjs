@@ -1,5 +1,5 @@
 import { createReadStream } from 'node:fs';
-import { chmod, copyFile, mkdir, lstat, realpath, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, cp, mkdir, lstat, readFile, realpath, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +28,21 @@ export async function buildPackages(binary, destination) {
   await copyFile(join(dirname(fileURLToPath(import.meta.url)), 'launcher.mjs'), join(launcher, 'bin/launcher.mjs'));
   await chmod(join(launcher, 'bin/launcher.mjs'), 0o755);
   return { native, launcher, target, name };
+}
+// Rehearse the actual published bin aliases without publishing or installing
+// globally. Keep compatibility source files for inspection/recovery, but native
+// selection cannot fall back to them after its durable handoff.
+export async function buildPublishedPackage(runtimeRoot, packages) {
+  const root=resolve(runtimeRoot), destination=join(dirname(packages.launcher),'published');
+  await mkdir(destination);
+  for (const name of ['bin','src']) await cp(join(root,name),join(destination,name),{recursive:true,errorOnExist:true,force:false});
+  const pkg=JSON.parse(await readFile(join(root,'package.json'),'utf8'));
+  await mkdir(join(destination,'bin/native'));
+  await copyFile(join(dirname(fileURLToPath(import.meta.url)),'launcher.mjs'),join(destination,'bin/native/launcher.mjs'));
+  await writeFile(join(destination,'bin/native-runtime.json'),JSON.stringify({formatVersion:1,version:VERSION,backend:'rust',migrationComplete:false}));
+  await writeFile(join(destination,'package.json'),JSON.stringify({name:pkg.name,version:VERSION,private:true,type:'module',bin:pkg.bin,files:['bin','src'],engines:pkg.engines,
+    optionalDependencies:Object.fromEntries(['linux-x64-gnu','win32-x64','darwin-arm64'].map(t=>[`@remodex/native-connect-experiment-${t}`,VERSION]))},null,2));
+  return destination;
 }
 if (process.argv[1] && await realpath(process.argv[1]).catch(() => '') === await realpath(fileURLToPath(import.meta.url))) {
   if (process.argv.length !== 4) throw new Error('Usage: node build.mjs RELEASE_BINARY NEW_OUTPUT_DIRECTORY');

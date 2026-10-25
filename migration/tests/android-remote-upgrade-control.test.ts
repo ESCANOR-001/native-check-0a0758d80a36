@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { startUpgradeControl } from '../src/android-remote/upgrade-control';
+import { startUpgradeSource } from '../src/android-remote/upgrade-startup';
 
 test('private source control exports once, retains completion, and refuses browser and wrong-instance requests', async () => {
   const root = await mkdtemp(join(tmpdir(), 'upgrade-control-'));
@@ -104,4 +105,83 @@ test('source registration canonicalizes parent aliases but rejects a linked inst
     await symlink(options.installation, linked, process.platform === 'win32' ? 'junction' : 'dir');
     await expect(startUpgradeControl({ ...options, installation: linked })).rejects.toThrow();
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+
+test('published source startup binds its configuration before shutdown and exits only after a durable plan', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'upgrade-startup-'));
+  const events: string[] = [];
+  const profiles = { codex: join(root, 'codex'), claude: join(root, 'claude') };
+  let published!: () => void;
+  const done = new Promise<void>(resolve => { published = resolve; });
+  const control = await startUpgradeSource({ sourceRoot: root,
+    async runtime() { events.push('resolve'); return { configuration: { profiles, max_active_chats: 4 }, profiles,
+      bind: '127.0.0.1:1234', publicUrl: 'http://127.0.0.1:1234', gui: root }; },
+    async export(directory, actual) {
+      events.push('shutdown'); expect(actual).toEqual(profiles);
+      expect(JSON.parse(await readFile(join(dirname(directory), 'configuration.json'), 'utf8')).profiles).toEqual(profiles);
+      await mkdir(directory); const receipt = join(directory, 'closed-owner.json');
+      await writeFile(receipt, '{}'); return { receipt };
+    },
+    published() { events.push('published'); published(); },
+  });
+  try {
+    expect(events).toEqual([]);
+    const d=JSON.parse(await readFile(control.descriptor, 'utf8'));
+    const headers = { authorization: `Bearer ${d.token}`, 'x-remodex-upgrade-instance':d.instance };
+    expect((await fetch(d.endpoint, { method: 'POST', headers })).status).toBe(409);
+    const preflight = await fetch(d.endpoint.replace('/upgrade', '/configuration'), { headers }).then(r=>r.json());
+    await fetch(d.endpoint, { method: 'POST', headers: { ...headers, 'x-remodex-configuration-sha256': preflight.configurationHash } });
+    await Promise.race([done, Bun.sleep(3000).then(() => { throw new Error('Handoff not published'); })]);
+    expect(events).toEqual(['resolve','resolve','shutdown','published']);
+    const plan=JSON.parse(await readFile(join(dirname(control.descriptor), 'npm-plan.json'), 'utf8'));
+    expect(plan.configuration).toBe(join(dirname(control.descriptor), 'configuration.json'));
+    expect(plan.bind).toBe('127.0.0.1:1234');
+    expect(await fetch(d.endpoint).then(() => true, () => false)).toBe(false);
+    expect(JSON.parse(await readFile(join(root,'native-installation/npm-source.json'),'utf8')).descriptor).toBe(control.descriptor);
+  } finally { await control.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('unsupported source configuration keeps its owner running and publishes no completion', async () => {
+  const root=await mkdtemp(join(tmpdir(),'upgrade-unsupported-'));
+  let exported=false,published=false;
+  const control=await startUpgradeSource({sourceRoot:root,
+    async runtime():Promise<never> { throw new Error('Unsupported tunnel'); },
+    async export():Promise<never> { exported=true; throw new Error('Must not retire source'); },
+    published() { published=true; },
+  });
+  try {
+    const d=JSON.parse(await readFile(control.descriptor,'utf8'));
+    const headers={authorization:`Bearer ${d.token}`,'x-remodex-upgrade-instance':d.instance};
+    expect((await fetch(d.endpoint,{method:'POST',headers})).status).toBe(409);
+    expect((await fetch(d.endpoint,{headers}).then(r=>r.json())).phase).toBe('idle');
+    expect(exported).toBe(false); expect(published).toBe(false);
+    expect(await stat(join(dirname(control.descriptor),'npm-plan.json')).then(()=>true,()=>false)).toBe(false);
+  } finally { await control.close(); await rm(root,{recursive:true,force:true}); }
+});
+
+test('a transient configuration probe can recover without restarting its source owner', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'upgrade-retry-'));
+  let probes = 0, exports = 0;
+  const profiles = { codex: join(root, 'codex'), claude: join(root, 'claude') };
+  const control = await startUpgradeSource({ sourceRoot: root,
+    async runtime() {
+      if (++probes === 1) throw new Error('Temporary capability discovery failure');
+      return { configuration: { profiles }, profiles, bind: '127.0.0.1:1234', publicUrl: 'http://127.0.0.1:1234', gui: root };
+    },
+    async export(): Promise<never> { exports++; throw new Error('No export requested'); },
+  });
+  try {
+    const d = JSON.parse(await readFile(control.descriptor, 'utf8'));
+    const headers = { authorization: `Bearer ${d.token}`, 'x-remodex-upgrade-instance': d.instance };
+    const endpoint = d.endpoint.replace('/upgrade', '/configuration');
+    expect((await fetch(endpoint, { headers })).status).toBe(409);
+    const response = await fetch(endpoint, { headers });
+    expect(response.status).toBe(200);
+    expect((await response.json()).configurationHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(probes).toBe(2);
+    expect(exports).toBe(0);
+    expect((await fetch(d.endpoint, { headers }).then(r => r.json())).phase).toBe('idle');
+    expect(await stat(join(dirname(control.descriptor), 'attempt.json')).then(() => true, () => false)).toBe(false);
+  } finally { await control.close(); await rm(root, { recursive: true, force: true }); }
 });

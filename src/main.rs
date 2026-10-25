@@ -11,6 +11,12 @@ use std::{future::IntoFuture, path::PathBuf, time::Duration};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "--named-tunnel-helper") {
+        match remodex_connect_native::named_tunnel::helper(&args).await {
+            Ok(0) => return Ok(()),
+            _ => std::process::exit(1),
+        }
+    }
     if args.get(1).is_some_and(|a| a == "--capture-codex-history") {
         if args.len() != 5 {
             return Err(
@@ -292,6 +298,7 @@ async fn serve(
         .get(4)
         .map(|path| remodex_connect_native::launch_config::load(&PathBuf::from(path)))
         .transpose()?;
+    let connection = config.as_ref().and_then(|c| c.connection.clone());
     let directory = PathBuf::from(&args[1]);
     let _profile_lock = remodex_connect_native::profile_lock::acquire(&directory)?;
     remodex_connect_native::legacy_activation::before_start(&directory, config.as_ref())?;
@@ -300,6 +307,15 @@ async fn serve(
     // immediate service stop can use the OS default instead of our cleanup.
     let stopping = shutdown()?;
     let listener = tokio::net::TcpListener::bind(&args[2]).await?;
+    let dashboard_listener = match &connection {
+        Some(c) => Some(tokio::net::TcpListener::bind(c.dashboard_bind).await?),
+        None => None,
+    };
+    if let Some(named) = connection.as_ref().and_then(|c| c.named_tunnel.as_ref()) {
+        if named.origin.port() != listener.local_addr()?.port() || dashboard_listener.is_none() {
+            return Err("The saved tunnel must target the phone-only listener".into());
+        }
+    }
     let store = Store::open(&directory)?;
     store.assert_migration_configuration(config.as_ref())?;
     let mut auth = Auth::new(store);
@@ -307,11 +323,27 @@ async fn serve(
         && auth.local_network_enabled()?
         && !auth.quick_tunnel_enabled()?
     {
-        Some(auth.invite("Rust native foundation", &args[3], auth::now())?)
+        Some(
+            auth.invite(
+                connection
+                    .as_ref()
+                    .and_then(|c| c.label.as_deref())
+                    .unwrap_or("Remodex"),
+                &args[3],
+                auth::now(),
+            )?,
+        )
     } else {
         None
     };
-    let mut app = App::with_configuration(auth, "Rust native foundation", config.as_ref())?;
+    let mut app = App::with_configuration(
+        auth,
+        connection
+            .as_ref()
+            .and_then(|c| c.label.as_deref())
+            .unwrap_or("Remodex"),
+        config.as_ref(),
+    )?;
     app.local_url = Some(args[3].clone());
     let diagnostics = remodex_connect_native::diagnostics::Log::new(&directory)?;
     app.diagnostics = Some(diagnostics.clone());
@@ -334,12 +366,19 @@ async fn serve(
     let tunnel_origin = Some(
         remodex_connect_native::tunnel::Origin::start(
             &mut app,
-            std::env::var_os("REMODEX_NATIVE_CLOUDFLARED").map(PathBuf::from),
+            connection
+                .as_ref()
+                .and_then(|c| c.cloudflared.clone())
+                .or_else(|| std::env::var_os("REMODEX_NATIVE_CLOUDFLARED").map(PathBuf::from)),
             &directory,
+            connection.as_ref().and_then(|c| c.named_tunnel.clone()),
         )
         .await?,
     );
     let shutdown_tunnel = app.tunnel.clone();
+    let management = dashboard_listener.map(|listener| {
+        remodex_connect_native::management_listener::Server::start(listener, app.clone())
+    });
     let invitation = invite
         .as_ref()
         .map(|v| InvitationFile::create(&directory, v))
@@ -368,8 +407,12 @@ async fn serve(
     };
     let serving = axum::serve(
         listener,
-        app.router()
-            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        (if connection.is_some() {
+            app.phone_router()
+        } else {
+            app.router()
+        })
+        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
         tokio::select! {
@@ -408,6 +451,9 @@ async fn serve(
     };
     if let Some(origin) = tunnel_origin {
         origin.shutdown().await?;
+    }
+    if let Some(management) = management {
+        management.shutdown().await?;
     }
     drop(invitation);
     if let Some(chats) = chats {

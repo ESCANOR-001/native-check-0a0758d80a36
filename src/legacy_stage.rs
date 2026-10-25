@@ -45,6 +45,8 @@ struct Codex {
     history: String,
     native: Option<Native>,
     uploads: Option<Uploads>,
+    #[serde(default)]
+    reference: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -290,7 +292,14 @@ fn import(store: &mut Store, root: &Path, plan: &Plan, deadline: Instant) -> Res
         if Instant::now() >= deadline {
             return Err(ERROR.into());
         }
-        store.prepare_legacy_codex_history(&chat.id, &input(root, &chat.history)?)?;
+        if chat.reference {
+            if chat.native.is_some() || chat.uploads.is_some() {
+                return Err(ERROR.into());
+            }
+            store.prepare_desktop_reference(&chat.id, &input(root, &chat.history)?)?;
+        } else {
+            store.prepare_legacy_codex_history(&chat.id, &input(root, &chat.history)?)?;
+        }
         if let Some(native) = &chat.native {
             store.prepare_legacy_codex_native(
                 &chat.id,

@@ -213,3 +213,35 @@ fn corrupt_backup_and_unexpected_destination_rows_block_rollback() {
     connect(fresh.path()).execute_batch("CREATE TABLE unexpected_history(value TEXT); INSERT INTO unexpected_history VALUES ('preserve');").unwrap();
     assert!(store.rollback_legacy_connection().is_err());
 }
+
+#[test]
+fn pairing_choice_survives_import_even_when_background_tunnel_is_enabled() {
+    for choice in [None, Some("local"), Some("quick"), Some("named")] {
+        let root = tempfile::tempdir().unwrap();
+        let mut input = source();
+        match choice {
+            Some(value) => input["settings"]["connectionChoice"] = json!(value),
+            None => {
+                input["settings"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("connectionChoice");
+            }
+        }
+        if choice == Some("named") {
+            input["settings"]["tunnelMode"] = json!("named");
+            input["settings"]["namedTunnelHostname"] = json!("phone.example.com");
+        }
+        let mut store = Store::open(root.path()).unwrap();
+        store.prepare_legacy_connection(&parsed(&input)).unwrap();
+        let mut auth = Auth::new(store);
+        assert!(auth.quick_tunnel_enabled().unwrap());
+        assert_eq!(
+            auth.pairing_remote().unwrap(),
+            matches!(choice, Some("quick" | "named"))
+        );
+        auth.set_connection_preferences(None, None, None, Some(false))
+            .unwrap();
+        assert!(!auth.pairing_remote().unwrap());
+    }
+}

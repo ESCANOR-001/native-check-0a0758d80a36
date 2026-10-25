@@ -64,7 +64,13 @@ fn parse(raw: &[u8], root: &Value) -> Result<Vec<Value>, String> {
             || !public.insert(remote)
             || native["id"] != id
             || native["cwd"] != alias["cwd"]
-            || !matches!(native["modelProvider"].as_str(), Some("openai" | "codex"))
+            || !native["modelProvider"].as_str().is_some_and(|s| {
+                !s.is_empty()
+                    && s.len() <= 128
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+            })
+            || native["modelProvider"] != alias["nativeModelProvider"]
             || !matches!(
                 native["status"]["type"].as_str(),
                 Some("idle" | "notLoaded")

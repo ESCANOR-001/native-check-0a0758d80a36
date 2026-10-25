@@ -33,6 +33,8 @@ struct Chat {
     sha256: String,
     uploads: Option<crate::legacy_export_assets::Uploads>,
     images: Option<crate::legacy_export_assets::Images>,
+    #[serde(default, rename = "desktopReference")]
+    desktop_reference: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -121,7 +123,32 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
         .map_err(|_| ERROR)?;
     let config_raw = read(config_path, 262144)?;
     let config: crate::chat::Config = serde_json::from_slice(&config_raw).map_err(|_| ERROR)?;
-    config.validate()?;
+    if receipt.profile_mode == profile_handoff::ProfileMode::Existing {
+        config.validate_export()?;
+    } else {
+        config.validate()?;
+    }
+    let connection: Value = serde_json::from_slice(&read(
+        &child(&original, &receipt.connection)?,
+        16 * 1024 * 1024,
+    )?)
+    .map_err(|_| ERROR)?;
+    if connection["settings"]["tunnelMode"] == "named" {
+        let named = config
+            .connection
+            .as_ref()
+            .and_then(|c| c.named_tunnel.as_ref())
+            .ok_or(ERROR)?;
+        if connection["settings"]["namedTunnelHostname"] != named.hostname {
+            return Err(ERROR.into());
+        }
+    } else if config
+        .connection
+        .as_ref()
+        .is_some_and(|c| c.named_tunnel.is_some())
+    {
+        return Err(ERROR.into());
+    }
     if receipt.version != 1
         || receipt.chats.len() > 10_000
         || (config.codex.shared_server.is_some()
@@ -181,6 +208,26 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
         {
             return Err(ERROR.into());
         }
+        if chat.desktop_reference {
+            if chat.agent != "codex"
+                || receipt.profile_mode != profile_handoff::ProfileMode::Existing
+                || !config.desktop_endpoint()
+                || chat.uploads.is_some()
+                || chat.images.is_some()
+            {
+                return Err(ERROR.into());
+            }
+            crate::legacy_desktop_reference::Reference::parse(
+                &serde_json::to_vec(&v).map_err(|_| ERROR)?,
+            )?
+            .matches_receipt(
+                &receipt.profiles.codex,
+                &chat.id,
+                &chat.transcript,
+                &chat.sha256,
+            )?;
+            continue;
+        }
         crate::legacy_export_assets::validate(
             &v,
             &chat.agent,
@@ -223,7 +270,7 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
             let files: Vec<_> = receipt
                 .chats
                 .iter()
-                .filter(|c| c.agent == agent)
+                .filter(|c| c.agent == agent && !c.desktop_reference)
                 .map(|c| c.transcript.clone())
                 .collect::<BTreeSet<_>>()
                 .into_iter()
@@ -251,6 +298,22 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
     }
     let mut stage = json!({"version":1,"connection":"connection.json","codex_projects":"codex-projects.json","claude_settings":"claude-settings.json","codex":[],"claude":[]});
     for (index, chat) in receipt.chats.iter().enumerate() {
+        if chat.desktop_reference {
+            let name = format!("codex-{index}.json");
+            let bytes = read(&child(&public, &chat.history)?, 16384)?;
+            crate::legacy_desktop_reference::Reference::parse(&bytes)?.matches_receipt(
+                &receipt.profiles.codex,
+                &chat.id,
+                &chat.transcript,
+                &chat.sha256,
+            )?;
+            write(&source.join(&name), &bytes)?;
+            stage["codex"]
+                .as_array_mut()
+                .ok_or(ERROR)?
+                .push(json!({"id":chat.id,"history":name,"reference":true}));
+            continue;
+        }
         let snapshot = source.join(format!("{}-native", chat.agent));
         let manifest: Value =
             serde_json::from_slice(&read(&snapshot.join("snapshot.json"), 8 * 1024 * 1024)?)

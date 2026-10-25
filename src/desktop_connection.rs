@@ -13,6 +13,7 @@ struct Desktop {
     client: Client,
     profile: PathBuf,
     reader: Reader,
+    activation: Option<crate::desktop_activation::Activation>,
     native: String,
     owner: Option<Owner>,
     turn: String,
@@ -21,6 +22,31 @@ struct Desktop {
     lifecycle: std::sync::Arc<std::sync::Mutex<crate::codex_lifecycle::Tracker>>,
 }
 impl Desktop {
+    async fn load_owner(&mut self, native: &str, allow_activation: bool) -> Result<Owner, String> {
+        if let Some(owner) = self.client.find_owner(native).await? {
+            return Ok(owner);
+        }
+        let activation = self
+            .activation
+            .as_ref()
+            .filter(|_| allow_activation)
+            .ok_or(ERROR)?;
+        // Only a conclusive no-client-found may open this existing route. This
+        // cannot replay a prompt or create a competing CLI owner.
+        tokio::time::timeout(Duration::from_secs(9), async {
+            activation.open(&self.profile, native).await?;
+            for delay in [0, 100, 250, 500, 750, 1000, 1500, 2000] {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                if let Some(owner) = self.client.find_owner(native).await? {
+                    return Ok(owner);
+                }
+            }
+            Err(ERROR.to_owned())
+        })
+        .await
+        .map_err(|_| ERROR)?
+    }
+
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
         if method == "initialize" {
             return Ok(json!({"userAgent":"remodex-desktop-follower"}));
@@ -44,7 +70,8 @@ impl Desktop {
                 }
                 // Discovery proves the original owner is connected; the bounded
                 // native turn page provides execution state. Never resume it.
-                self.client.owner(native).await?;
+                self.load_owner(native, params["remodexAllowActivation"] == true)
+                    .await?;
                 let (thread, _) = self.metadata(native).await?;
                 Ok(json!({"thread":thread}))
             }
@@ -277,6 +304,7 @@ impl Connection {
         profile: PathBuf,
         executable: PathBuf,
         cwd: PathBuf,
+        activation: Option<crate::desktop_activation::Activation>,
     ) -> Result<Self, String> {
         let client = endpoint.connect(&profile).await?;
         let config = crate::chat::AgentConfig {
@@ -292,6 +320,7 @@ impl Connection {
             client,
             profile,
             reader,
+            activation,
             native: String::new(),
             owner: None,
             turn: String::new(),

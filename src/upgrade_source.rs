@@ -17,6 +17,8 @@ struct Source {
     instance: String,
     endpoint: String,
     token: String,
+    #[serde(default)]
+    preflight: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -193,6 +195,48 @@ async fn acquire_for(
         .build()
         .map_err(|_| ERROR)?;
     let until = tokio::time::Instant::now() + deadline;
+    let configuration_hash = if source.preflight {
+        let endpoint = source.endpoint.strip_suffix("/upgrade").ok_or(ERROR)?;
+        let mut response = client
+            .get(format!("{endpoint}/configuration"))
+            .bearer_auth(&source.token)
+            .header("x-remodex-upgrade-instance", &source.instance)
+            .send()
+            .await
+            .map_err(|_| ERROR)?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err("The original bridge is not ready for upgrade; it remains running".into());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| ERROR)? {
+            if bytes.len() + chunk.len() > 4096 {
+                return Err(ERROR.into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| ERROR)?;
+        let bytes = private_bytes(&directory.join("configuration.json"), 262144)?;
+        let hash = crate::auth::digest(std::str::from_utf8(&bytes).map_err(|_| ERROR)?);
+        if value["version"] != 1
+            || value["instance"] != source.instance
+            || value["configurationHash"] != hash
+        {
+            return Err(ERROR.into());
+        }
+        let configuration: crate::chat::Config =
+            serde_json::from_slice(&bytes).map_err(|_| ERROR)?;
+        configuration.validate_export()?;
+        if let Some(named) = configuration
+            .connection
+            .as_ref()
+            .and_then(|c| c.named_tunnel.as_ref())
+        {
+            crate::named_tunnel::preflight(named).await?;
+        }
+        Some(hash)
+    } else {
+        None
+    };
     let mut started = false;
     loop {
         if let Some(plan) =
@@ -206,12 +250,14 @@ async fn acquire_for(
             reqwest::Method::POST
         };
         started = true;
-        let response = client
+        let mut request = client
             .request(method, &source.endpoint)
             .bearer_auth(&source.token)
-            .header("x-remodex-upgrade-instance", &source.instance)
-            .send()
-            .await;
+            .header("x-remodex-upgrade-instance", &source.instance);
+        if let Some(hash) = &configuration_hash {
+            request = request.header("x-remodex-configuration-sha256", hash);
+        }
+        let response = request.send().await;
         if let Ok(mut response) = response {
             if response.status() != reqwest::StatusCode::OK {
                 return completed(&source, directory)

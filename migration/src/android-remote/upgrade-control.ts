@@ -14,6 +14,11 @@ export interface UpgradeControlOptions {
     version: 1; closed_owner: string; configuration: string;
     bind: string; public_url: string; gui: string;
   }>;
+  /** The CLI can exit only after its receipt and plan are durable and this
+   * last listener is closed. Never called for an incomplete handoff. */
+  onPublished?(): void;
+  /** Stage only configuration; no admission drain or owner shutdown. */
+  prepareConfiguration?(): Promise<string>;
 }
 const FAILURE = 'The source upgrade did not complete. Existing data and recovery files were retained.';
 async function writeNew(path: string, value: unknown) {
@@ -39,7 +44,7 @@ export async function startUpgradeControl(options: UpgradeControlOptions) {
   let closed = false;
   const server = Bun.serve({
     hostname: '127.0.0.1', port: 0, maxRequestBodySize: 1024, idleTimeout: 10,
-    fetch(request) {
+    async fetch(request) {
       const auth = Buffer.from(request.headers.get('authorization') ?? '');
       const expected = Buffer.from(`Bearer ${token}`);
       // Not a browser API: Origin, Fetch Metadata and redirects have no role in
@@ -48,12 +53,25 @@ export async function startUpgradeControl(options: UpgradeControlOptions) {
         || request.headers.has('origin') || request.headers.has('sec-fetch-site')
         || request.headers.get('x-remodex-upgrade-instance') !== instance) return new Response(null, { status: 403 });
       const url = new URL(request.url);
+      if (url.pathname === '/configuration' && !url.search && !url.hash && request.method === 'GET' && options.prepareConfiguration) {
+        if (phase !== 'idle' || closed) return new Response(null, { status: 409 });
+        try {
+          const configurationHash = await options.prepareConfiguration();
+          return Response.json({ version: 1, instance, configurationHash }, { headers: { 'cache-control': 'no-store' } });
+        } catch { return new Response(null, { status: 409 }); }
+      }
       if (url.pathname !== '/upgrade' || url.search || url.hash
         || request.headers.get('transfer-encoding')
         || ![null, '0'].includes(request.headers.get('content-length'))) return new Response(null, { status: 400 });
       if (!['GET', 'POST'].includes(request.method)) return new Response(null, { status: 405 });
       if (closed) return new Response(null, { status: 503 });
       if (request.method === 'POST' && phase === 'idle') {
+        if (options.prepareConfiguration) {
+          try {
+            if (request.headers.get('x-remodex-configuration-sha256') !== await options.prepareConfiguration()) return new Response(null, { status: 409 });
+          } catch { return new Response(null, { status: 409 }); }
+          if (closed || phase !== 'idle') return Response.json({ version: 1, instance, phase });
+        }
         // Set synchronously before any await. Repeated requests join the same
         // durable attempt; they never replay shutdown or overwrite an export.
         phase = 'exporting';
@@ -68,6 +86,7 @@ export async function startUpgradeControl(options: UpgradeControlOptions) {
           // its workers and public listener have already been released.
           await server.stop(true);
           closed = true;
+          options.onPublished?.();
         })().catch(() => { phase = 'failed'; });
       }
       return Response.json({ version: 1, instance, phase }, { headers: { 'cache-control': 'no-store' } });
@@ -88,7 +107,8 @@ export async function startUpgradeControl(options: UpgradeControlOptions) {
     // the canonical directory instead of comparing its textual spelling.
     const installation = await realpath(options.installation);
     await writeNew(descriptor, { version: 1, source_root: sourceRoot, installation,
-      instance, endpoint: `http://127.0.0.1:${server.port}/upgrade`, token });
+      instance, endpoint: `http://127.0.0.1:${server.port}/upgrade`, token,
+      ...(options.prepareConfiguration ? { preflight: true } : {}) });
     await writeNew(registration, { version: 1, descriptor });
     registrationIdentity = await lstat(registration);
     registered = true;

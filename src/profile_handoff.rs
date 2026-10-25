@@ -334,7 +334,14 @@ fn validate(plan: &Plan, root: &Path) -> Result<()> {
         return Err(ERROR.into());
     }
     for input in [&plan.codex, &plan.claude] {
-        isolated(&input.original_profile)?;
+        if plan.profile_mode == ProfileMode::Existing {
+            // Existing mode binds the original directory and verifies selected
+            // exports. It never copies authentication or replaces native files.
+            absolute(&input.original_profile)?;
+            ordinary_parents(&input.original_profile)?;
+        } else {
+            isolated(&input.original_profile)?;
+        }
         if plan.profile_mode == ProfileMode::Copy
             && migration_snapshot::is_selected(&input.snapshot, &plan.environment)
                 .map_err(|_| ERROR)?

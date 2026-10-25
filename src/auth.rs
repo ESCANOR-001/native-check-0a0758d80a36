@@ -275,6 +275,33 @@ impl Auth {
     pub fn quick_tunnel_enabled(&self) -> rusqlite::Result<bool> {
         self.bool_setting("quick_tunnel_enabled", false)
     }
+    /// The legacy runtime runs its tunnel even while the Local QR tab is
+    /// selected. Preserve that separate pairing choice across migration.
+    pub fn pairing_remote(&self) -> rusqlite::Result<bool> {
+        use rusqlite::OptionalExtension;
+        let explicit: Option<String> = self
+            .store
+            .db
+            .query_row(
+                "SELECT value FROM metadata WHERE key='pairing_remote'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(value) = explicit {
+            return match value.as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err(rusqlite::Error::InvalidQuery),
+            };
+        }
+        let legacy: bool = self.store.db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='legacy_connection_import')", [], |r| r.get(0))?;
+        if legacy {
+            let choice: Option<String> = self.store.db.query_row("SELECT json_extract(CAST(raw AS TEXT),'$.settings.connectionChoice') FROM legacy_connection_import WHERE id=1", [], |r| r.get(0)).optional()?.flatten();
+            return Ok(matches!(choice.as_deref(), Some("quick" | "named")));
+        }
+        self.quick_tunnel_enabled()
+    }
     fn bool_setting(&self, key: &str, default: bool) -> rusqlite::Result<bool> {
         use rusqlite::OptionalExtension;
         let value: Option<String> = self
@@ -322,6 +349,7 @@ impl Auth {
             ("keep_awake", keep_awake),
             ("local_network_enabled", local),
             ("quick_tunnel_enabled", quick),
+            ("pairing_remote", quick),
         ] {
             if let Some(value) = value {
                 tx.execute("INSERT INTO metadata(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key, if value {"true"} else {"false"}])?;

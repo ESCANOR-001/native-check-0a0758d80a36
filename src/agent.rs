@@ -32,6 +32,8 @@ pub enum SharedServer {
         desktop_endpoint: crate::desktop_ipc::Endpoint,
         reader_executable: PathBuf,
         reader_workspace: PathBuf,
+        #[serde(default)]
+        activation: Option<crate::desktop_activation::Activation>,
     },
     Capability {
         address: std::net::SocketAddr,
@@ -48,6 +50,7 @@ impl SharedServer {
                 desktop_endpoint,
                 reader_executable,
                 reader_workspace,
+                activation,
             } => {
                 if !reader_executable.is_absolute()
                     || !reader_executable.is_file()
@@ -55,6 +58,9 @@ impl SharedServer {
                     || !reader_workspace.is_dir()
                 {
                     return Err("The Desktop history reader needs explicit existing paths".into());
+                }
+                if let Some(activation) = activation {
+                    activation.validate(profile)?;
                 }
                 desktop_endpoint.validate(profile)
             }
@@ -139,6 +145,7 @@ impl SharedServer {
             desktop_endpoint,
             reader_executable,
             reader_workspace,
+            activation,
         } = self
         {
             self.validate(profile)?;
@@ -147,6 +154,7 @@ impl SharedServer {
                 profile.to_owned(),
                 reader_executable.clone(),
                 reader_workspace.clone(),
+                activation.clone(),
             )
             .await;
         }

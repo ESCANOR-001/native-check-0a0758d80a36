@@ -126,7 +126,11 @@ pub(crate) async fn read(
     let result=tokio::time::timeout(Duration::from_secs(12), async {
         rpc(&mut connection,"initialize",json!({"clientInfo":{"name":"remodex_history_reader","version":"0.0.0"},"capabilities":{"experimentalApi":true}})).await?;
         connection.send(&json!({"method":"initialized","params":{}})).await.map_err(|_|"Shared history disconnected")?;
-        let metadata=match rpc_response(&mut connection,"thread/read",json!({"threadId":native,"includeTurns":false})).await? {
+        let mut read_params=json!({"threadId":native,"includeTurns":false});
+        if explicit_send && matches!(config.shared_server, Some(crate::agent::SharedServer::Desktop { .. })) {
+            read_params["remodexAllowActivation"]=json!(true);
+        }
+        let metadata=match rpc_response(&mut connection,"thread/read",read_params).await? {
             Ok(v)=>v,
             Err(error)=>{
                 let cid=chat.clone();let nid=native.clone();

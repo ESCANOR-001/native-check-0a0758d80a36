@@ -2,6 +2,21 @@
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--activate") {
+        assert_eq!(args.len(), 4);
+        assert!(args[3].starts_with(
+            "codex://threads/12345678-1234-4234-8234-123456789abc?opencodex-reactivate="
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&args[2])
+            .unwrap();
+        writeln!(file, "{}", args[3]).unwrap();
+        return;
+    }
+
     let root = std::path::PathBuf::from(std::env::var_os("CODEX_HOME").unwrap());
     let setup: Value =
         serde_json::from_slice(&std::fs::read(root.join("fixture.json")).unwrap()).unwrap();

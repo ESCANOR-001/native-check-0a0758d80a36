@@ -83,9 +83,22 @@ fn default_workers() -> usize {
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ConnectionConfig {
+    pub dashboard_bind: std::net::SocketAddr,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub cloudflared: Option<PathBuf>,
+    #[serde(default)]
+    pub named_tunnel: Option<crate::named_tunnel::Config>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub native_profile_handoff: Option<PathBuf>,
+    #[serde(default)]
+    pub connection: Option<ConnectionConfig>,
     #[serde(default)]
     pub storage: crate::storage::Limits,
     #[serde(default = "default_workers")]
@@ -96,6 +109,44 @@ pub struct Config {
 }
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_paths(self.native_profile_handoff.is_some())
+    }
+    /// Read-only export validation. Starting with these paths still requires a
+    /// verified source receipt, installation binding and profile handoff lease.
+    pub(crate) fn validate_export(&self) -> Result<(), String> {
+        self.validate_paths(true)
+    }
+    fn validate_paths(&self, allow_existing: bool) -> Result<(), String> {
+        if let Some(connection) = &self.connection {
+            if connection.label.as_ref().is_some_and(|s| {
+                s.trim().is_empty() || s.len() > 256 || s.chars().any(char::is_control)
+            }) {
+                return Err("The saved PC name is invalid".into());
+            }
+            if let Some(path) = &connection.cloudflared {
+                if !path.is_absolute() || !path.is_file() {
+                    return Err("The saved tunnel executable is unavailable".into());
+                }
+                #[cfg(windows)]
+                if !path
+                    .extension()
+                    .is_some_and(|v| v.eq_ignore_ascii_case("exe"))
+                {
+                    return Err("A native tunnel executable is required".into());
+                }
+            }
+            if !connection.dashboard_bind.ip().is_loopback()
+                || connection.dashboard_bind.port() == 0
+            {
+                return Err("The dashboard requires an explicit loopback address".into());
+            }
+            if let Some(named) = &connection.named_tunnel {
+                named.validate()?;
+                if named.origin.port() == connection.dashboard_bind.port() {
+                    return Err("Phone and dashboard ports must be separate".into());
+                }
+            }
+        }
         self.storage.validate()?;
         if !(1..=8).contains(&self.max_active_chats) {
             return Err("Choose between one and eight active chats".into());
@@ -117,7 +168,9 @@ impl Config {
                 .map_err(|_| "Cannot resolve test profile")?;
             for key in ["HOME", "USERPROFILE"] {
                 if let Some(home) = std::env::var_os(key) {
-                    if crate::profile_lock::standard_agent_profile(&path, &PathBuf::from(home)) {
+                    if !allow_existing
+                        && crate::profile_lock::standard_agent_profile(&path, &PathBuf::from(home))
+                    {
                         return Err("Normal agent profiles are forbidden in this experiment".into());
                     }
                 }
@@ -1215,6 +1268,10 @@ impl Hub {
         let mut bootstrap_jobs = tokio::task::JoinSet::new();
         let mut shared_jobs = tokio::task::JoinSet::new();
         let mut shared_reads = HashSet::new();
+        // Only a new phone thread subscription requests dormant Desktop
+        // activation. Periodic history watches never open Desktop routes.
+        let mut desktop_opens = HashSet::new();
+        let mut desktop_opened: HashMap<String, Instant> = HashMap::new();
         let mut shared_sends: HashMap<String, (Instant, u64, Request)> = HashMap::new();
         let mut claude_sends = send_recovery::Sends::default();
         let mut shared_send_epoch = 0u64;
@@ -1229,6 +1286,7 @@ impl Hub {
         let mut storage_checked = Instant::now();
         loop {
             let restart_pending = restart_gate.load(Ordering::Acquire) != 0;
+            desktop_opened.retain(|_, at| at.elapsed() < Duration::from_secs(60));
             self.shared_watches.retain(|id, (until, _)| {
                 *until > Instant::now()
                     || shared_sends.contains_key(id)
@@ -1241,6 +1299,7 @@ impl Hub {
                             )
                     })
             });
+            desktop_opens.retain(|id| self.shared_watches.contains_key(id));
             let ready: Vec<_> = self
                 .shared_watches
                 .iter()
@@ -1273,6 +1332,7 @@ impl Hub {
                 };
                 let db = self.db.clone();
                 let send_epoch = shared_sends.get(&id).map(|(_, epoch, _)| *epoch);
+                let activate_desktop = desktop_opens.remove(&id);
                 shared_reads.insert(id.clone());
                 shared_jobs.spawn(async move {
                     let result = crate::shared_history::read(
@@ -1280,7 +1340,7 @@ impl Hub {
                         db,
                         id.clone(),
                         native.clone(),
-                        send_epoch.is_some(),
+                        send_epoch.is_some() || activate_desktop,
                     )
                     .await;
                     (id, native, send_epoch, result)
@@ -1341,7 +1401,12 @@ impl Hub {
                     if r.method=="native.watchShared" {
                         let id=s(&r.params["threadId"]).to_owned();
                         if r.agent==AgentKind::Codex && self.checked(r.agent,&id).is_ok_and(|c|self.config.shared_codex(c)) && (self.shared_watches.len()<64 || self.shared_watches.contains_key(&id)) {
+                            if r.params["activateDesktop"] == true && self.config.desktop_endpoint()
+                                && !self.active.contains_key(&id) && !desktop_opened.contains_key(&id) && desktop_opened.len() < 64 {
+                                desktop_opens.insert(id.clone()); desktop_opened.insert(id.clone(), Instant::now());
+                            }
                             let watch=self.shared_watches.entry(id).or_insert((Instant::now(),Instant::now()));watch.0=Instant::now()+Duration::from_secs(3);
+                            if r.params["activateDesktop"] == true { watch.1=Instant::now(); }
                         }
                         let _=r.reply.send(Ok(json!({})));continue;
                     }
@@ -5526,6 +5591,7 @@ mod desktop_routing_tests {
         };
         let mut config = Config {
             native_profile_handoff: None,
+            connection: None,
             storage: Default::default(),
             max_active_chats: 1,
             workspace: "/fixture/workspace".into(),
@@ -5539,6 +5605,7 @@ mod desktop_routing_tests {
             },
             reader_executable: "/fixture/cli".into(),
             reader_workspace: "/fixture/workspace".into(),
+            activation: None,
         });
         assert!(config
             .for_chat(&chat(false))

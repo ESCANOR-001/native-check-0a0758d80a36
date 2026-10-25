@@ -131,6 +131,7 @@ impl Fixture {
         let config = Config {
             storage: Default::default(),
             native_profile_handoff: None,
+            connection: None,
             max_active_chats: 1,
             workspace: dir.path().into(),
             claude: agent.clone(),

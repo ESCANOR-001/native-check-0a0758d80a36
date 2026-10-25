@@ -42,6 +42,7 @@ struct Desired {
     generation: u64,
 }
 struct Core {
+    mode: &'static str,
     desired: watch::Sender<Desired>,
     stop: watch::Sender<bool>,
     state: watch::Receiver<State>,
@@ -57,6 +58,7 @@ impl Drop for Core {
 pub struct Manager(Arc<Core>);
 #[derive(Clone)]
 pub struct Config {
+    pub named: Option<crate::named_tunnel::Config>,
     pub executable: PathBuf,
     /// Private empty config, so quick mode cannot pick up another service's
     /// named tunnel or credentials from the normal cloudflared configuration.
@@ -77,6 +79,7 @@ impl Origin {
         app: &mut crate::server::App,
         executable: Option<PathBuf>,
         directory: &std::path::Path,
+        named: Option<crate::named_tunnel::Config>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         use std::io::Write;
         let empty_config = directory.join("native-quick-tunnel.yml");
@@ -95,13 +98,22 @@ impl Origin {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
         }
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let listener = if named.is_none() {
+            Some(tokio::net::TcpListener::bind("127.0.0.1:0").await?)
+        } else {
+            None
+        };
+        let origin = match &named {
+            Some(c) => c.origin,
+            None => listener.as_ref().unwrap().local_addr()?,
+        };
         let manager = Manager::new(
             Config {
+                named,
                 executable: executable
                     .unwrap_or_else(|| crate::cloudflared::managed_path(directory)),
                 empty_config,
-                origin: listener.local_addr()?,
+                origin,
                 environment_id: app.environment_id.clone(),
             },
             false,
@@ -113,21 +125,20 @@ impl Origin {
         app.tunnel = Some(manager.clone());
         let mut stopping = app.stopping.subscribe();
         let router = app.clone().phone_router();
-        let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
-                let _ = stopping.wait_for(|v| *v).await;
+        let server = listener.map(|listener| {
+            tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
+                    let _ = stopping.wait_for(|v| *v).await;
+                })
+                .await
             })
-            .await
         });
         manager.configure(enabled);
-        Ok(Self {
-            manager,
-            server: Some(server),
-        })
+        Ok(Self { manager, server })
     }
     pub async fn shutdown(mut self) -> std::io::Result<()> {
         self.manager.shutdown().await;
@@ -193,6 +204,17 @@ impl Manager {
         {
             return Err("Tunnel configuration must be a private empty file".into());
         }
+        if let Some(named) = &config.named {
+            named.validate()?;
+            if named.origin != config.origin {
+                return Err("Named tunnel origin mismatch".into());
+            }
+        }
+        let mode = if config.named.is_some() {
+            "named"
+        } else {
+            "quick"
+        };
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(3))
@@ -211,6 +233,7 @@ impl Manager {
         let check = Arc::new(Notify::new());
         let task = tokio::spawn(run(config, client, changes, stopping, send, check.clone()));
         Ok(Self(Arc::new(Core {
+            mode,
             desired,
             stop,
             state,
@@ -218,17 +241,23 @@ impl Manager {
             task: Mutex::new(Some(task)),
         })))
     }
+    pub fn mode(&self) -> &'static str {
+        self.0.mode
+    }
     pub fn state(&self) -> State {
         let desired = self.0.desired.borrow();
-        if *self.0.stop.borrow() || !desired.enabled {
-            return State::new("stopped", None, None);
-        }
-        let state = self.0.state.borrow().clone();
-        if state.generation != desired.generation {
-            State::new("starting", None, None)
+        let mut state = if *self.0.stop.borrow() || !desired.enabled {
+            State::new("stopped", None, None)
         } else {
-            state
-        }
+            let state = self.0.state.borrow().clone();
+            if state.generation != desired.generation {
+                State::new("starting", None, None)
+            } else {
+                state
+            }
+        };
+        state.mode = self.0.mode;
+        state
     }
     pub fn configure(&self, enabled: bool) {
         if *self.0.stop.borrow() {
@@ -352,7 +381,11 @@ async fn attempt(
         _=stopping.changed()=>return Ok(()),
         result=crate::cloudflared::resolve(&config.executable, config.empty_config.parent().ok_or("tunnel_failed")?)=>result?,
     };
-    let mut command = Command::new(executable);
+    let mut command = Command::new(if config.named.is_some() {
+        std::env::current_exe().map_err(|_| "cloudflared_unavailable")?
+    } else {
+        executable.clone()
+    });
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
         if name.starts_with("TUNNEL_")
@@ -362,21 +395,31 @@ async fn attempt(
             command.env_remove(key);
         }
     }
+    if let Some(named) = &config.named {
+        command
+            .arg("--named-tunnel-helper")
+            .arg(&named.account)
+            .arg(&executable)
+            .arg(if policy.quic { "quic" } else { "http2" })
+            .arg(&config.empty_config);
+    } else {
+        command
+            .arg("tunnel")
+            .arg("--config")
+            .arg(&config.empty_config)
+            .arg("--origincert")
+            .arg(config.empty_config.with_extension("unused-cert"))
+            .args([
+                "--no-autoupdate",
+                "--metrics",
+                "127.0.0.1:0",
+                "--protocol",
+                if policy.quic { "quic" } else { "http2" },
+                "--url",
+            ])
+            .arg(format!("http://{}", config.origin));
+    }
     command
-        .arg("tunnel")
-        .arg("--config")
-        .arg(&config.empty_config)
-        .arg("--origincert")
-        .arg(config.empty_config.with_extension("unused-cert"))
-        .args([
-            "--no-autoupdate",
-            "--metrics",
-            "127.0.0.1:0",
-            "--protocol",
-            if policy.quic { "quic" } else { "http2" },
-            "--url",
-        ])
-        .arg(format!("http://{}", config.origin))
         .env_remove("TUNNEL_TOKEN")
         .env_remove("TUNNEL_TOKEN_FILE")
         .env_remove("TUNNEL_CRED_FILE")
@@ -406,7 +449,7 @@ async fn attempt(
     let mut err = [0u8; 4096];
     let (mut out_lines, mut err_lines) = (Lines::default(), Lines::default());
     let (mut out_open, mut err_open) = (true, true);
-    let mut url = None;
+    let mut url = config.named.as_ref().map(|c| c.public_url());
     let mut registered = false;
     let mut ready = false;
     let mut initial_expired = false;
@@ -569,6 +612,7 @@ mod tests {
         std::fs::write(&empty_config, b"{}\n").unwrap();
         let executable = crate::cloudflared::managed_path(dir.path());
         let config = Config {
+            named: None,
             executable: executable.clone(),
             empty_config,
             origin: "127.0.0.1:12345".parse().unwrap(),
@@ -607,6 +651,7 @@ mod tests {
         let empty_config = dir.path().join("empty.yml");
         std::fs::write(&empty_config, b"{}\n").unwrap();
         let config = Config {
+            named: None,
             executable,
             empty_config,
             origin: "127.0.0.1:12345".parse().unwrap(),
@@ -682,6 +727,7 @@ mod tests {
             State::new("ready", Some("https://old.trycloudflare.com".into()), None).generation(8),
         );
         let manager = Manager(Arc::new(Core {
+            mode: "quick",
             desired,
             stop,
             state,
@@ -719,6 +765,7 @@ mod tests {
         let empty_config = dir.path().join("empty.yml");
         std::fs::write(&empty_config, b"{}\n").unwrap();
         let config = Config {
+            named: None,
             executable,
             empty_config,
             origin: "127.0.0.1:12345".parse().unwrap(),

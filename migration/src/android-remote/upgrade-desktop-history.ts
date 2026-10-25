@@ -4,6 +4,7 @@
 import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { transcriptFingerprint, UPGRADE_BUSY } from './upgrade-export';
+import { desktopTranscriptReference } from './upgrade-desktop-reference';
 
 type Row = Record<string, any>;
 type Client = { request(method: string, params: Row): Promise<any> };
@@ -19,7 +20,7 @@ function cursor(v: unknown): string | null {
   if (typeof v !== 'string' || !v || v.length > 8192) throw new Error(UPGRADE_BUSY);
   return v;
 }
-async function lifecycle(path: string, native: string, deadline: number): Promise<{ latest: { turn: string; status: string } | null; settings: Row | null }> {
+async function lifecycle(path: string, native: string, deadline: number, reference = false): Promise<{ latest: { turn: string; status: string } | null; settings: Row | null }> {
   const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   try {
     const meta = await file.stat();
@@ -29,7 +30,7 @@ async function lifecycle(path: string, native: string, deadline: number): Promis
     const chunk = Buffer.alloc(65536);
     for (;;) {
       if (Date.now() > deadline) throw new Error(UPGRADE_BUSY);
-      const { bytesRead } = await file.read(chunk);
+      const { bytesRead } = await file.read(chunk, 0, Math.min(chunk.length, meta.size - bytes));
       if (!bytesRead) break;
       bytes += bytesRead;
       if (bytes > meta.size) throw new Error(UPGRADE_BUSY);
@@ -58,7 +59,7 @@ async function lifecycle(path: string, native: string, deadline: number): Promis
       }
       if (pending.length > LINE) throw new Error(UPGRADE_BUSY);
     }
-    if (first || pending.length || bytes !== meta.size) throw new Error(UPGRADE_BUSY);
+    if (first || !reference && pending.length || bytes !== meta.size) throw new Error(UPGRADE_BUSY);
     return { latest, settings };
   } finally { await file.close(); }
 }
@@ -123,17 +124,17 @@ export async function readDesktopExportHeader(client: Client, native: string, pr
   if (owner === null) throw new Error(UPGRADE_BUSY);
   const thread = (await client.request('thread/read', { threadId: native, includeTurns: false }))?.thread;
   if (!object(thread) || thread.id !== native || typeof thread.path !== 'string'
-    || thread.turns?.length || !['openai', 'codex'].includes(thread.modelProvider)) throw new Error(UPGRADE_BUSY);
-  const before = await transcriptFingerprint(profile, thread.path);
-  const { latest, settings } = await lifecycle(thread.path, native, Date.now() + 120_000);
-  if (latest?.status === 'inProgress' || !settings || settings.cwd !== thread.cwd
+    || thread.turns?.length || typeof thread.modelProvider !== 'string' || !/^[a-zA-Z0-9_.-]{1,128}$/.test(thread.modelProvider)) throw new Error(UPGRADE_BUSY);
+  const before = await desktopTranscriptReference(profile, thread.path, native);
+  const { settings } = await lifecycle(thread.path, native, Date.now() + 120_000, true);
+  if (!settings || settings.cwd !== thread.cwd
     || typeof settings.model !== 'string' || !settings.model || settings.model.length > 256
     || !['default', 'plan'].includes(settings.mode)
     || [settings.effort, settings.serviceTier].some(v => v !== null && (typeof v !== 'string' || !v || v.length > 128))) throw new Error(UPGRADE_BUSY);
-  if (await ownerConnected() !== owner) throw new Error(UPGRADE_BUSY);
-  const after = await transcriptFingerprint(profile, thread.path);
+  if (await ownerConnected() === null) throw new Error(UPGRADE_BUSY);
+  const after = await desktopTranscriptReference(profile, thread.path, native);
   if (before.sha256 !== after.sha256 || before.bytes !== after.bytes) throw new Error(UPGRADE_BUSY);
-  return { ...thread, status: { type: 'idle' }, androidRemoteModel: settings.model,
+  return { ...thread, status: { type: 'notLoaded' }, androidRemoteModel: settings.model,
     androidRemoteRuntimeMode: settings.runtimeMode, androidRemoteInteractionMode: settings.mode,
     androidRemoteNativeEffort: settings.effort, androidRemoteNativeServiceTier: settings.serviceTier };
 }

@@ -90,10 +90,16 @@ impl Prepared {
             None => "local",
             Some(value) => text(value, 16)?,
         };
-        // Named credentials live in the OS keyring. Never downgrade that route
-        // or silently substitute an unprotected/plaintext credential copy.
-        if mode != "quick" || !["local", "quick"].contains(&choice) {
-            return Err("Named tunnel migration still requires secure credential migration; nothing imported");
+        if !["quick", "named"].contains(&mode) || !["local", mode].contains(&choice) {
+            return Err(INVALID);
+        }
+        if mode == "named" {
+            let named = crate::named_tunnel::Config {
+                hostname: text(&root["settings"]["namedTunnelHostname"], 253)?.into(),
+                account: "0".repeat(64),
+                origin: "127.0.0.1:1".parse().unwrap(),
+            };
+            named.validate().map_err(|_| INVALID)?;
         }
         let list = root["clients"]
             .as_array()
@@ -340,6 +346,7 @@ fn has_chats(db: &rusqlite::Connection) -> Result<bool, String> {
                 | "legacy_codex_import"
                 | "legacy_codex_headers"
                 | "legacy_codex_history"
+                | "legacy_desktop_reference"
                 | "legacy_codex_native"
                 | "legacy_preferences_import"
                 | "legacy_uploads"

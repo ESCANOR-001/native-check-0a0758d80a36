@@ -600,6 +600,15 @@ async fn serve_socket(
         {
             subscription = Some((id.clone(), method.to_owned(), params.clone()));
         }
+        if method == "orchestration.subscribeThread" && params.is_object() {
+            if let Some(chats) = &app.chats {
+                let mut opening = params.clone();
+                opening["activateDesktop"] = json!(true);
+                let _ = chats
+                    .call(agent, &client, "native.watchShared", opening)
+                    .await;
+            }
+        }
         let reply = native_reply(&app, agent, &client, id, method, params).await;
         if method == "subscribeServerConfig" {
             connection_revision =

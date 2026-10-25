@@ -181,7 +181,14 @@ impl Prepared {
                 || !natives.insert(native)
                 || !std::path::Path::new(cwd).is_absolute()
                 || !native_provider(&alias["instanceId"])
-                || !native_provider(&alias["nativeModelProvider"])
+                || !(native_provider(&alias["nativeModelProvider"])
+                    || alias["externalCodex"] == true
+                        && alias["nativeModelProvider"].as_str().is_some_and(|s| {
+                            !s.is_empty()
+                                && s.len() <= 128
+                                && s.bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+                        }))
                 || !matches!(
                     alias["runtimeMode"].as_str(),
                     Some("approval-required" | "auto-accept-edits" | "full-access")
@@ -258,6 +265,7 @@ impl Prepared {
     fn verify(&self, db: &rusqlite::Connection) -> Result<(), String> {
         for state in &self.states {
             let id = state["thread"]["id"].as_str().ok_or(INVALID)?;
+            crate::legacy_desktop_reference::verify(db, state, None)?;
             let (header, imported_history) = crate::legacy_codex_history::verify(db, state)?;
             let found: String = db
                 .query_row(
@@ -400,6 +408,7 @@ pub(crate) fn rollback(
     if phase == "prepared" {
         p.verify(db)?;
         for state in &p.states {
+            crate::legacy_desktop_reference::rollback(db, state)?;
             crate::legacy_uploads::rollback(
                 db,
                 directory,

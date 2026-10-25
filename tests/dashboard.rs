@@ -279,6 +279,7 @@ async fn quick_tunnel_preferences_persist_but_unverified_urls_cannot_pair() {
     std::fs::write(&empty, b"{}\n").unwrap();
     let tunnel = remodex_connect_native::tunnel::Manager::new(
         remodex_connect_native::tunnel::Config {
+            named: None,
             executable: env!("CARGO_BIN_EXE_chat-fixture").into(),
             empty_config: empty,
             origin: "127.0.0.1:12345".parse().unwrap(),
@@ -704,6 +705,7 @@ async fn agents_dashboard_uses_real_profile_status_and_isolated_preferences() {
     let config = Config {
         storage: Default::default(),
         native_profile_handoff: None,
+        connection: None,
         max_active_chats: 1,
         workspace: f._root.path().into(),
         codex: agent,
@@ -1935,6 +1937,7 @@ async fn storage_fixture() -> (Fixture, remodex_connect_native::chat::Chats) {
     let config = Config {
         storage: Default::default(),
         native_profile_handoff: None,
+        connection: None,
         max_active_chats: 1,
         workspace: f._root.path().into(),
         codex: agent.clone(),

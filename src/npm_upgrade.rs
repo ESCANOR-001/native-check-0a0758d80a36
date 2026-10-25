@@ -178,7 +178,7 @@ pub fn prepare(root: &Path, plan_path: &Path) -> Result<Value, String> {
     let owner: Value = serde_json::from_slice(&receipt).map_err(|_| ERROR)?;
     let config = read(&plan.configuration, 262144)?;
     let parsed: crate::chat::Config = serde_json::from_slice(&config).map_err(|_| ERROR)?;
-    parsed.validate()?;
+    parsed.validate_export()?;
     let address: std::net::SocketAddr = plan.bind.parse().map_err(|_| ERROR)?;
     let url = reqwest::Url::parse(&plan.public_url).map_err(|_| ERROR)?;
     if plan.version != 1

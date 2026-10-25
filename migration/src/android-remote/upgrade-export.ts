@@ -7,6 +7,7 @@ import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { exportChatAssets, type AssetProof } from './upgrade-export-assets';
 import { verifyShutdownBookkeeping } from './upgrade-shutdown-proof';
 import { holdUpgradeSource, recordStoppedUpgradeOwner, releaseUnpublishedStoppedExport } from './upgrade-source-hold';
+import { desktopTranscriptReference } from './upgrade-desktop-reference';
 
 export const UPGRADE_BUSY = 'Upgrade is waiting for settled chats and exclusive ownership. Finish pending work and retry; no chat was moved.';
 export class UpgradeAdmission {
@@ -49,6 +50,7 @@ export interface UpgradeExportChat {
   id: string;
   history: Row;
   transcript: string;
+  desktopReference?: boolean;
 }
 export interface UpgradeExportOwner {
   environment: string;
@@ -147,7 +149,7 @@ export async function exportOwnedUpgrade(
     await writePrivate(resolve(target, 'connection.json'), owner.connection);
     await writePrivate(resolve(target, 'codex-projects.json'), owner.projects);
     await writePrivate(resolve(target, 'claude-settings.json'), owner.claudeSettings);
-    const chats: { agent: string; id: string; history: string; transcript: string; sha256: string; bytes: number; uploads?: Row; images?: Row }[] = [];
+    const chats: { agent: string; id: string; history: string; transcript: string; sha256: string; bytes: number; desktopReference?: boolean; nativeId?: string; uploads?: Row; images?: Row }[] = [];
     const assets: AssetProof[] = [];
     let assetBytes = 0;
     const seen = new Set<string>();
@@ -158,14 +160,22 @@ export async function exportOwnedUpgrade(
       const history = `${chat.agent}-${chats.length}.json`;
       total += Buffer.byteLength(JSON.stringify(chat.history));
       if (total > 512 * 1024 * 1024) throw new Error(UPGRADE_BUSY);
-      const proof = await transcriptFingerprint(profiles[chat.agent], chat.transcript);
+      if (chat.desktopReference && chat.agent !== 'codex') throw new Error(UPGRADE_BUSY);
+      const proof = chat.desktopReference
+        ? await desktopTranscriptReference(profiles.codex, chat.transcript, chat.history.nativeId)
+        : await transcriptFingerprint(profiles[chat.agent], chat.transcript);
       const inventory = await exportChatAssets(target, chats.length, chat, owner.assetRoots, transcriptFingerprint, bytes => {
         assetBytes += bytes; if (assetBytes > 512 * 1024 * 1024) throw new Error(UPGRADE_BUSY);
       });
       if (assets.length + inventory.proofs.length > 20_000) throw new Error(UPGRADE_BUSY);
       assets.push(...inventory.proofs);
-      await writePrivate(resolve(target, history), chat.history);
-      chats.push({ agent: chat.agent, id: chat.id, history, transcript: proof.relative, sha256: proof.sha256, bytes: proof.bytes, uploads: inventory.uploads, images: inventory.images });
+      await writePrivate(resolve(target, history), chat.desktopReference ? {
+        version: 1, threadId: chat.id, nativeId: chat.history.nativeId, profile: profiles.codex,
+        transcript: proof.relative, firstLineSha256: proof.sha256, firstLineBytes: proof.bytes,
+      } : chat.history);
+      chats.push({ agent: chat.agent, id: chat.id, history, transcript: proof.relative, sha256: proof.sha256, bytes: proof.bytes,
+        ...(chat.desktopReference ? { desktopReference: true, nativeId: chat.history.nativeId } : {}),
+        uploads: inventory.uploads, images: inventory.images });
     }
     owner.assertSettled();
     stopping = true;
@@ -176,6 +186,11 @@ export async function exportOwnedUpgrade(
     if (hold) await recordStoppedUpgradeOwner(hold, owner.environment);
     for (const chat of chats) {
       const agent = chat.agent as 'codex' | 'claude';
+      if (chat.desktopReference) {
+        const proof = await desktopTranscriptReference(profiles.codex, resolve(profiles.codex, chat.transcript), chat.nativeId!);
+        if (proof.sha256 !== chat.sha256 || proof.bytes !== chat.bytes) throw new Error(UPGRADE_BUSY);
+        continue;
+      }
       const proof = await transcriptFingerprint(profiles[agent], resolve(profiles[agent], chat.transcript));
       if (proof.sha256 !== chat.sha256) {
         await verifyShutdownBookkeeping(resolve(profiles[agent], chat.transcript), agent, chat.bytes, chat.sha256);
@@ -190,7 +205,7 @@ export async function exportOwnedUpgrade(
     }
     const receipt = resolve(target, 'closed-owner.json');
     publishing = true;
-    await writePrivate(receipt, { version: 1, profile_mode: 'existing', environment: owner.environment, source_hold: hold?.path, profiles, chats: chats.map(({ bytes, ...chat }) => chat),
+    await writePrivate(receipt, { version: 1, profile_mode: 'existing', environment: owner.environment, source_hold: hold?.path, profiles, chats: chats.map(({ bytes, nativeId, ...chat }) => chat),
       connection: 'connection.json', codex_projects: 'codex-projects.json', claude_settings: 'claude-settings.json' });
     if (process.platform !== 'win32') {
       const dir = await open(target, 'r'); try { await dir.sync(); } finally { await dir.close(); }

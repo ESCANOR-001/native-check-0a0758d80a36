@@ -484,7 +484,7 @@ async fn status(State(app): State<App>) -> Response {
         let clients = stmt.query_map([], |r| { let id:String=r.get(0)?;let created:i64=r.get(3)?;
             Ok(json!({"id":id,"label":r.get::<_,String>(1)?,"os":r.get::<_,String>(2)?,"deviceType":"mobile", "createdAt":auth::timestamp(created),"scopes":auth::SCOPES.split(' ').collect::<Vec<_>>(),"online":online.contains(&id)}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((a.control_enabled()?, a.keep_awake()?, a.local_network_enabled()?,a.quick_tunnel_enabled()?, clients))
+        Ok((a.control_enabled()?, a.keep_awake()?, a.local_network_enabled()?,a.pairing_remote()?, clients))
     }).await;
     let Ok(Ok((enabled, keep_awake, local, quick, clients))) = state else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "Pairing store unavailable");
@@ -502,8 +502,8 @@ async fn status(State(app): State<App>) -> Response {
     response(
         StatusCode::OK,
         json!({"version":1,"controlEnabled":enabled,"keepAwake":keep_awake,"localNetworkEnabled":local,
-        "connectionChoice":if quick{"quick"}else{"local"},"pairingAvailable":enabled && if quick{remote_ready}else{local},"gateway":{"status":if enabled {"ready"} else {"stopped"},"backgroundServer":"current-process","port":d.port},
-        "reachableAddresses":if local {vec![d.public_url.clone()]} else {vec![]},"tunnel":{"configuration":{"mode":"quick","hasNamedTunnelToken":false},"runtime":tunnel},
+        "connectionChoice":if quick{app.tunnel.as_ref().map_or("quick",|t|t.mode())}else{"local"},"pairingAvailable":enabled && if quick{remote_ready}else{local},"gateway":{"status":if enabled {"ready"} else {"stopped"},"backgroundServer":"current-process","port":d.port},
+        "reachableAddresses":if local {vec![d.public_url.clone()]} else {vec![]},"tunnel":{"configuration":{"mode":app.tunnel.as_ref().map_or("quick",|t|t.mode()),"hasNamedTunnelToken":app.tunnel.as_ref().is_some_and(|t|t.mode()=="named")},"runtime":tunnel},
         "desktop":{"id":"desktop","label":app.label,"platform":platform,"address":d.public_url,"online":true},"clients":clients}),
     )
 }
@@ -637,7 +637,7 @@ async fn pair(
     if body.as_object().is_none_or(|v| !v.is_empty()) {
         return error(StatusCode::BAD_REQUEST, "Provide an empty pairing request");
     }
-    let quick = match app.auth.call(|a| a.quick_tunnel_enabled()).await {
+    let quick = match app.auth.call(|a| a.pairing_remote()).await {
         Ok(Ok(v)) => v,
         _ => {
             return error(
@@ -679,7 +679,7 @@ async fn pair(
             // Recheck within the settings worker so a concurrent mode change
             // cannot mint an invitation for a connection that was just disabled.
             let valid = a
-                .quick_tunnel_enabled()
+                .pairing_remote()
                 .map_err(|_| "Pairing settings unavailable")?
                 == quick
                 && if quick {
@@ -731,7 +731,7 @@ async fn settings(State(app): State<App>, Json(body): Json<Value>) -> Response {
     // must not appear successful or partially disable a working phone.
     if object
         .get("connectionChoice")
-        .is_some_and(|v| v == "named" || (v == "quick" && app.tunnel.is_none()))
+        .is_some_and(|v| v != "local" && !app.tunnel.as_ref().is_some_and(|t| v == t.mode()))
     {
         return error(
             StatusCode::NOT_IMPLEMENTED,
@@ -742,7 +742,7 @@ async fn settings(State(app): State<App>, Json(body): Json<Value>) -> Response {
     let keep_awake = body["keepAwake"].as_bool();
     let local = body["localNetworkEnabled"].as_bool();
     let network = app.network.clone();
-    let quick = body["connectionChoice"].as_str().map(|s| s == "quick");
+    let quick = body["connectionChoice"].as_str().map(|s| s != "local");
     let tunnel = app.tunnel.clone();
     if (enabled.is_some() || keep_awake.is_some() || local.is_some() || quick.is_some())
         && !matches!(

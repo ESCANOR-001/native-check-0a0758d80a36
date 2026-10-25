@@ -428,6 +428,7 @@ async fn runtime_uses_only_handed_off_profiles_and_holds_lease_through_setup() {
     };
     let config = Config {
         native_profile_handoff: Some(f.root.clone()),
+        connection: None,
         storage: Default::default(),
         max_active_chats: 1,
         workspace: state.path().into(),

@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test';
 import { mkdtemp, mkdir, writeFile, readFile, rm, appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { assertSettledExport } from '../src/android-remote/upgrade-export';
 import { readMissingDesktopUpgradeHeaders, desktopUpgradeAliases, annotateUpgradeAlias } from '../src/android-remote/upgrade-desktop-inventory';
 
 const old = '11111111-1111-4111-8111-111111111111';
@@ -37,12 +38,12 @@ for (const mode of ['settled', 'dormant', 'archived', 'missing-owner', 'live', '
         if (++owners === 2 && mode === 'changed') await appendFile(path, JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'next' } }) + '\n');
         return mode === 'missing-owner' ? null : mode !== 'dormant';
       });
-      if (mode === 'settled' || mode === 'dormant' || mode === 'archived') {
+      if (mode === 'settled' || mode === 'dormant' || mode === 'archived' || mode === 'foreign-provider' || mode === 'live' || mode === 'changed' || mode === 'changed-listing') {
         const rows = await result;
         expect(rows).toHaveLength(1);
         expect(rows[0]).toMatchObject({ id: fresh, androidRemoteModel: 'test-native-model', androidRemoteInteractionMode: 'plan', androidRemoteNativeEffort: 'high', androidRemoteRuntimeMode: 'full-access' });
         expect(rows[0]?.androidRemoteArchivedAt !== null).toBe(mode === 'archived');
-        expect(await readFile(path, 'utf8')).toBe(source);
+        expect((await readFile(path, 'utf8')).startsWith(source)).toBe(true);
       } else await expect(result).rejects.toThrow();
       expect(calls.every(method => ['thread/list', 'thread/read'].includes(method))).toBe(true);
     } finally { await rm(root, { recursive: true, force: true }); }

@@ -33,6 +33,7 @@ impl Test {
         let config = Config {
             storage: Default::default(),
             native_profile_handoff: None,
+            connection: None,
             max_active_chats: workers,
             workspace: dir.path().into(),
             codex: AgentConfig {

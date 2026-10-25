@@ -11,6 +11,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 mod desktop_phase;
 #[path = "desktop_requests.rs"]
 mod desktop_requests;
+#[cfg(windows)]
+#[path = "desktop_windows.rs"]
+mod desktop_windows;
 
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(12);
@@ -76,7 +79,9 @@ impl Endpoint {
             let root = profile.canonicalize().map_err(|_| UNAVAILABLE)?;
             let hash = format!("{:x}", Sha256::digest(root.as_os_str().as_encoded_bytes()));
             let expected = format!(r"\\.\pipe\remodex-desktop-test-{hash}");
-            if self.path.as_path() != Path::new(&expected) {
+            if self.path.as_path() != Path::new(&expected)
+                && !desktop_windows::standard_endpoint(&self.path, &root)
+            {
                 return Err(UNAVAILABLE.into());
             }
             Ok(())
@@ -113,6 +118,13 @@ impl Endpoint {
         let stream = tokio::net::windows::named_pipe::ClientOptions::new()
             .open(&self.path)
             .map_err(|_| UNAVAILABLE)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            // Authenticate the connected pipe before sending any IPC frame.
+            // The global pipe name alone does not identify its process owner.
+            desktop_windows::verify_peer(stream.as_raw_handle()).map_err(|_| UNAVAILABLE)?;
+        }
         #[cfg(any(unix, windows))]
         {
             Client::initialize(Box::new(stream), TIMEOUT).await
@@ -243,6 +255,13 @@ impl Client {
                         .unwrap_or(&response["handledByClientId"]);
                     return Ok(json!({"owner":text(owner,256)?}));
                 }
+                if discovery
+                    && response["type"] == "response"
+                    && response["resultType"] == "error"
+                    && response["error"] == "no-client-found"
+                {
+                    return Ok(Value::Null);
+                }
                 if response["type"] != "response" || response["resultType"] != "success" {
                     // Errors are deliberately not interpreted as permission to
                     // replay or to take ownership. Reconnect is a fresh read.
@@ -274,6 +293,13 @@ impl Client {
         result
     }
     pub async fn owner(&mut self, thread: &str) -> Result<Owner, String> {
+        self.find_owner(thread)
+            .await?
+            .ok_or_else(|| UNAVAILABLE.into())
+    }
+    /// Only an explicit router no-client-found is absent. Timeout, malformed
+    /// replies and connection loss remain errors and cannot authorize activation.
+    pub async fn find_owner(&mut self, thread: &str) -> Result<Option<Owner>, String> {
         if uuid::Uuid::parse_str(thread).is_err() {
             return Err(UNAVAILABLE.into());
         }
@@ -286,15 +312,18 @@ impl Client {
                 true,
             )
             .await?;
+        if result.is_null() {
+            return Ok(None);
+        }
         let owner = text(&result["owner"], 256)?;
         if owner == self.client {
             return Err(UNAVAILABLE.into());
         }
-        Ok(Owner {
+        Ok(Some(Owner {
             thread: thread.into(),
             client: owner.into(),
             connection: self.generation.clone(),
-        })
+        }))
     }
     fn observe_phase(&mut self, value: &Value) -> Result<(), String> {
         let Some(owner) = &self.followed else {

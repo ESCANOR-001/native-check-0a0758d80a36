@@ -128,6 +128,7 @@ async fn controls_stay_with_desktop_and_history_reader_never_resumes_the_chat() 
         desktop_endpoint: Endpoint { path },
         reader_executable: env!("CARGO_BIN_EXE_history-fixture").into(),
         reader_workspace: root.path().into(),
+        activation: None,
     };
     let mut c = config.connect(&profile).await.unwrap();
     assert!(rpc(
@@ -255,4 +256,118 @@ async fn controls_stay_with_desktop_and_history_reader_never_resumes_the_chat() 
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn dormant_owner_loads_only_for_explicit_send_and_never_for_uncertain_discovery() {
+    for uncertain in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let path = profile.join("ipc.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::create_dir(profile.join("sessions")).unwrap();
+        let transcript = profile.join("sessions/saved.jsonl");
+        let history = format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":NATIVE}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"saved"}})
+        );
+        std::fs::write(&transcript, &history).unwrap();
+        std::fs::write(
+            profile.join("desktop-state.json"),
+            json!({"turn":"saved","status":"completed"}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            profile.join("fixture.json"),
+            json!({"native":NATIVE,"mode":"desktop","path":transcript}).to_string(),
+        )
+        .unwrap();
+        let marker = root.path().join("activation.log");
+        let activated = marker.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            while let Ok(size) = stream.read_u32_le().await {
+                assert!(size < 65536);
+                let mut bytes = vec![0; size as usize];
+                stream.read_exact(&mut bytes).await.unwrap();
+                let v: Value = serde_json::from_slice(&bytes).unwrap();
+                let mut response = json!({"type":"response","requestId":v["requestId"],"method":v["method"],"resultType":"success","handledByClientId":"original","result":{}});
+                match v["method"].as_str().unwrap() {
+                    "initialize" => response["result"] = json!({"clientId":"reader"}),
+                    "thread-owner-discovery" => {
+                        assert_eq!(v["params"]["conversationId"], NATIVE);
+                        if !activated.exists() {
+                            response["resultType"] = json!("error");
+                            response["error"] = json!(if uncertain {
+                                "temporarily-unavailable"
+                            } else {
+                                "no-client-found"
+                            });
+                        }
+                    }
+                    other => panic!("Unexpected owner mutation: {other}"),
+                }
+                let bytes = serde_json::to_vec(&response).unwrap();
+                stream.write_u32_le(bytes.len() as u32).await.unwrap();
+                stream.write_all(&bytes).await.unwrap();
+            }
+        });
+        let config = SharedServer::Desktop {
+            desktop_endpoint: Endpoint { path },
+            reader_executable: env!("CARGO_BIN_EXE_history-fixture").into(),
+            reader_workspace: root.path().into(),
+            activation: Some(
+                remodex_connect_native::desktop_activation::Activation::Command {
+                    executable: env!("CARGO_BIN_EXE_history-fixture").into(),
+                    arguments: vec!["--activate".into(), marker.to_str().unwrap().into()],
+                },
+            ),
+        };
+        let mut c = config.connect(&profile).await.unwrap();
+        assert!(rpc(
+            &mut c,
+            "thread/read",
+            json!({"threadId":NATIVE,"includeTurns":false})
+        )
+        .await
+        .get("error")
+        .is_some());
+        assert!(
+            !marker.exists(),
+            "background history must not activate Desktop"
+        );
+        let result = rpc(
+            &mut c,
+            "thread/read",
+            json!({"threadId":NATIVE,"includeTurns":false,"remodexAllowActivation":true}),
+        )
+        .await;
+        if uncertain {
+            assert!(result.get("error").is_some());
+            assert!(
+                !marker.exists(),
+                "uncertain ownership must not authorize activation"
+            );
+        } else {
+            assert_eq!(result["result"]["thread"]["id"], NATIVE);
+            assert_eq!(result["result"]["thread"]["status"]["type"], "idle");
+            assert_eq!(std::fs::read_to_string(&marker).unwrap().lines().count(), 1);
+            let result = rpc(
+                &mut c,
+                "thread/read",
+                json!({"threadId":NATIVE,"includeTurns":false,"remodexAllowActivation":true}),
+            )
+            .await;
+            assert!(result.get("error").is_none());
+            assert_eq!(std::fs::read_to_string(&marker).unwrap().lines().count(), 1);
+        }
+        assert_eq!(std::fs::read_to_string(&transcript).unwrap(), history);
+        let methods = std::fs::read_to_string(profile.join("methods.log")).unwrap();
+        assert!(!methods.contains("thread/resume") && !methods.contains("turn/start"));
+        c.close().await;
+        server.await.unwrap();
+    }
 }

@@ -25,7 +25,9 @@ export async function readMissingDesktopUpgradeHeaders(
         if (seen.size > 1024) throw new Error('This installation exceeds the bounded automatic chat inventory; all source chats are retained.');
         if (known.has(id)) continue;
         const header = await readDesktopExportHeader(client, id, profile, () => ownerConnected(id));
-        if (header.cwd !== row.cwd || header.updatedAt !== row.updatedAt) throw new Error(UPGRADE_BUSY);
+        // Native Desktop can append while the read-only inventory is collected.
+        // Identity/cwd are stable; listing timestamps need not be frozen.
+        if (header.cwd !== row.cwd) throw new Error(UPGRADE_BUSY);
         if (!Number.isFinite(header.createdAt) || !Number.isFinite(header.updatedAt)) throw new Error(UPGRADE_BUSY);
         headers.push({ ...header, androidRemoteArchivedAt: archived ? new Date(header.updatedAt * 1000).toISOString() : null });
       }
@@ -72,5 +74,9 @@ export function annotateUpgradeAlias(native: Row, alias: AndroidRemoteThreadAlia
     androidRemoteProjectId: alias.projectId, androidRemoteTitle: alias.title,
     androidRemoteWorkspaceKind: alias.workspaceKind,
     androidRemoteProviderInstanceId: alias.instanceId, androidRemoteModel: alias.model,
-    androidRemoteRuntimeMode: alias.runtimeMode, androidRemoteInteractionMode: alias.interactionMode };
+    androidRemoteRuntimeMode: alias.runtimeMode,
+    // The alias is the current selection, not evidence that every historical
+    // final answer was a proposed plan. Keep that selection in connection.json;
+    // native plan items/tags still project as plans without this fallback.
+    androidRemoteInteractionMode: 'default' };
 }

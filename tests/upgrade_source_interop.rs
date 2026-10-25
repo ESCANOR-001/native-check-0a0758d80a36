@@ -11,6 +11,11 @@ use tokio::{
 
 #[tokio::test]
 async fn bun_owner_retires_and_rust_recovers_the_exact_durable_plan() {
+    for mode in ["", "preflight", "bad-config"] {
+        qualify(mode).await;
+    }
+}
+async fn qualify(mode: &str) {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let module = [
         manifest.join("../../src/android-remote/upgrade-control.ts"),
@@ -28,6 +33,7 @@ async fn bun_owner_retires_and_rust_recovers_the_exact_durable_plan() {
         .arg(module)
         .arg(&base)
         .arg(&installation)
+        .arg(mode)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -49,6 +55,22 @@ async fn bun_owner_retires_and_rust_recovers_the_exact_durable_plan() {
         upgrade_source::registered(&installation).unwrap(),
         descriptor
     );
+    if mode == "bad-config" {
+        assert!(upgrade_source::acquire(&installation, &descriptor)
+            .await
+            .is_err());
+        assert!(
+            !descriptor.parent().unwrap().join("attempt.json").exists(),
+            "Failed preflight must not start source shutdown"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "Working source remains running"
+        );
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+        return;
+    }
     let plan = tokio::time::timeout(
         Duration::from_secs(10),
         upgrade_source::acquire(&installation, &descriptor),

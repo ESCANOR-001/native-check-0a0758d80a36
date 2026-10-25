@@ -123,3 +123,44 @@ async fn incompatible_configuration_does_not_create_a_new_destination() {
     assert!(!output.status.success());
     assert!(!state.exists());
 }
+
+#[tokio::test]
+async fn standard_profiles_cannot_start_without_a_verified_handoff() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    for name in [".codex", ".claude"] {
+        std::fs::create_dir_all(home.join(name)).unwrap();
+    }
+    let mut config = configuration(root.path());
+    config["codex"]["profile"] = json!(home.join(".codex"));
+    config["claude"]["profile"] = json!(home.join(".claude"));
+    let path = root.path().join("config.json");
+    for handoff in [false, true] {
+        if handoff {
+            config["native_profile_handoff"] = json!(root.path().join("unverified-handoff"));
+        }
+        std::fs::write(&path, config.to_string()).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_remodex-connect-native"));
+        command
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .arg(root.path().join("state"))
+            .args(["127.0.0.1:0", "http://127.0.0.1:1234"])
+            .arg(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(0x08000000);
+        let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("ready"));
+        for name in [".codex", ".claude"] {
+            assert_eq!(std::fs::read_dir(home.join(name)).unwrap().count(), 0);
+        }
+    }
+}
