@@ -202,11 +202,17 @@ pub fn prepare(root: &Path, plan_path: &Path) -> Result<Value, String> {
     for input in [
         &plan.closed_owner,
         &plan.configuration,
-        &parsed.codex()?.profile,
-        &parsed.claude()?.profile,
         &plan.gui,
         plan_path,
-    ] {
+    ]
+    .into_iter()
+    .chain(
+        parsed
+            .codex
+            .iter()
+            .chain(parsed.claude.iter())
+            .map(|c| c.profile.as_path()),
+    ) {
         let input = input.canonicalize().map_err(|_| ERROR)?;
         if root_path.starts_with(&input) || input.starts_with(&root_path) {
             return Err(ERROR.into());

@@ -49,16 +49,16 @@ impl Fixture {
             version: 1,
             profile_mode: Default::default(),
             environment: environment.into(),
-            codex: Input {
+            codex: Some(Input {
                 original_profile: codex,
                 snapshot: dir.path().join("export-codex"),
-            },
-            claude: Input {
+            }),
+            claude: Some(Input {
                 original_profile: claude,
                 snapshot: dir.path().join("export-claude"),
-            },
+            }),
         };
-        for input in [&plan.codex, &plan.claude] {
+        for input in [&plan.codex, &plan.claude].into_iter().flatten() {
             migration_snapshot::capture(&input.original_profile, &input.snapshot, environment)
                 .unwrap();
         }
@@ -75,13 +75,19 @@ impl Fixture {
         profile_handoff::activate(
             &self.root,
             ENV,
-            &self.plan.codex.original_profile,
-            &self.plan.claude.original_profile,
+            self.plan
+                .codex
+                .as_ref()
+                .map(|i| i.original_profile.as_path()),
+            self.plan
+                .claude
+                .as_ref()
+                .map(|i| i.original_profile.as_path()),
         )
         .unwrap()
     }
     fn original_intact(&self) {
-        for input in [&self.plan.codex, &self.plan.claude] {
+        for input in [&self.plan.codex, &self.plan.claude].into_iter().flatten() {
             migration_snapshot::verify_tree(
                 &input.snapshot,
                 &input.original_profile,
@@ -103,8 +109,24 @@ fn existing_install_keeps_agent_paths_and_new_history_without_rebasing_or_restor
     assert_eq!(
         lease.profiles(),
         (
-            f.plan.codex.original_profile.canonicalize().unwrap(),
-            f.plan.claude.original_profile.canonicalize().unwrap()
+            Some(
+                f.plan
+                    .codex
+                    .as_ref()
+                    .unwrap()
+                    .original_profile
+                    .canonicalize()
+                    .unwrap()
+            ),
+            Some(
+                f.plan
+                    .claude
+                    .as_ref()
+                    .unwrap()
+                    .original_profile
+                    .canonicalize()
+                    .unwrap()
+            )
         )
     );
     f.original_intact();
@@ -112,13 +134,20 @@ fn existing_install_keeps_agent_paths_and_new_history_without_rebasing_or_restor
     let path = f
         .plan
         .claude
+        .as_ref()
+        .unwrap()
         .original_profile
         .join(format!("projects/fixture/{ID}.jsonl"));
     let old = fs::read(&path).unwrap();
     let new = [old.as_slice(), b"NEW DESKTOP MESSAGE\n"].concat();
     fs::write(&path, &new).unwrap();
     fs::write(
-        f.plan.codex.original_profile.join("new-native-file"),
+        f.plan
+            .codex
+            .as_ref()
+            .unwrap()
+            .original_profile
+            .join("new-native-file"),
         b"NEW CODEX MESSAGE",
     )
     .unwrap();
@@ -129,7 +158,7 @@ fn existing_install_keeps_agent_paths_and_new_history_without_rebasing_or_restor
         .unwrap_err()
         .contains("current agent directories"));
     assert_eq!(fs::read(path).unwrap(), new);
-    migration_snapshot::verify(&f.plan.claude.snapshot, ENV).unwrap();
+    migration_snapshot::verify(&f.plan.claude.as_ref().unwrap().snapshot, ENV).unwrap();
 }
 
 #[test]
@@ -140,14 +169,16 @@ fn existing_install_refuses_source_changes_before_start_and_keeps_unused_rollbac
     let path = f
         .plan
         .claude
+        .as_ref()
+        .unwrap()
         .original_profile
         .join("unknown-future-metadata");
     fs::write(&path, b"CHANGED BEFORE CUTOVER").unwrap();
     assert!(profile_handoff::activate(
         &f.root,
         ENV,
-        &f.plan.codex.original_profile,
-        &f.plan.claude.original_profile
+        f.plan.codex.as_ref().map(|i| i.original_profile.as_path()),
+        f.plan.claude.as_ref().map(|i| i.original_profile.as_path())
     )
     .is_err());
     assert!(profile_handoff::rollback(&f.root, ENV).is_err());
@@ -163,6 +194,7 @@ fn handoff_rebases_only_copied_rollout_paths_and_keeps_all_metadata() {
     f.prepare();
     let lease = f.activate();
     let (codex, claude) = lease.profiles();
+    let (codex, claude) = (codex.unwrap(), claude.unwrap());
     let db = Connection::open(codex.join("state_5.sqlite")).unwrap();
     let row: (String, String, i64, i64, i64) = db
         .query_row(
@@ -218,13 +250,13 @@ fn unused_generation_rolls_back_idempotently_without_deleting_any_files() {
         "rolled-back"
     );
     assert!(profile_handoff::rollback(&f.root, ENV).is_ok());
-    assert!(paths.0.join("sessions/rollout.jsonl").exists());
-    assert!(paths.1.join("unknown-future-metadata").exists());
+    assert!(paths.0.unwrap().join("sessions/rollout.jsonl").exists());
+    assert!(paths.1.unwrap().join("unknown-future-metadata").exists());
     assert!(profile_handoff::activate(
         &f.root,
         ENV,
-        &f.plan.codex.original_profile,
-        &f.plan.claude.original_profile
+        f.plan.codex.as_ref().map(|i| i.original_profile.as_path()),
+        f.plan.claude.as_ref().map(|i| i.original_profile.as_path())
     )
     .is_err());
     f.original_intact();
@@ -237,8 +269,8 @@ fn active_owner_excludes_a_second_runtime_prepare_and_rollback() {
     assert!(profile_handoff::activate(
         &f.root,
         ENV,
-        &f.plan.codex.original_profile,
-        &f.plan.claude.original_profile
+        f.plan.codex.as_ref().map(|i| i.original_profile.as_path()),
+        f.plan.claude.as_ref().map(|i| i.original_profile.as_path())
     )
     .is_err());
     assert!(profile_handoff::rollback(&f.root, ENV).is_err());
@@ -251,6 +283,7 @@ fn new_history_survives_restart_and_blocks_destructive_data_rollback() {
     f.prepare();
     let lease = f.activate();
     let (_, claude) = lease.profiles();
+    let claude = claude.unwrap();
     let file = claude.join(format!("projects/fixture/{ID}.jsonl"));
     let mut data = fs::read(&file).unwrap();
     data.extend_from_slice(b"NEW_HISTORY\n");
@@ -271,8 +304,8 @@ fn changed_checkpoint_or_wrong_environment_cannot_activate() {
     assert!(profile_handoff::activate(
         &f.root,
         "opencodex-aaaaaaaaaaaaaaaaaaaaaaaa",
-        &f.plan.codex.original_profile,
-        &f.plan.claude.original_profile
+        f.plan.codex.as_ref().map(|i| i.original_profile.as_path()),
+        f.plan.claude.as_ref().map(|i| i.original_profile.as_path())
     )
     .is_err());
     fs::write(
@@ -284,8 +317,8 @@ fn changed_checkpoint_or_wrong_environment_cannot_activate() {
     assert!(profile_handoff::activate(
         &f.root,
         ENV,
-        &f.plan.codex.original_profile,
-        &f.plan.claude.original_profile
+        f.plan.codex.as_ref().map(|i| i.original_profile.as_path()),
+        f.plan.claude.as_ref().map(|i| i.original_profile.as_path())
     )
     .is_err());
     f.original_intact();
@@ -308,6 +341,7 @@ fn interrupted_rebase_is_retained_and_retry_uses_a_fresh_numbered_copy() {
     assert!(lease
         .profiles()
         .0
+        .unwrap()
         .starts_with(f.root.canonicalize().unwrap().join("attempt-2")));
     assert_eq!(fs::read_to_string(retained).unwrap(), "INTERRUPTED_COPY");
     f.original_intact();
@@ -320,14 +354,16 @@ fn source_progress_after_export_refuses_split_history_without_overwriting_either
     let original = f
         .plan
         .claude
+        .as_ref()
+        .unwrap()
         .original_profile
         .join("unknown-future-metadata");
     fs::write(&original, "NEW_ORIGINAL_WORK").unwrap();
     let error = match profile_handoff::activate(
         &f.root,
         ENV,
-        &f.plan.codex.original_profile,
-        &f.plan.claude.original_profile,
+        f.plan.codex.as_ref().map(|i| i.original_profile.as_path()),
+        f.plan.claude.as_ref().map(|i| i.original_profile.as_path()),
     ) {
         Ok(_) => panic!("changed original was accepted"),
         Err(e) => e,
@@ -357,7 +393,7 @@ fn unknown_destination_and_foreign_export_are_never_adopted() {
     let f = Fixture::new();
     f.prepare();
     let mut other = f.plan.clone();
-    other.claude.snapshot = other.codex.snapshot.clone();
+    other.claude.as_mut().unwrap().snapshot = other.codex.as_ref().unwrap().snapshot.clone();
     assert!(profile_handoff::prepare(&f.root, &other).is_err());
     f.original_intact();
 }
@@ -365,19 +401,33 @@ fn unknown_destination_and_foreign_export_are_never_adopted() {
 fn missing_or_mismatched_native_rollout_refuses_handoff() {
     for wrong_header in [false, true] {
         let f = Fixture::new();
-        let source = f.plan.codex.original_profile.join("sessions/rollout.jsonl");
+        let source = f
+            .plan
+            .codex
+            .as_ref()
+            .unwrap()
+            .original_profile
+            .join("sessions/rollout.jsonl");
         if wrong_header {
             fs::write(&source,format!("{}\n",json!({"type":"session_meta","payload":{"id":"00000000-0000-4000-8000-000000000099"}}))).unwrap();
         } else {
             fs::remove_file(&source).unwrap();
         }
         let mut plan = f.plan.clone();
-        plan.codex.snapshot = f._dir.path().join("bad-export");
-        migration_snapshot::capture(&plan.codex.original_profile, &plan.codex.snapshot, ENV)
-            .unwrap();
+        plan.codex.as_mut().unwrap().snapshot = f._dir.path().join("bad-export");
+        migration_snapshot::capture(
+            &plan.codex.as_ref().unwrap().original_profile,
+            &plan.codex.as_ref().unwrap().snapshot,
+            ENV,
+        )
+        .unwrap();
         assert!(profile_handoff::prepare(&f.root, &plan).is_err());
-        migration_snapshot::verify_tree(&plan.codex.snapshot, &plan.codex.original_profile, ENV)
-            .unwrap();
+        migration_snapshot::verify_tree(
+            &plan.codex.as_ref().unwrap().snapshot,
+            &plan.codex.as_ref().unwrap().original_profile,
+            ENV,
+        )
+        .unwrap();
     }
 }
 #[cfg(any(unix, windows))]
@@ -387,6 +437,7 @@ fn linked_working_profile_cannot_redirect_activation() {
     f.prepare();
     let lease = f.activate();
     let (_, claude) = lease.profiles();
+    let claude = claude.unwrap();
     drop(lease);
     let moved = claude.with_file_name("preserved");
     fs::rename(&claude, &moved).unwrap();
@@ -397,8 +448,8 @@ fn linked_working_profile_cannot_redirect_activation() {
     assert!(profile_handoff::activate(
         &f.root,
         ENV,
-        &f.plan.codex.original_profile,
-        &f.plan.claude.original_profile
+        f.plan.codex.as_ref().map(|i| i.original_profile.as_path()),
+        f.plan.claude.as_ref().map(|i| i.original_profile.as_path())
     )
     .is_err());
     assert!(profile_handoff::rollback(&f.root, ENV).is_err());
@@ -432,8 +483,12 @@ async fn runtime_uses_only_handed_off_profiles_and_holds_lease_through_setup() {
         storage: Default::default(),
         max_active_chats: 1,
         workspace: state.path().into(),
-        codex: Some(provider(f.plan.codex.original_profile.clone())),
-        claude: Some(provider(f.plan.claude.original_profile.clone())),
+        codex: Some(provider(
+            f.plan.codex.as_ref().unwrap().original_profile.clone(),
+        )),
+        claude: Some(provider(
+            f.plan.claude.as_ref().unwrap().original_profile.clone(),
+        )),
     };
     let service = AuthService::new(Auth::new(store)).unwrap();
     let hub = Chats::start(service.clone(), config.clone()).await.unwrap();
@@ -458,6 +513,8 @@ async fn runtime_uses_only_handed_off_profiles_and_holds_lease_through_setup() {
     assert!(!f
         .plan
         .claude
+        .as_ref()
+        .unwrap()
         .original_profile
         .join("setup-auth-probes.log")
         .exists());
@@ -536,5 +593,98 @@ fn selected_existing_profile_snapshots_keep_unrelated_live_data_out_of_migration
             &["sessions/link.jsonl".into()]
         )
         .is_err());
+    }
+}
+
+#[test]
+fn partial_agent_handoff_preserves_presence_history_and_rollback_boundaries() {
+    use profile_handoff::ProfileMode;
+    for mode in [ProfileMode::Copy, ProfileMode::Existing] {
+        for (codex, claude) in [(true, false), (false, true), (false, false)] {
+            let mut f = Fixture::new();
+            f.plan.profile_mode = mode;
+            let original = f.plan.clone();
+            if !codex {
+                f.plan.codex = None;
+            }
+            if !claude {
+                f.plan.claude = None;
+            }
+            f.prepare();
+            f.prepare();
+            // Presence is part of the binding: never adopt a profile merely
+            // because it exists on the same PC after preparation.
+            assert!(profile_handoff::activate(
+                &f.root,
+                ENV,
+                original
+                    .codex
+                    .as_ref()
+                    .map(|i| i.original_profile.as_path()),
+                original
+                    .claude
+                    .as_ref()
+                    .map(|i| i.original_profile.as_path())
+            )
+            .is_err());
+            let lease = f.activate();
+            let paths = lease.profiles();
+            assert_eq!(paths.0.is_some(), codex);
+            assert_eq!(paths.1.is_some(), claude);
+            assert_eq!(
+                lease.retains_original_profiles(),
+                mode == ProfileMode::Existing
+            );
+            let target = paths
+                .0
+                .as_ref()
+                .or(paths.1.as_ref())
+                .map(|p| p.join("new-history"));
+            if let Some(target) = &target {
+                fs::write(target, "NEW_HISTORY").unwrap();
+            }
+            drop(lease);
+            let lease = f.activate();
+            assert_eq!(lease.profiles(), paths);
+            if let Some(target) = &target {
+                assert_eq!(fs::read(target).unwrap(), b"NEW_HISTORY");
+            }
+            drop(lease);
+            assert!(!f.root.join("attempt-1/working/codex").exists() || codex);
+            assert!(!f.root.join("attempt-1/working/claude").exists() || claude);
+            if target.is_some() || mode == ProfileMode::Existing {
+                assert!(profile_handoff::rollback(&f.root, ENV).is_err());
+            } else {
+                profile_handoff::rollback(&f.root, ENV).unwrap();
+            }
+            // Omitted profiles are neither written nor copied.
+            for input in [
+                (!codex).then_some(original.codex),
+                (!claude).then_some(original.claude),
+            ]
+            .into_iter()
+            .flatten()
+            .flatten()
+            {
+                migration_snapshot::verify_tree(&input.snapshot, &input.original_profile, ENV)
+                    .unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_handoff_still_requires_a_valid_connection_identity() {
+    for environment in [
+        "",
+        "not-an-environment",
+        "OPENCODEX-0123456789abcdef01234567",
+    ] {
+        let mut f = Fixture::new();
+        f.plan.codex = None;
+        f.plan.claude = None;
+        f.plan.environment = environment.into();
+        assert!(profile_handoff::prepare(&f.root, &f.plan).is_err());
+        assert!(!f.root.exists());
     }
 }

@@ -74,14 +74,14 @@ impl Fixture {
                 version: 1,
                 profile_mode,
                 environment: ENV.into(),
-                codex: Input {
+                codex: Some(Input {
                     original_profile: codex.clone(),
                     snapshot: self.source.join("codex-native"),
-                },
-                claude: Input {
+                }),
+                claude: Some(Input {
                     original_profile: claude.clone(),
                     snapshot: claude_snapshot,
-                },
+                }),
             },
         )
         .unwrap();
@@ -1760,8 +1760,12 @@ fn service_selection_is_bound_exclusive_and_cancellable_only_before_native_start
     assert!(remodex_connect_native::profile_handoff::activate(
         &root.join("generation/native"),
         ENV,
-        std::path::Path::new(cfg["codex"]["profile"].as_str().unwrap()),
-        std::path::Path::new(cfg["claude"]["profile"].as_str().unwrap())
+        Some(std::path::Path::new(
+            cfg["codex"]["profile"].as_str().unwrap()
+        )),
+        Some(std::path::Path::new(
+            cfg["claude"]["profile"].as_str().unwrap()
+        ))
     )
     .is_err());
     let imported =
@@ -2118,4 +2122,109 @@ fn desktop_reference_upgrade_allows_live_appends_and_preserves_original_history(
             );
         }
     }
+}
+
+#[test]
+fn automatic_export_supports_single_agent_and_empty_installations_without_placeholder_profiles() {
+    use remodex_connect_native::{legacy_activation, legacy_export};
+    for agent in ["codex", "claude", "none"] {
+        for existing in [false, true] {
+            let (f, receipt, config) = automatic_export_fixture();
+            let root = f._dir.path().join("single-agent-upgrade");
+            let owner = receipt.parent().unwrap();
+            let mut input = read(&receipt);
+            let mut cfg = read(&config);
+            if existing {
+                input["profile_mode"] = json!("existing");
+            }
+            if agent != "codex" {
+                let mut connection = read(&owner.join("connection.json"));
+                connection["threadAliases"] = json!([]);
+                write(&owner.join("connection.json"), &connection);
+                input["chats"] = json!([]);
+                cfg.as_object_mut().unwrap().remove("codex");
+                input["profiles"].as_object_mut().unwrap().remove("codex");
+            }
+            if agent != "claude" {
+                cfg.as_object_mut().unwrap().remove("claude");
+                input["profiles"].as_object_mut().unwrap().remove("claude");
+            } else {
+                let old = read(&owner.join("codex.json"));
+                let public = json!({"version":1,"nativeId":CODEX,"thread":{
+                    "id":"claude-only","projectId":"project","title":"Preserve Claude",
+                    "worktreePath":f._dir.path(),"createdAt":TIME,"updatedAt":TIME,
+                    "modelSelection":{"instanceId":"claude-code","model":"test"},
+                    "runtimeMode":"approval-required","interactionMode":"default",
+                    "session":{"threadId":"claude-only","status":"ready"},
+                    "messages":old["messages"],"activities":[],"proposedPlans":[]}});
+                let profile = PathBuf::from(cfg["claude"]["profile"].as_str().unwrap());
+                fs::create_dir_all(profile.join("projects/test")).unwrap();
+                let relative = format!("projects/test/{CODEX}.jsonl");
+                let user = json!({"type":"user","uuid":PROMPT,"sessionId":CODEX,"parentUuid":null,"message":{"role":"user","content":"Keep original prompt"}});
+                let reply = json!({"type":"assistant","uuid":"00000000-0000-4000-8000-000000000002","sessionId":CODEX,"parentUuid":PROMPT,"message":{"id":"reply","role":"assistant","content":[{"type":"text","text":"Keep reply"}]}});
+                let bytes = format!("{user}\n{reply}\n");
+                fs::write(profile.join(&relative), &bytes).unwrap();
+                write(&owner.join("claude-only.json"), &public);
+                input["chats"] = json!([{"agent":"claude","id":"claude-only","history":"claude-only.json","transcript":relative,"sha256":format!("{:x}",Sha256::digest(bytes.as_bytes()))}]);
+            }
+            write(&receipt, &input);
+            write(&config, &cfg);
+            let report = legacy_export::run(&root, &receipt, &config).unwrap();
+            assert_eq!(report["phase"], "prepared");
+            let generation = root.join("generation");
+            legacy_activation::run(
+                &generation.join("bridge/state"),
+                &generation.join("configuration.json"),
+            )
+            .unwrap();
+            let db =
+                Connection::open(generation.join("bridge/state/native-connect.sqlite")).unwrap();
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM clients", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM chat_rows WHERE kind='messages'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                if agent == "none" { 0 } else { 2 }
+            );
+            let plan = read(&root.join("native-plan.json"));
+            for name in ["codex", "claude"] {
+                assert_eq!(plan[name].is_null(), name != agent);
+                assert_eq!(
+                    root.join(format!("source/{name}-native")).exists(),
+                    name == agent
+                );
+            }
+            // Roll back before startup without touching originals or pairing.
+            remodex_connect_native::legacy_upgrade::run(
+                "rollback",
+                &generation,
+                &root.join("upgrade-plan.json"),
+            )
+            .unwrap();
+            assert_eq!(read(&receipt), input);
+        }
+    }
+}
+
+#[test]
+fn automatic_export_refuses_omitted_profile_for_retained_chat_before_creating_destination() {
+    let (f, receipt, config) = automatic_export_fixture();
+    let mut input = read(&receipt);
+    input["profiles"].as_object_mut().unwrap().remove("codex");
+    let mut cfg = read(&config);
+    cfg.as_object_mut().unwrap().remove("codex");
+    write(&receipt, &input);
+    write(&config, &cfg);
+    let root = f._dir.path().join("refused-missing-profile");
+    let error = remodex_connect_native::legacy_export::run(&root, &receipt, &config).unwrap_err();
+    assert!(error.contains("profile missing"), "{error}");
+    assert!(!root.exists());
+    assert_eq!(read(&receipt), input);
 }

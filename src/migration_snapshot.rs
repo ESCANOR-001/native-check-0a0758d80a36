@@ -206,7 +206,7 @@ pub struct Report {
     pub directories: usize,
     pub bytes: u64,
 }
-fn environment(value: &str) -> bool {
+pub(crate) fn environment(value: &str) -> bool {
     // Existing TypeScript installations use opencodex-<hex>; isolated native
     // profiles retain their UUID identity through a profile-generation upgrade.
     (value.len() == 36 && uuid::Uuid::parse_str(value).is_ok_and(|id| id.to_string() == value))

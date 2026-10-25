@@ -8,6 +8,7 @@ import { exportChatAssets, type AssetProof } from './upgrade-export-assets';
 import { verifyShutdownBookkeeping } from './upgrade-shutdown-proof';
 import { holdUpgradeSource, recordStoppedUpgradeOwner, releaseUnpublishedStoppedExport } from './upgrade-source-hold';
 import { desktopTranscriptReference } from './upgrade-desktop-reference';
+import type { UpgradeProfiles } from './upgrade-profiles';
 
 export const UPGRADE_BUSY = 'Upgrade is waiting for settled chats and exclusive ownership. Finish pending work and retry; no chat was moved.';
 export class UpgradeAdmission {
@@ -129,7 +130,7 @@ async function writePrivate(path: string, value: unknown) {
  * separate: an interrupted export never has a completed receipt. */
 export async function exportOwnedUpgrade(
   directory: string,
-  profiles: { codex: string; claude: string },
+  profiles: UpgradeProfiles,
   owner: UpgradeExportOwner,
 ): Promise<{ receipt: string; chats: number }> {
   let stopping = false, stopped = false, publishing = false;
@@ -139,6 +140,7 @@ export async function exportOwnedUpgrade(
     const parent = await realpath(resolve(directory, '..'));
     const target = resolve(parent, directory.split(sep).at(-1)!);
     for (const path of Object.values(profiles)) {
+      if (path === undefined) continue;
       const source = await realpath(path);
       const rel = relative(source, target), reverse = relative(target, source);
       if (!rel || !reverse || !rel.startsWith('..' + sep) && !isAbsolute(rel)
@@ -161,16 +163,18 @@ export async function exportOwnedUpgrade(
       total += Buffer.byteLength(JSON.stringify(chat.history));
       if (total > 512 * 1024 * 1024) throw new Error(UPGRADE_BUSY);
       if (chat.desktopReference && chat.agent !== 'codex') throw new Error(UPGRADE_BUSY);
+      const profile = profiles[chat.agent];
+      if (!profile) throw new Error('A saved chat requires an agent profile missing from this export. No history was removed.');
       const proof = chat.desktopReference
-        ? await desktopTranscriptReference(profiles.codex, chat.transcript, chat.history.nativeId)
-        : await transcriptFingerprint(profiles[chat.agent], chat.transcript);
+        ? await desktopTranscriptReference(profile, chat.transcript, chat.history.nativeId)
+        : await transcriptFingerprint(profile, chat.transcript);
       const inventory = await exportChatAssets(target, chats.length, chat, owner.assetRoots, transcriptFingerprint, bytes => {
         assetBytes += bytes; if (assetBytes > 512 * 1024 * 1024) throw new Error(UPGRADE_BUSY);
       });
       if (assets.length + inventory.proofs.length > 20_000) throw new Error(UPGRADE_BUSY);
       assets.push(...inventory.proofs);
       await writePrivate(resolve(target, history), chat.desktopReference ? {
-        version: 1, threadId: chat.id, nativeId: chat.history.nativeId, profile: profiles.codex,
+        version: 1, threadId: chat.id, nativeId: chat.history.nativeId, profile,
         transcript: proof.relative, firstLineSha256: proof.sha256, firstLineBytes: proof.bytes,
       } : chat.history);
       chats.push({ agent: chat.agent, id: chat.id, history, transcript: proof.relative, sha256: proof.sha256, bytes: proof.bytes,
@@ -186,15 +190,17 @@ export async function exportOwnedUpgrade(
     if (hold) await recordStoppedUpgradeOwner(hold, owner.environment);
     for (const chat of chats) {
       const agent = chat.agent as 'codex' | 'claude';
+      const profile = profiles[agent];
+      if (!profile) throw new Error(UPGRADE_BUSY);
       if (chat.desktopReference) {
-        const proof = await desktopTranscriptReference(profiles.codex, resolve(profiles.codex, chat.transcript), chat.nativeId!);
+        const proof = await desktopTranscriptReference(profile, resolve(profile, chat.transcript), chat.nativeId!);
         if (proof.sha256 !== chat.sha256 || proof.bytes !== chat.bytes) throw new Error(UPGRADE_BUSY);
         continue;
       }
-      const proof = await transcriptFingerprint(profiles[agent], resolve(profiles[agent], chat.transcript));
+      const proof = await transcriptFingerprint(profile, resolve(profile, chat.transcript));
       if (proof.sha256 !== chat.sha256) {
-        await verifyShutdownBookkeeping(resolve(profiles[agent], chat.transcript), agent, chat.bytes, chat.sha256);
-        const stable = await transcriptFingerprint(profiles[agent], resolve(profiles[agent], chat.transcript));
+        await verifyShutdownBookkeeping(resolve(profile, chat.transcript), agent, chat.bytes, chat.sha256);
+        const stable = await transcriptFingerprint(profile, resolve(profile, chat.transcript));
         if (stable.sha256 !== proof.sha256) throw new Error(UPGRADE_BUSY);
         chat.sha256 = proof.sha256;
       }

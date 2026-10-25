@@ -20,8 +20,10 @@ const ERROR: &str =
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Profiles {
-    codex: PathBuf,
-    claude: PathBuf,
+    #[serde(default)]
+    codex: Option<PathBuf>,
+    #[serde(default)]
+    claude: Option<PathBuf>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -151,12 +153,18 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
     }
     if receipt.version != 1
         || receipt.chats.len() > 10_000
-        || (config.codex()?.shared_server.is_some()
+        || (config
+            .codex
+            .as_ref()
+            .is_some_and(|c| c.shared_server.is_some())
             && !(config.desktop_endpoint()
                 && receipt.profile_mode == profile_handoff::ProfileMode::Existing))
-        || config.claude()?.shared_server.is_some()
-        || config.codex()?.profile != receipt.profiles.codex
-        || config.claude()?.profile != receipt.profiles.claude
+        || config
+            .claude
+            .as_ref()
+            .is_some_and(|c| c.shared_server.is_some())
+        || config.codex.as_ref().map(|c| &c.profile) != receipt.profiles.codex.as_ref()
+        || config.claude.as_ref().map(|c| &c.profile) != receipt.profiles.claude.as_ref()
         || !root.is_absolute()
         || root
             .components()
@@ -171,7 +179,10 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
         .canonicalize()
         .map_err(|_| ERROR)?
         .join(root.file_name().ok_or(ERROR)?);
-    for source in [&original, &receipt.profiles.codex, &receipt.profiles.claude] {
+    for source in std::iter::once(&original)
+        .chain(receipt.profiles.codex.iter())
+        .chain(receipt.profiles.claude.iter())
+    {
         let source = source.canonicalize().map_err(|_| ERROR)?;
         if root.starts_with(&source) || source.starts_with(&root) {
             return Err(ERROR.into());
@@ -197,6 +208,14 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
         {
             return Err(ERROR.into());
         }
+        if (chat.agent == "codex" && receipt.profiles.codex.is_none())
+            || (chat.agent == "claude" && receipt.profiles.claude.is_none())
+        {
+            return Err(
+                "A chat requires an agent profile missing from this export; no history was removed"
+                    .into(),
+            );
+        }
         let v: Value =
             serde_json::from_slice(&read(&child(&original, &chat.history)?, 16 * 1024 * 1024)?)
                 .map_err(|_| ERROR)?;
@@ -221,7 +240,7 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
                 &serde_json::to_vec(&v).map_err(|_| ERROR)?,
             )?
             .matches_receipt(
-                &receipt.profiles.codex,
+                receipt.profiles.codex.as_deref().ok_or(ERROR)?,
                 &chat.id,
                 &chat.transcript,
                 &chat.sha256,
@@ -265,6 +284,7 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
         ("codex", &receipt.profiles.codex),
         ("claude", &receipt.profiles.claude),
     ] {
+        let Some(profile) = profile else { continue };
         let destination = source.join(format!("{agent}-native"));
         if receipt.profile_mode == profile_handoff::ProfileMode::Existing {
             let files: Vec<_> = receipt
@@ -302,7 +322,7 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
             let name = format!("codex-{index}.json");
             let bytes = read(&child(&public, &chat.history)?, 16384)?;
             crate::legacy_desktop_reference::Reference::parse(&bytes)?.matches_receipt(
-                &receipt.profiles.codex,
+                receipt.profiles.codex.as_deref().ok_or(ERROR)?,
                 &chat.id,
                 &chat.transcript,
                 &chat.sha256,
@@ -364,8 +384,8 @@ pub fn run(root: &Path, receipt_path: &Path, config_path: &Path) -> Result<Value
     json_file(
         &root.join("native-plan.json"),
         &json!({"version":1,"environment":receipt.environment,"profile_mode":receipt.profile_mode,
-        "codex":{"original_profile":receipt.profiles.codex,"snapshot":source.join("codex-native")},
-        "claude":{"original_profile":receipt.profiles.claude,"snapshot":source.join("claude-native")}}),
+        "codex":receipt.profiles.codex.as_ref().map(|p| json!({"original_profile":p,"snapshot":source.join("codex-native")})),
+        "claude":receipt.profiles.claude.as_ref().map(|p| json!({"original_profile":p,"snapshot":source.join("claude-native")}))}),
     )?;
     let plan = root.join("upgrade-plan.json");
     json_file(

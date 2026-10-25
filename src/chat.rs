@@ -368,7 +368,12 @@ impl Chats {
         })
         .await??;
         let profile_handoff = if let Some(root) = config.native_profile_handoff.clone() {
-            if config.codex()?.shared_server.is_some() && !config.desktop_endpoint() {
+            if config
+                .codex
+                .as_ref()
+                .is_some_and(|c| c.shared_server.is_some())
+                && !config.desktop_endpoint()
+            {
                 return Err("Shared Codex ownership must be handed off by its original server; a copied profile cannot adopt that transport".into());
             }
             let external = db
@@ -384,10 +389,15 @@ impl Chats {
                 .call(|a| a.store.environment_id())
                 .await?
                 .map_err(|_| "Cannot verify handoff environment")?;
-            let codex = config.codex()?.profile.clone();
-            let claude = config.claude()?.profile.clone();
+            let codex = config.codex.as_ref().map(|c| c.profile.clone());
+            let claude = config.claude.as_ref().map(|c| c.profile.clone());
             let session = tokio::task::spawn_blocking(move || {
-                crate::profile_handoff::activate(&root, &environment, &codex, &claude)
+                crate::profile_handoff::activate(
+                    &root,
+                    &environment,
+                    codex.as_deref(),
+                    claude.as_deref(),
+                )
             })
             .await
             .map_err(|_| "Native profile handoff check failed")??;
@@ -398,16 +408,13 @@ impl Chats {
             db.call(move |a| a.store.complete_migration_activation(&migration_config))
                 .await??;
             let (codex, claude) = session.profiles();
-            config
-                .codex
-                .as_mut()
-                .ok_or("Codex handoff configuration is missing")?
-                .profile = codex;
-            config
-                .claude
-                .as_mut()
-                .ok_or("Claude handoff configuration is missing")?
-                .profile = claude;
+            for (config, profile) in [(&mut config.codex, codex), (&mut config.claude, claude)] {
+                match (config.as_mut(), profile) {
+                    (Some(config), Some(profile)) => config.profile = profile,
+                    (None, None) => {}
+                    _ => return Err("Agent profile configuration changed during handoff".into()),
+                }
+            }
             Some(Arc::new(session))
         } else {
             None

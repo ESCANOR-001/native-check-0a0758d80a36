@@ -17,8 +17,15 @@ const ERROR:&str="This migration is not ready to activate; original installation
 
 fn binding(config: &Config) -> Result<String, String> {
     config.validate()?;
-    if (config.codex()?.shared_server.is_some() && !config.desktop_endpoint())
-        || config.claude()?.shared_server.is_some()
+    if (config
+        .codex
+        .as_ref()
+        .is_some_and(|c| c.shared_server.is_some())
+        && !config.desktop_endpoint())
+        || config
+            .claude
+            .as_ref()
+            .is_some_and(|c| c.shared_server.is_some())
     {
         return Err("Shared owners require their existing connection; this owned-profile migration cannot take them over".into());
     }
@@ -28,7 +35,7 @@ fn binding(config: &Config) -> Result<String, String> {
         .ok_or(ERROR)?
         .canonicalize()
         .map_err(|_| ERROR)?;
-    let mut value = json!({"root":root,"codex":config.codex()?.profile.canonicalize().map_err(|_|ERROR)?,"claude":config.claude()?.profile.canonicalize().map_err(|_|ERROR)?,"workspace":config.workspace.canonicalize().map_err(|_|ERROR)?});
+    let mut value = json!({"root":root,"codex":config.codex.as_ref().map(|c| c.profile.canonicalize()).transpose().map_err(|_|ERROR)?,"claude":config.claude.as_ref().map(|c| c.profile.canonicalize()).transpose().map_err(|_|ERROR)?,"workspace":config.workspace.canonicalize().map_err(|_|ERROR)?});
     if let Some(connection) = &config.connection {
         value["connection"] = json!({"dashboardBind": connection.dashboard_bind, "namedTunnel": connection.named_tunnel});
         if let Some(label) = &connection.label {
@@ -44,7 +51,7 @@ fn binding(config: &Config) -> Result<String, String> {
         reader_executable,
         reader_workspace,
         activation,
-    }) = &config.codex()?.shared_server
+    }) = config.codex.as_ref().and_then(|c| c.shared_server.as_ref())
     {
         value["desktopOwner"] = json!({"endpoint":desktop_endpoint.path,"reader":reader_executable.canonicalize().map_err(|_|ERROR)?,"workspace":reader_workspace.canonicalize().map_err(|_|ERROR)?});
         // Preserve the binding of generations created before activation existed.
@@ -155,8 +162,8 @@ pub(crate) fn rollback_lease(
     profile_handoff::inspect_prepared(
         config.native_profile_handoff.as_ref().ok_or(ERROR)?,
         &environment,
-        &config.codex()?.profile,
-        &config.claude()?.profile,
+        config.codex.as_ref().map(|c| c.profile.as_path()),
+        config.claude.as_ref().map(|c| c.profile.as_path()),
     )
     .map(Some)
 }
@@ -323,8 +330,8 @@ pub fn run(directory: &Path, config_path: &Path) -> Result<Value, String> {
     let session = profile_handoff::inspect_prepared(
         config.native_profile_handoff.as_ref().ok_or(ERROR)?,
         &environment,
-        &config.codex()?.profile,
-        &config.claude()?.profile,
+        config.codex.as_ref().map(|c| c.profile.as_path()),
+        config.claude.as_ref().map(|c| c.profile.as_path()),
     )?;
     let (codex, claude) = session.profiles();
     let chats: Vec<(String, String, String)> = store
@@ -348,13 +355,17 @@ pub fn run(directory: &Path, config_path: &Path) -> Result<Value, String> {
             return Err(ERROR.into());
         }
         if agent == "codex"
-            && crate::legacy_desktop_reference::verify(&store.db, &chat, Some(&codex))?
+            && crate::legacy_desktop_reference::verify(
+                &store.db,
+                &chat,
+                Some(codex.as_deref().ok_or(ERROR)?),
+            )?
         {
             continue;
         }
         let (proof, profile) = if agent == "codex" {
             crate::legacy_codex_native::verify(&store.db, directory, id)?;
-            ("legacy_codex_native", &codex)
+            ("legacy_codex_native", codex.as_deref().ok_or(ERROR)?)
         } else if agent == "claude" {
             crate::legacy_claude_native::verify(&store.db, directory, id)?;
             crate::legacy_claude_resume::verify(&store.db, id)?;
@@ -371,7 +382,7 @@ pub fn run(directory: &Path, config_path: &Path) -> Result<Value, String> {
             if (linked && (!resumed || !config.claude_sync_enabled())) || (!linked && resumed) {
                 return Err(ERROR.into());
             }
-            ("legacy_claude_native", &claude)
+            ("legacy_claude_native", claude.as_deref().ok_or(ERROR)?)
         } else {
             return Err(ERROR.into());
         };

@@ -6,10 +6,11 @@ import { open, realpath } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { startUpgradeControl } from './upgrade-control';
+import type { UpgradeProfiles } from './upgrade-profiles';
 
 export interface UpgradeRuntime {
   configuration: Record<string, unknown>;
-  profiles: { codex: string; claude: string };
+  profiles: UpgradeProfiles;
   bind: string;
   publicUrl: string;
   gui: string;
