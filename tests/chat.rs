@@ -99,12 +99,24 @@ impl Test {
     }
     async fn wait_for(&self, a: AgentKind, id: &str, status: &str, limit: Duration) -> Value {
         let started = std::time::Instant::now();
+        let mut last_report = started;
         let mut last = Value::Null;
         let result = tokio::time::timeout(limit, async {
             loop {
                 let t = self.detail(a, id).await;
                 if t["session"]["status"] == status {
                     return t;
+                }
+                if limit == BULK_HISTORY_TIMEOUT && last_report.elapsed() >= Duration::from_secs(1) {
+                    let messages = t["messages"].as_array();
+                    eprintln!(
+                        "Durable preparation {a:?}/{id}: elapsed={:?}, visible={}, last_id={}, status={}",
+                        started.elapsed(),
+                        messages.map_or(0, Vec::len),
+                        messages.and_then(|m| m.last()).map(|m| &m["id"]).unwrap_or(&Value::Null),
+                        t["session"]["status"]
+                    );
+                    last_report = std::time::Instant::now();
                 }
                 last = t;
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -995,6 +1007,12 @@ async fn native_claude_setup_preferences_do_not_disconnect_hosts_or_change_codex
 
 #[tokio::test]
 async fn external_claude_restart_keeps_owner_history_without_launching_another_cli() {
+    for desktop_sync in [false, true] {
+        external_claude_restart_keeps_owner_history(desktop_sync).await;
+    }
+}
+
+async fn external_claude_restart_keeps_owner_history(desktop_sync: bool) {
     let mut test = Test::new().await;
     let a = AgentKind::Claude;
     test.create(a, "external").await;
@@ -1011,10 +1029,17 @@ async fn external_claude_restart_keeps_owner_history_without_launching_another_c
         chat["thread"]["messages"]=json!([{"id":"original","role":"user","text":"Keep the original task intact","turnId":"owner-turn","streaming":false}]);
         a.store.save_chat(&chat,None).unwrap();
     }).await.unwrap();
-    test.config.claude.as_mut().unwrap().remote_control = true;
+    test.config.claude.as_mut().unwrap().remote_control = desktop_sync;
     test.hub = Chats::start(test.db.clone(), test.config.clone())
         .await
         .unwrap();
+    assert_eq!(
+        test.hub
+            .call(a, "phone", "claude.getSyncSettings", json!({}))
+            .await
+            .unwrap()["desktopSync"],
+        desktop_sync
+    );
     assert!(
         test.hub
             .configure_claude(json!({"enabled":false}))

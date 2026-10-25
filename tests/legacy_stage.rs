@@ -921,10 +921,11 @@ fn external_claude_requires_original_profile_native_proof_and_committed_cursor()
         let result = legacy_activation::run(&f.generation.join("state"), &config);
         assert_eq!(
             result.is_ok(),
-            mode == ProfileMode::Existing && ((!linked && !resume) || (linked && resume && remote)),
+            mode == ProfileMode::Existing && linked == resume,
             "{result:?}"
         );
         assert_eq!(rows(&f.db()), before);
+        assert_eq!(read(&config)["claude"]["remote_control"], remote);
         assert_eq!(
             fs::read_to_string(profile.join(&transcript)).unwrap(),
             original

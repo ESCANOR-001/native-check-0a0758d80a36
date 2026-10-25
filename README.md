@@ -37,6 +37,19 @@ phase. It rejects foreign owners and missing revisions instead of inferring
 compaction from silence. Live snapshots are capped at 8 MiB; broader Desktop
 version and large-history qualification are still required before release.
 
+Standalone native configurations can omit an unconfigured `codex` or `claude`
+agent. The bridge reports that agent as unavailable, preserves readable history,
+and refuses execution or settings writes for it without creating a placeholder
+profile or launching a fallback CLI. Configured agents continue independently;
+restart and dashboard status remain available even before either agent is set up.
+Existing-install export/handoff now preserves that same agent presence: only
+configured profiles are bound or copied, and a saved chat whose profile is missing
+blocks the upgrade before activation. Both copy-mode rehearsals and retained
+original directories cover Codex-only, Claude-only and empty exports. The legacy
+source bridge still requires Codex to run; its exporter no longer requires an
+unused Claude installation. Explicit or broken Claude profile paths remain errors.
+This does not yet qualify first-run npm onboarding or public release readiness.
+
 Implemented here:
 
 - Closed-owner export: `--legacy-export ABSOLUTE_NEW_ROOT CLOSED_OWNER_JSON
@@ -138,6 +151,8 @@ Implemented here:
   and never bootstraps over an existing journal, registration or source hold.
   Existing Bun service entries forward to the native selection, including
   `start --port PORT`; a port mismatch is refused before source shutdown.
+  The source export preserves Claude's saved Desktop-sharing preference. A
+  linked chat cannot activate with sharing disabled by an omitted setting.
   Explicit LAN selection retains its address even if the old backend has an
   unused quick tunnel. A selected temporary remote URL cannot yet survive
   migration, so that case stops before export. Named connections retain their
@@ -364,7 +379,10 @@ Implemented here:
   delivering remote events, never resends saved prompts, and preserves finished
   turns and paused queues when a handshake fails.
 - Existing shared Claude sessions can attach through a separate native HTTP/SSE
-  observer without launching or terminating their owner. A fresh worker handshake
+  observer without launching or terminating their owner, while bridge sharing
+  is enabled. Upgrades preserve verified
+  history and saved cursors when sharing is disabled, without enabling it or
+  starting a replacement CLI for a Desktop-owned chat. A fresh worker handshake
   and local history binding verify the native/shared IDs and workspace. Projection,
   stream cursors and local input receipts commit atomically. Stream reads continue
   during bounded command delivery; reconnect never resends a prompt. Native read

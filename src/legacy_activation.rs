@@ -379,7 +379,10 @@ pub fn run(directory: &Path, config_path: &Path) -> Result<Value, String> {
             // native-history proof above preserves it without requiring a live
             // relay or inventing an observer cursor. Only the original profile
             // may supply its link later; never resume this chat through a CLI.
-            if (linked && (!resumed || !config.claude_sync_enabled())) || (!linked && resumed) {
+            // A saved link still needs its verified cursor even when sharing is
+            // disabled. Activation preserves history and that preference; the
+            // runtime decides whether to attach, without enabling sharing here.
+            if linked != resumed {
                 return Err(ERROR.into());
             }
             ("legacy_claude_native", claude.as_deref().ok_or(ERROR)?)
@@ -389,7 +392,7 @@ pub fn run(directory: &Path, config_path: &Path) -> Result<Value, String> {
         let (path,report):(String,String)=store.db.query_row(&format!("SELECT transcript,report FROM {proof} WHERE chat=?1 AND phase='prepared' AND length(report)<=16777216"),[id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|ERROR)?;
         transcript(profile, &path, &report)?;
     }
-    // The receipt commits only after every chat and both copied profiles were
+    // The receipt commits only after every chat and configured profile were
     // verified. No CLI, relay, listener or original profile is touched here.
     let tx = store.db.transaction().map_err(|_| ERROR)?;
     tx.execute_batch("CREATE TABLE legacy_activation(id INTEGER PRIMARY KEY CHECK(id=1),environment TEXT NOT NULL,configuration TEXT NOT NULL,source_hash TEXT NOT NULL,phase TEXT NOT NULL,config TEXT NOT NULL);").map_err(|_|ERROR)?;

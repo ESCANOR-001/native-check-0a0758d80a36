@@ -49,6 +49,9 @@ jobs:
         run: cargo +1.98.0 clippy --locked --all-targets -- -D warnings
       - name: Qualify source handoff before the full suite
         run: cargo +1.98.0 test --locked --test upgrade_source_interop -- --show-output
+      - name: Recheck bounded prompt-edit history preparation
+        timeout-minutes: 10
+        run: node npm/check-history-preparation.mjs
       - name: Execute protocol and lifecycle tests
         timeout-minutes: 15
         run: cargo +1.98.0 test --locked --all-targets --no-fail-fast -- --test-threads=1 --show-output
@@ -60,7 +63,9 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: projection-diagnostic-${{ runner.os }}-${{ github.sha }}
-          path: legacy-hang-*
+          path: |
+            legacy-hang-*
+            history-preparation-*
           if-no-files-found: ignore
           retention-days: 7
       - name: Qualify pinned tunnel helper installation and reuse
