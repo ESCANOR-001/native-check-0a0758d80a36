@@ -18,6 +18,29 @@ struct Source {
     endpoint: String,
     token: String,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Registration {
+    version: u32,
+    descriptor: PathBuf,
+}
+/// A supported source owner registers itself beside the durable npm journal.
+/// This is a private local pathname, never an arbitrary URL or process probe.
+pub fn registered(root: &Path) -> Result<PathBuf, String> {
+    storage_stage::open(root, true).map_err(|_| ERROR)?;
+    if !root.is_absolute() || !canonical_spelling(root)? {
+        return Err(ERROR.into());
+    }
+    let bytes = private_bytes(&root.join("npm-source.json"), 8192).map_err(|_| {
+        "This older installation has no verified upgrade handoff. Start a compatible source bridge before upgrading; existing chats were left unchanged"
+    })?;
+    let record: Registration = serde_json::from_slice(&bytes).map_err(|_| ERROR)?;
+    if record.version != 1 {
+        return Err(ERROR.into());
+    }
+    load(root, &record.descriptor)?;
+    Ok(record.descriptor)
+}
 // Compare Node DOS spellings and Rust verbatim spellings without resolving
 // aliases or accepting a different path. The installation may not exist yet.
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -325,6 +348,38 @@ mod tests {
             &json!({"profile_mode":"copied","source_hold":"foreign"}),
         );
         assert!(acquire(&f.root, &f.descriptor).await.is_err());
+    }
+    #[test]
+    fn installed_start_requires_a_private_registration_bound_to_this_installation() {
+        let f = Fixture::new(1);
+        fs::create_dir(&f.root).unwrap();
+        let path = f.root.join("npm-source.json");
+        assert!(registered(&f.root).is_err());
+        let good = json!({"version":1,"descriptor":f.descriptor});
+        write(&path, &good);
+        assert_eq!(registered(&f.root).unwrap(), f.descriptor);
+        let other = f.root.with_file_name("other-installation");
+        fs::create_dir(&other).unwrap();
+        write(&other.join("npm-source.json"), &good);
+        assert!(registered(&other).is_err());
+        write(&path, &json!({"version":2,"descriptor":f.descriptor}));
+        assert!(registered(&f.root).is_err());
+        write(
+            &path,
+            &json!({"version":1,"descriptor":"https://example.com/upgrade"}),
+        );
+        assert!(registered(&f.root).is_err());
+        write(&path, &good);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(registered(&f.root).is_err());
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        fs::hard_link(&path, f.root.join("linked.json")).unwrap();
+        assert!(registered(&f.root).is_err());
+        assert!(!f.root.join("npm-upgrade.sqlite").exists());
     }
     #[tokio::test]
     async fn requests_one_owned_export_and_polls_until_the_durable_plan_exists() {

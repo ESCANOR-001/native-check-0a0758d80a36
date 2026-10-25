@@ -45,6 +45,10 @@ async fn bun_owner_retires_and_rust_recovers_the_exact_durable_plan() {
         .unwrap();
     assert!(line.len() < 8192);
     let descriptor = PathBuf::from(line);
+    assert_eq!(
+        upgrade_source::registered(&installation).unwrap(),
+        descriptor
+    );
     let plan = tokio::time::timeout(
         Duration::from_secs(10),
         upgrade_source::acquire(&installation, &descriptor),
@@ -73,8 +77,13 @@ async fn bun_owner_retires_and_rust_recovers_the_exact_durable_plan() {
             .unwrap(),
         plan
     );
-    assert!(
-        !installation.exists(),
-        "Acquisition must not preempt native validation or create an execution profile"
+    assert_eq!(
+        std::fs::read_dir(&installation).unwrap().count(),
+        1,
+        "Only the source locator exists; acquisition must not create an execution profile"
+    );
+    assert_eq!(
+        upgrade_source::registered(&installation).unwrap(),
+        descriptor
     );
 }

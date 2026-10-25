@@ -9,6 +9,8 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[path = "desktop_phase.rs"]
 mod desktop_phase;
+#[path = "desktop_requests.rs"]
+mod desktop_requests;
 
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(12);
@@ -109,6 +111,7 @@ pub struct Client {
     poisoned: bool,
     followed: Option<Owner>,
     phase: desktop_phase::Phase,
+    requests: desktop_requests::Requests,
 }
 #[derive(Clone)]
 pub struct Owner {
@@ -161,6 +164,7 @@ impl Client {
             poisoned: false,
             followed: None,
             phase: Default::default(),
+            requests: Default::default(),
         };
         let result = client
             .exchange(
@@ -283,6 +287,7 @@ impl Client {
             && p["hostId"] == "local"
         {
             self.phase.apply(&p["change"], &owner.thread)?;
+            self.requests.apply(&p["change"], &owner.thread)?;
         }
         Ok(())
     }
@@ -293,6 +298,10 @@ impl Client {
         owner: &Owner,
         current_turn: &str,
     ) -> Result<Option<(String, String)>, String> {
+        self.follow(owner).await?;
+        Ok(self.phase.compacting(current_turn))
+    }
+    async fn follow(&mut self, owner: &Owner) -> Result<(), String> {
         if self.poisoned || owner.connection != self.generation {
             return Err(UNAVAILABLE.into());
         }
@@ -340,7 +349,24 @@ impl Client {
                 return Err(UNAVAILABLE.into());
             }
         }
-        Ok(self.phase.compacting(current_turn))
+        Ok(())
+    }
+    pub async fn pending_requests(&mut self, owner: &Owner) -> Result<Vec<Value>, String> {
+        self.follow(owner).await?;
+        Ok(self.requests.rows().to_vec())
+    }
+    pub async fn respond(&mut self, owner: &Owner, response: &Value) -> Result<(), String> {
+        // Refresh before a decision: Desktop may have answered or cancelled it.
+        self.follow(owner).await?;
+        let (method, params) = self.requests.response(response)?;
+        let result = self.action(owner, method, 1, params).await?;
+        if result["ok"] != true {
+            self.poisoned = true;
+            return Err(
+                "Desktop did not acknowledge the control response; it was not retried".into(),
+            );
+        }
+        Ok(())
     }
     async fn action(
         &mut self,

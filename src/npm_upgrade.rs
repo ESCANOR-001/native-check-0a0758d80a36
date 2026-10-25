@@ -126,6 +126,7 @@ impl Journal {
                     "npm-upgrade.sqlite-wal",
                     "npm-upgrade.sqlite-shm",
                     "npm-upgrade.sqlite-journal",
+                    "npm-source.json",
                     "cutover.json",
                     "service",
                 ]
@@ -315,6 +316,21 @@ pub async fn launch<F: std::future::Future<Output = ()>>(
     source: &Path,
     stop: F,
 ) -> Result<i32, String> {
+    launch_registered(root, Some(source), stop).await
+}
+
+pub async fn start<F: std::future::Future<Output = ()>>(
+    root: &Path,
+    stop: F,
+) -> Result<i32, String> {
+    launch_registered(root, None, stop).await
+}
+
+async fn launch_registered<F: std::future::Future<Output = ()>>(
+    root: &Path,
+    source: Option<&Path>,
+    stop: F,
+) -> Result<i32, String> {
     let selected = if root
         .join("npm-upgrade.sqlite")
         .try_exists()
@@ -336,6 +352,14 @@ pub async fn launch<F: std::future::Future<Output = ()>>(
     if selected {
         return resume(root, stop).await;
     }
+    let registered;
+    let source = match source {
+        Some(source) => source,
+        None => {
+            registered = crate::upgrade_source::registered(root)?;
+            &registered
+        }
+    };
     let plan = crate::upgrade_source::acquire(root, source).await?;
     run(root, &plan, stop).await
 }

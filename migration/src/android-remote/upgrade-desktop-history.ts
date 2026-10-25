@@ -1,4 +1,6 @@
-/** Upgrade-only reader. Never resume a Desktop-owned chat in a second CLI. */
+/** Upgrade-only reader. Never resume a Desktop-owned chat in a second CLI.
+ * A confirmed absent owner permits a read-only dormant export; an unreachable
+ * discovery bus or ownership change is not proof of dormancy. */
 import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { transcriptFingerprint, UPGRADE_BUSY } from './upgrade-export';

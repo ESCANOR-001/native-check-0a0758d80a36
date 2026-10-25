@@ -12,7 +12,7 @@ test('Upgrade runs the native coordinator only on explicit launch and keeps path
     ['--npm-upgrade', 'run', 'C:\\Users\\A B\\install', 'C:\\$(literal)\\plan.json']);
   assert.throws(() => nativeArguments(['upgrade']), /Usage/);
   assert.throws(() => nativeArguments(['upgrade', 'a', 'b', 'extra']), /Usage/);
-  assert.deepEqual(nativeArguments(['start','C:\\Users\\A B\\installation']), ['--npm-upgrade','resume','C:\\Users\\A B\\installation']);
+  assert.deepEqual(nativeArguments(['start','C:\\Users\\A B\\installation']), ['--npm-upgrade','start','C:\\Users\\A B\\installation']);
   assert.throws(() => nativeArguments(['start']), /Usage/);
   assert.deepEqual(nativeArguments(['start','a','b']), ['--npm-upgrade','automatic','a','b']);
   assert.deepEqual(nativeArguments(['migrate','a','b']), ['--npm-upgrade','automatic','a','b']);

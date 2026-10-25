@@ -34,6 +34,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(PathBuf::from)
             .ok_or("An installation directory is required")?;
         match (args.get(2).map(String::as_str), args.len()) {
+            (Some("start"), 4) => {
+                let code = remodex_connect_native::npm_upgrade::start(&root, shutdown()?).await?;
+                if code != 0 { std::process::exit(code); }
+            }
             (Some("automatic"), 5) => {
                 let descriptor = PathBuf::from(&args[4]);
                 let code = remodex_connect_native::npm_upgrade::launch(&root, &descriptor, shutdown()?).await?;
@@ -64,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => {
                 return Err(
-                    "Usage: --npm-upgrade prepare|run INSTALL_DIR PLAN_JSON | automatic INSTALL_DIR SOURCE_JSON | resume|status|cancel INSTALL_DIR"
+                    "Usage: --npm-upgrade start|resume|status|cancel INSTALL_DIR | prepare|run INSTALL_DIR PLAN_JSON | automatic INSTALL_DIR SOURCE_JSON"
                         .into(),
                 )
             }

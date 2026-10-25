@@ -4,6 +4,35 @@ This is an isolated Rust foundation, **not a completed backend migration** and
 not an npm release. The production entrypoint still uses the TypeScript backend.
 The React dashboard and Android app are unchanged by this crate.
 
+Current upgrade qualification: an installed experimental npm launcher can ask a
+hook-enabled source bridge to export, drain, stop and launch the Rust generation
+on the same endpoint. Realme retained its pairing, original Desktop-owned Codex
+chat ID, messages and project label. This does **not** yet qualify an arbitrary
+published older package without that source hook. Desktop-native history is read
+without resuming it in a second CLI; mutations stay with the original IPC owner.
+The source exporter also discovers chats without an Android alias through bounded
+read-only inventory pages, preserving their native IDs and last-used settings.
+Unknown owners, changing transcripts and partial inventories stop the upgrade
+before cutover. Desktop pending approvals and questions now travel through that
+same verified owner, with bounded request inventories and native acknowledgments.
+Approval and decline, including an approval pending across a bridge restart,
+have passed on realme with the original isolated Desktop chat. Production Windows
+Desktop endpoint discovery remains a release gate.
+
+Task presentation now has an optional persisted `session.executionState`:
+`starting`, `running`, `paused`, `compacting`, `idle`, or `unknown`. Sending a
+prompt is not proof that execution started. Native acknowledgment starts Running;
+native compaction events control Compacting, interruption pauses the task, and
+lost observation reports Unknown rather than inventing completion or interruption.
+Android renders this phase in the list and status panel when the bridge supplies
+it. Existing servers without the optional field retain their current behavior.
+Actual native compaction has been checked on realme for both agents. For a
+Desktop-owned Codex chat, the saved transcript reports compaction too late, so a
+bounded original-owner subscription retains only turn/compaction identifiers and
+phase. It rejects foreign owners and missing revisions instead of inferring
+compaction from silence. Live snapshots are capped at 8 MiB; broader Desktop
+version and large-history qualification are still required before release.
+
 Implemented here:
 
 - Closed-owner export: `--legacy-export ABSOLUTE_NEW_ROOT CLOSED_OWNER_JSON
@@ -39,8 +68,8 @@ Implemented here:
   release without erasing a newer selection. Source and service leases exclude
   competing preparation/selection/recovery. This is a launcher boundary, **not** OS service
   registration or replacement of the published npm entrypoint. It never stops
-  or adopts another service. Codex Desktop-owned transport migration remains
-  outside this path.
+  or adopts another service. Desktop-owned Codex aliases can use the original-owner IPC adapter; unsupported
+  owners remain gated.
 - Explicit Linux user-service registration: `--background-service prepare
   REGISTRATION_DIR CUTOVER_DIR` captures the current executable and an already
   selected, stopped generation. Then use `install`, `start`, `status` or
@@ -82,6 +111,26 @@ Implemented here:
   connection and reattaches it after startup. Pending deliveries and missing
   ownership evidence remain blocked. Normal agent folders are still excluded by
   this experiment's isolation checks; this is not a shipping first-run upgrader.
+- npm launch handoff: `rmx-native-experiment upgrade INSTALL_DIR PLAN_JSON`
+  invokes the Rust coordinator on an explicit launch (never an npm install
+  hook). The plan contains `version: 1`, `closed_owner`, `configuration`, `bind`,
+  `public_url`, and `gui`. It requires a closed legacy-owner receipt in
+  `existing` profile mode. Preparation and service selection resume from a
+  durable journal, retain partial attempts, and stop after three attempts.
+  Repeated launches use the selected generation; cancellation after native
+  startup is refused so new messages cannot be replaced by an old snapshot.
+  `rmx-native-experiment start INSTALL_DIR` discovers a supported source owner's
+  private registration on first launch, requests its fixed export once, then
+  prepares and selects the native generation. A competing source cannot replace
+  the registration. Export attempts retain it across interruption; a clean idle
+  source shutdown removes only its own untouched registration. Later starts
+  validate the retained selection and run the current package against the same data. This
+  does not need the original external plan/configuration/receipt files and
+  cannot rerun an old export. Missing source registrations or cancelled selections remain blocked.
+  `.codex` and `.claude` stay at their configured paths. This connects the
+  closed-owner export to the launcher; acquiring that export from an older
+  published installation without the hook is still a release gate. It is not
+  a claim that updating the published package is ready.
 - Install preparation coordinator: `--legacy-upgrade prepare|check|rollback
   ABSOLUTE_NEW_ROOT PLAN_JSON` combines verified staging, native-profile binding,
   activation and the atomic rollback check. The version-1 plan contains

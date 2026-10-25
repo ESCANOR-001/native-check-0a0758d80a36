@@ -21,6 +21,8 @@ test('private source control exports once, retains completion, and refuses brows
   });
   try {
     const descriptor = JSON.parse(await readFile(control.descriptor, 'utf8'));
+    expect(JSON.parse(await readFile(join(root, 'installation/npm-source.json'), 'utf8')))
+      .toEqual({ version: 1, descriptor: control.descriptor });
     const headers = { authorization: `Bearer ${descriptor.token}`, 'x-remodex-upgrade-instance': descriptor.instance };
     expect((await fetch(descriptor.endpoint)).status).toBe(403);
     for (const extra of [{ origin: 'http://localhost' }, { 'sec-fetch-site': 'same-origin' }, { 'x-remodex-upgrade-instance': 'foreign' }]) {
@@ -32,6 +34,7 @@ test('private source control exports once, retains completion, and refuses brows
     expect(pending.every(r => r.phase === 'exporting')).toBe(true);
     await exporting;
     expect(calls).toBe(1);
+    expect((await stat(join(root, 'installation/npm-source.json'))).isFile()).toBe(true);
     finish();
     await control.close();
     const plan = JSON.parse(await readFile(join(dirname(control.descriptor), 'npm-plan.json'), 'utf8'));
@@ -39,6 +42,24 @@ test('private source control exports once, retains completion, and refuses brows
     expect(calls).toBe(1);
     if (process.platform !== 'win32') expect((await stat(control.descriptor)).mode & 0o077).toBe(0);
   } finally { finish(); await control.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('idle shutdown releases discovery but competing source startup never replaces a registered owner', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'upgrade-registration-'));
+  const options = { sourceRoot: root, installation: join(root, 'installation'),
+    async exportOwner(): Promise<never> { throw new Error('No export requested'); } };
+  const first = await startUpgradeControl(options);
+  try {
+    const path = join(options.installation, 'npm-source.json');
+    const registered = await readFile(path, 'utf8');
+    await expect(startUpgradeControl(options)).rejects.toThrow();
+    expect(await readFile(path, 'utf8')).toBe(registered);
+    await first.close();
+    expect(await stat(path).then(() => true, () => false)).toBe(false);
+    const next = await startUpgradeControl(options);
+    expect(next.descriptor).not.toBe(first.descriptor);
+    await next.close();
+  } finally { await first.close(); await rm(root, { recursive: true, force: true }); }
 });
 
 test('failed source export is not replayed and never publishes a plan or sensitive error', async () => {

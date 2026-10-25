@@ -19,7 +19,7 @@ export function nativeArguments(args) {
   if (args[0] === 'start') {
     if (args.length === 3) return ['--npm-upgrade', 'automatic', ...args.slice(1)];
     if (args.length !== 2) throw new Error('Usage: rmx-native-experiment start INSTALL_DIR');
-    return ['--npm-upgrade', 'resume', args[1]];
+    return ['--npm-upgrade', 'start', args[1]];
   }
   if (args[0] !== 'upgrade') return args;
   if (args.length !== 3) throw new Error('Usage: rmx-native-experiment upgrade INSTALL_DIR PLAN_JSON');

@@ -17,6 +17,7 @@ struct Desktop {
     owner: Option<Owner>,
     turn: String,
     items: BTreeMap<String, String>,
+    requests: BTreeMap<String, Value>,
     lifecycle: std::sync::Arc<std::sync::Mutex<crate::codex_lifecycle::Tracker>>,
 }
 impl Desktop {
@@ -161,6 +162,34 @@ impl Desktop {
             return Ok(());
         }
         let (metadata, page) = self.metadata(&self.native.clone()).await?;
+        let requests = self
+            .client
+            .pending_requests(self.owner.as_ref().ok_or(ERROR)?)
+            .await?;
+        let mut next = BTreeMap::new();
+        for request in requests {
+            if request["params"]
+                .get("turnId")
+                .is_some_and(|t| t != &self.turn)
+            {
+                return Err("Desktop control does not belong to the current task".into());
+            }
+            let key = request["id"].to_string();
+            if let Some(prior) = self.requests.get(&key) {
+                if prior != &request {
+                    return Err("Desktop reused a pending request identity".into());
+                }
+            } else {
+                send(output, request.clone()).await?;
+            }
+            next.insert(key, request);
+        }
+        for (key, prior) in &self.requests {
+            if !next.contains_key(key) {
+                send(output, json!({"method":"serverRequest/resolved","params":{"threadId":self.native,"requestId":prior["id"]}})).await?;
+            }
+        }
+        self.requests = next;
         if metadata["remodexLiveCompaction"]["turnId"] == self.turn {
             send(output, json!({"method":"item/started","params":{"threadId":self.native,"turnId":self.turn,
                 "item":{"type":"contextCompaction","id":metadata["remodexLiveCompaction"]["itemId"]}}})).await?;
@@ -267,6 +296,7 @@ impl Connection {
             owner: None,
             turn: String::new(),
             items: BTreeMap::new(),
+            requests: BTreeMap::new(),
             lifecycle: Default::default(),
         };
         let (writes, mut input) = mpsc::channel::<Write>(2);
@@ -283,6 +313,16 @@ impl Connection {
                         let Some((bytes,reply))=packet else{break;};
                         let request=serde_json::from_slice::<Value>(&bytes);
                         let Ok(request)=request else{let _=reply.send(Err(io::ErrorKind::InvalidData.into()));break;};
+                        if request.get("method").is_none() {
+                            let result=match desktop.owner.as_ref() {
+                                Some(owner)=>desktop.client.respond(owner,&request).await,
+                                None=>Err(ERROR.into()),
+                            };
+                            let failed=result.is_err();
+                            let _=reply.send(result.map_err(io::Error::other));
+                            if failed {break;}
+                            continue;
+                        }
                         let _=reply.send(Ok(()));
                         let result=desktop.request(request["method"].as_str().unwrap_or(""),request["params"].clone()).await;
                         if request.get("id").is_none() {if result.is_err(){break;}continue;}

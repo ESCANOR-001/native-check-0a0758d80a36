@@ -2,7 +2,7 @@
  * dashboard. A package launcher can request only this owner's fixed export. */
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { constants } from 'node:fs';
-import { mkdir, open, realpath } from 'node:fs/promises';
+import { lstat, mkdir, open, realpath, unlink } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 
 export interface UpgradeControlOptions {
@@ -74,9 +74,20 @@ export async function startUpgradeControl(options: UpgradeControlOptions) {
     },
   });
   const descriptor = join(directory, 'source.json');
+  // The installed launcher needs only its persistent installation directory.
+  // Never overwrite a previous registration: it may describe an interrupted
+  // export, and PID/port absence is not proof that its workers stopped.
+  const registration = join(options.installation, 'npm-source.json');
+  let registered = false;
+  let registrationIdentity: { dev: number; ino: number } | undefined;
   try {
     await writeNew(descriptor, { version: 1, source_root: sourceRoot, installation: options.installation,
       instance, endpoint: `http://127.0.0.1:${server.port}/upgrade`, token });
+    await mkdir(options.installation, { recursive: true, mode: 0o700 });
+    if (await realpath(options.installation) !== options.installation) throw new Error(FAILURE);
+    await writeNew(registration, { version: 1, descriptor });
+    registrationIdentity = await lstat(registration);
+    registered = true;
   } catch (error) { await server.stop(true); throw error; }
   return {
     descriptor,
@@ -86,6 +97,16 @@ export async function startUpgradeControl(options: UpgradeControlOptions) {
       // A caller disconnect cannot cancel the source's shutdown or truncate its
       // receipt. Keep the directory as recovery evidence, including failures.
       await flight;
+      // Clean shutdown before any export may release discovery. Once offered,
+      // retain it through failure, process exit and npm package replacement.
+      if (registered && phase === 'idle') {
+        const named = await lstat(registration).catch(() => null);
+        if (named?.isFile() && !named.isSymbolicLink() && named.nlink === 1
+          && named.dev === registrationIdentity?.dev && named.ino === registrationIdentity?.ino) {
+          await unlink(registration);
+        }
+        registered = false;
+      }
     },
   };
 }
