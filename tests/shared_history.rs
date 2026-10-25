@@ -265,6 +265,52 @@ fn external(id: &str, status: &str, count: usize) -> Value {
     json!({"id":id,"status":status,"startedAt":stamp/1000,"completedAt":if status=="completed"{json!(stamp/1000+1)}else{Value::Null},"items":items})
 }
 #[tokio::test]
+async fn idle_owner_loss_and_offline_restart_do_not_claim_confirmed_idle_or_replay() {
+    let mut f = Fixture::new().await;
+    f.turns
+        .lock()
+        .unwrap()
+        .push(external("idle-observation", "completed", 2));
+    let before = f.wait_text("idle-observation_ITEM_1").await;
+    assert_eq!(before["session"]["statusConfidence"], "confirmed");
+    f.log.lock().unwrap().clear();
+    f.offline.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            f.watch().await;
+            if f.detail().await["session"]["statusConfidence"] == "unknown" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.restart().await;
+    let offline = f.detail().await;
+    assert_eq!(offline["session"]["statusConfidence"], "unknown");
+    assert_eq!(offline["messages"], before["messages"]);
+    assert_eq!(offline["latestTurn"], before["latestTurn"]);
+    f.offline.store(false, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            f.watch().await;
+            if f.detail().await["session"]["statusConfidence"] == "confirmed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.detail().await["messages"], before["messages"]);
+    assert!(f.log.lock().unwrap().iter().all(|v| !matches!(
+        v["method"].as_str(),
+        Some("thread/resume" | "turn/start" | "turn/steer" | "turn/interrupt")
+    )));
+}
+
+#[tokio::test]
 async fn owned_turn_disconnect_recovers_without_phone_watch_cancellation_or_replay() {
     let f = Fixture::new().await;
     f.send("hold_owned").await.unwrap();

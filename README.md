@@ -131,6 +131,11 @@ Implemented here:
   closed-owner export to the launcher; acquiring that export from an older
   published installation without the hook is still a release gate. It is not
   a claim that updating the published package is ready.
+  A saved original-Desktop endpoint may be offline at startup: the bridge can
+  still start and display retained history. Live controls continue to require
+  the original owner; no fallback CLI resumes that chat. Saved idle observations
+  are unconfirmed after a restart or failed owner read and are confirmed again
+  only after a successful authoritative read. Reconnection never replays prompts.
 - Install preparation coordinator: `--legacy-upgrade prepare|check|rollback
   ABSOLUTE_NEW_ROOT PLAN_JSON` combines verified staging, native-profile binding,
   activation and the atomic rollback check. The version-1 plan contains

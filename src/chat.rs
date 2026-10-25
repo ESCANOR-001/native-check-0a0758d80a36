@@ -362,11 +362,7 @@ impl Chats {
                 && config.shared_codex(&chat)
                 && !chat.native_id.is_empty()
                 && chat.thread["deletedAt"].is_null()
-                && chat.thread["archivedAt"].is_null()
-                && matches!(
-                    s(&chat.thread["session"]["status"]),
-                    "starting" | "running" | "stopping"
-                );
+                && chat.thread["archivedAt"].is_null();
             if recover_shared {
                 shared_recovery.push((
                     s(&chat.thread["id"]).to_owned(),
@@ -1173,6 +1169,20 @@ impl Hub {
                 chat.thread["latestTurn"] = latest;
             }
         }
+        // An already consumed terminal page may carry no items. Its fresh
+        // owner metadata can still reconfirm idle after an offline restart.
+        // Never turn an unresolved local running delivery into a completion.
+        if batch.caught_up
+            && !batch.busy
+            && matches!(
+                s(&chat.thread["session"]["status"]),
+                "idle" | "ready" | "interrupted" | "error"
+            )
+            && chat.thread["session"]["statusConfidence"] == "unknown"
+        {
+            chat.thread["session"]["statusConfidence"] = json!("confirmed");
+            chat.thread["session"]["lastError"] = Value::Null;
+        }
         if batch.before == batch.after
             && serde_json::to_value(&chat).unwrap() == serde_json::to_value(&original).unwrap()
         {
@@ -1559,6 +1569,18 @@ impl Hub {
                         let result=match result {Ok(batch)=>{let tail=batch.caught_up;let busy=batch.busy;let external=batch.turn.as_ref().filter(|t|t["status"]=="inProgress").map(|t|s(&t["id"]).to_owned());
                             if batch.missing_empty_session && !current_send {continue;}
                             match self.apply_shared(&id,batch).await {Ok(())=>{if tail && busy && (current_send || !shared_sends.contains_key(&id)) {if let Some(turn)=external {let _=self.attach_shared(&id,turn).await;}}Ok((tail,busy))},Err(e)=>Err(e)}},Err(e)=>Err(e)};
+                        if result.is_err() {
+                            let chat=self.chats.get_mut(&id).unwrap();
+                            if chat.thread["session"]["statusConfidence"]!="unknown" {
+                                // Losing the owner also invalidates a previously idle
+                                // observation. Preserve history and turn state; a failed
+                                // follower read cannot prove the original task stopped.
+                                chat.thread["session"]["statusConfidence"]=json!("unknown");
+                                chat.thread["session"]["lastError"]=json!("The original Codex connection is unavailable. Reconnecting without resending saved prompts.");
+                                self.dirty=true;
+                                let _=self.save(&id,None).await;
+                            }
+                        }
                         if let Some((_,due))=self.shared_watches.get_mut(&id){*due=Instant::now()+Duration::from_millis(if (shared_sends.contains_key(&id) && !current_send) || matches!(result,Ok((false,_))) {10} else if result.is_ok(){750}else{5000});}
                         let finish=match &result {Ok((tail,_))=>*tail,Err(_)=>true};
                         if finish && current_send {
