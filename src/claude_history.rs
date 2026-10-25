@@ -580,18 +580,8 @@ pub async fn project(
             .unwrap();
         row["turnId"] = json!(input.public_turn);
         if row["sequence"].is_null() {
-            if let Some(time) = event
-                .created_at
-                .as_deref()
-                .or_else(|| value["timestamp"].as_str())
-                .filter(|s| {
-                    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
-                        .is_ok()
-                })
-            {
-                row["createdAt"] = json!(time);
-                row["updatedAt"] = json!(time);
-            }
+            row["createdAt"] = json!(event_time);
+            row["updatedAt"] = json!(event_time);
         }
         chat.thread["latestUserMessageAt"] = json!(event_time);
     }
@@ -1648,6 +1638,34 @@ mod tests {
     }
     async fn step(db: &AuthService, cursor: &mut Cursor, seq: u64, payload: Value) -> Value {
         step_at(db, cursor, seq, payload, "2026-10-22T12:00:00Z").await
+    }
+    #[tokio::test]
+    async fn replayed_prompt_keeps_native_time_before_its_reply() {
+        let (_dir, db, mut cursor, _native) = setup().await;
+        let input = uuid::Uuid::new_v4().to_string();
+        let prompt_time = "2026-10-21T10:00:00Z";
+        let reply_time = "2026-10-21T10:00:05Z";
+        step(
+            &db,
+            &mut cursor,
+            1,
+            json!({"type":"user","uuid":input,
+            "timestamp":prompt_time,"message":{"role":"user","content":"Original prompt"}}),
+        )
+        .await;
+        let chat = step(&db, &mut cursor, 2, json!({"type":"assistant",
+            "timestamp":reply_time,"user_message_uuid":input,
+            "message":{"id":"replayed-reply","role":"assistant","content":[{"type":"text","text":"Original reply"}]}})).await;
+        let rows = chat["thread"]["messages"].as_array().unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r["id"] == input).unwrap()["createdAt"],
+            prompt_time
+        );
+        assert_eq!(
+            rows.iter().find(|r| r["id"] == "replayed-reply").unwrap()["createdAt"],
+            reply_time
+        );
+        assert_eq!(chat["thread"]["latestUserMessageAt"], prompt_time);
     }
     async fn step_at(
         db: &AuthService,
