@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { startUpgradeControl } from '../src/android-remote/upgrade-control';
@@ -85,4 +85,23 @@ test('failed source export is not replayed and never publishes a plan or sensiti
     expect(await stat(join(dirname(control.descriptor), 'npm-plan.json')).then(() => true, () => false)).toBe(false);
     expect(await stat(join(dirname(control.descriptor), 'attempt.json')).then(() => true, () => false)).toBe(true);
   } finally { await control.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('source registration canonicalizes parent aliases but rejects a linked installation directory', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'upgrade-path-alias-'));
+  const real = join(root, 'real'), alias = join(root, 'alias');
+  await mkdir(real);
+  await symlink(real, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const options = { sourceRoot: real, installation: join(alias, 'installation'),
+    async exportOwner(): Promise<never> { throw new Error('No export requested'); } };
+  try {
+    const control = await startUpgradeControl(options);
+    try {
+      const descriptor = JSON.parse(await readFile(control.descriptor, 'utf8'));
+      expect(descriptor.installation).toBe(await realpath(options.installation));
+    } finally { await control.close(); }
+    const linked = join(root, 'linked-installation');
+    await symlink(options.installation, linked, process.platform === 'win32' ? 'junction' : 'dir');
+    await expect(startUpgradeControl({ ...options, installation: linked })).rejects.toThrow();
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

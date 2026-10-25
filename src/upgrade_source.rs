@@ -28,9 +28,10 @@ struct Registration {
 /// This is a private local pathname, never an arbitrary URL or process probe.
 pub fn registered(root: &Path) -> Result<PathBuf, String> {
     storage_stage::open(root, true).map_err(|_| ERROR)?;
-    if !root.is_absolute() || !canonical_spelling(root)? {
+    if !root.is_absolute() {
         return Err(ERROR.into());
     }
+    let root = root.canonicalize().map_err(|_| ERROR)?;
     let bytes = private_bytes(&root.join("npm-source.json"), 8192).map_err(|_| {
         "This older installation has no verified upgrade handoff. Start a compatible source bridge before upgrading; existing chats were left unchanged"
     })?;
@@ -38,7 +39,7 @@ pub fn registered(root: &Path) -> Result<PathBuf, String> {
     if record.version != 1 {
         return Err(ERROR.into());
     }
-    load(root, &record.descriptor)?;
+    load(&root, &record.descriptor)?;
     Ok(record.descriptor)
 }
 // Compare Node DOS spellings and Rust verbatim spellings without resolving
@@ -90,11 +91,20 @@ fn load(root: &Path, descriptor: &Path) -> Result<Source, String> {
     let directory = source
         .source_root
         .join(format!("native-upgrade-{}", source.instance));
+    let canonical_root = if root.try_exists().map_err(|_| ERROR)? {
+        storage_stage::open(root, true).map_err(|_| ERROR)?;
+        Some(root.canonicalize().map_err(|_| ERROR)?)
+    } else {
+        None
+    };
     if source.version != 1
         || uuid::Uuid::parse_str(&source.instance).is_err()
         || !source.source_root.is_absolute()
         || !root.is_absolute()
-        || !same_path(&source.installation, root)
+        || !(same_path(&source.installation, root)
+            || canonical_root
+                .as_ref()
+                .is_some_and(|p| same_path(&source.installation, p)))
         || !same_path(descriptor, &directory.join("source.json"))
         || source.token.len() != 64
         || !source.token.bytes().all(|c| c.is_ascii_hexdigit())
@@ -358,6 +368,18 @@ mod tests {
         let good = json!({"version":1,"descriptor":f.descriptor});
         write(&path, &good);
         assert_eq!(registered(&f.root).unwrap(), f.descriptor);
+        #[cfg(unix)]
+        {
+            let alias = f.root.parent().unwrap().join("alias");
+            std::os::unix::fs::symlink(f.root.parent().unwrap(), &alias).unwrap();
+            assert_eq!(
+                registered(&alias.join("installation")).unwrap(),
+                f.descriptor
+            );
+            let linked = f.root.with_file_name("linked-installation");
+            std::os::unix::fs::symlink(&f.root, &linked).unwrap();
+            assert!(registered(&linked).is_err());
+        }
         let other = f.root.with_file_name("other-installation");
         fs::create_dir(&other).unwrap();
         write(&other.join("npm-source.json"), &good);

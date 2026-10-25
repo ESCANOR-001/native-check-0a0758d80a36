@@ -30,20 +30,38 @@ impl Endpoint {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{FileTypeExt, MetadataExt};
-            if !self.path.is_absolute() {
+            if !self.path.is_absolute()
+                || self.path.components().any(|part| {
+                    matches!(
+                        part,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    )
+                })
+            {
                 return Err(UNAVAILABLE.into());
             }
             let root = profile.canonicalize().map_err(|_| UNAVAILABLE)?;
-            let parent = self
-                .path
-                .parent()
-                .ok_or(UNAVAILABLE)?
-                .canonicalize()
-                .map_err(|_| UNAVAILABLE)?;
-            if !parent.starts_with(&root) {
+            let mut ancestor = self.path.parent().ok_or(UNAVAILABLE)?;
+            let parent = loop {
+                match ancestor.canonicalize() {
+                    Ok(path) => break path,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        ancestor = ancestor.parent().ok_or(UNAVAILABLE)?;
+                    }
+                    Err(_) => return Err(UNAVAILABLE.into()),
+                }
+            };
+            if !parent.starts_with(root) {
                 return Err(UNAVAILABLE.into());
             }
-            let meta = std::fs::symlink_metadata(&self.path).map_err(|_| UNAVAILABLE)?;
+            // A saved connection may be offline. Configuration validation must
+            // still allow the bridge to show history; only connect() establishes
+            // live authority, without starting or resuming a replacement owner.
+            let meta = match std::fs::symlink_metadata(&self.path) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(_) => return Err(UNAVAILABLE.into()),
+            };
             if !meta.file_type().is_socket()
                 || meta.uid() != unsafe { libc::geteuid() }
                 || meta.mode() & 0o077 != 0
@@ -72,6 +90,8 @@ impl Endpoint {
     pub async fn connect(&self, profile: &Path) -> Result<Client, String> {
         self.validate(profile)?;
         #[cfg(unix)]
+        std::fs::symlink_metadata(&self.path).map_err(|_| UNAVAILABLE)?;
+        #[cfg(unix)]
         let stream = tokio::time::timeout(
             Duration::from_secs(2),
             tokio::net::UnixStream::connect(&self.path),
@@ -84,6 +104,7 @@ impl Endpoint {
             // Check the connected peer as well as the socket pathname. A
             // pathname check alone is insufficient if it changes at connect.
             self.validate(profile)?;
+            std::fs::symlink_metadata(&self.path).map_err(|_| UNAVAILABLE)?;
             if stream.peer_cred().map_err(|_| UNAVAILABLE)?.uid() != unsafe { libc::geteuid() } {
                 return Err(UNAVAILABLE.into());
             }
@@ -796,6 +817,30 @@ mod tests {
         assert!(endpoint.validate(other.path()).is_err());
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o666)).unwrap();
         assert!(endpoint.validate(root.path()).is_err());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn offline_endpoint_keeps_configuration_readable_without_authorizing_control() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let endpoint = Endpoint {
+            path: root.path().join("ipc/ipc.sock"),
+        };
+        endpoint.validate(root.path()).unwrap();
+        assert!(endpoint.connect(root.path()).await.is_err());
+        assert!(endpoint.validate(other.path()).is_err());
+        std::fs::create_dir(root.path().join("ipc")).unwrap();
+        endpoint.validate(root.path()).unwrap();
+        std::fs::write(&endpoint.path, b"not a socket").unwrap();
+        assert!(endpoint.validate(root.path()).is_err());
+        std::fs::remove_file(&endpoint.path).unwrap();
+        std::fs::remove_dir(root.path().join("ipc")).unwrap();
+        std::os::unix::fs::symlink(other.path(), root.path().join("ipc")).unwrap();
+        assert!(endpoint.validate(root.path()).is_err());
+        let traversal = Endpoint {
+            path: root.path().join("uncreated/../../elsewhere/ipc.sock"),
+        };
+        assert!(traversal.validate(root.path()).is_err());
     }
 }
 

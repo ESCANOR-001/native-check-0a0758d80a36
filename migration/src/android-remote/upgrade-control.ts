@@ -81,10 +81,14 @@ export async function startUpgradeControl(options: UpgradeControlOptions) {
   let registered = false;
   let registrationIdentity: { dev: number; ino: number } | undefined;
   try {
-    await writeNew(descriptor, { version: 1, source_root: sourceRoot, installation: options.installation,
-      instance, endpoint: `http://127.0.0.1:${server.port}/upgrade`, token });
     await mkdir(options.installation, { recursive: true, mode: 0o700 });
-    if (await realpath(options.installation) !== options.installation) throw new Error(FAILURE);
+    const destination = await lstat(options.installation);
+    if (!destination.isDirectory() || destination.isSymbolicLink()) throw new Error(FAILURE);
+    // macOS's /var and Windows drive casing may differ from realpath. Persist
+    // the canonical directory instead of comparing its textual spelling.
+    const installation = await realpath(options.installation);
+    await writeNew(descriptor, { version: 1, source_root: sourceRoot, installation,
+      instance, endpoint: `http://127.0.0.1:${server.port}/upgrade`, token });
     await writeNew(registration, { version: 1, descriptor });
     registrationIdentity = await lstat(registration);
     registered = true;
