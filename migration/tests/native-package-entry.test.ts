@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, realpath } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -24,7 +24,7 @@ test('published bin keeps the Connect state location and literal paths', () => {
 });
 
 test('existing Bun service entry forwards its port without starting the legacy server', async () => {
-  const root=await mkdtemp(join(tmpdir(),'native-service-entry-'));
+  const root=await realpath(await mkdtemp(join(tmpdir(),'native-service-entry-')));
   try {
     await mkdir(join(root,'src/cli'),{recursive:true});await mkdir(join(root,'bin'));
     await writeFile(join(root,'src/cli/connect.ts'),await readFile(resolve(import.meta.dir,'../src/cli/connect.ts')));
