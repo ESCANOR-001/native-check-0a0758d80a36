@@ -447,6 +447,10 @@ impl Hub {
                 self.claude_recovery.connected(id, Instant::now());
                 let chat = self.chats.get_mut(id).unwrap();
                 chat.thread["session"]["statusConfidence"] = json!("confirmed");
+                if w.stage == "idle" {
+                    chat.thread["session"]["status"] = json!("idle");
+                    chat.thread["session"]["activeTurnId"] = Value::Null;
+                }
                 if chat.thread["session"]["lastError"]
                     == "Reconnecting to Claude's updated link; saved history is retained"
                 {

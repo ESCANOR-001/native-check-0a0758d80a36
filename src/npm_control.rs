@@ -186,7 +186,9 @@ async fn offline(target: &Target) -> bool {
     let Some(address) = target.base.strip_prefix("http://") else {
         return false;
     };
-    matches!(tokio::time::timeout(Duration::from_secs(1),tokio::net::TcpStream::connect(address)).await,
+    // Winsock may take over one second to return WSAECONNREFUSED even on
+    // loopback. A timeout still is not proof of shutdown: require refusal.
+    matches!(tokio::time::timeout(Duration::from_secs(3),tokio::net::TcpStream::connect(address)).await,
         Ok(Err(error)) if error.kind()==std::io::ErrorKind::ConnectionRefused)
 }
 pub async fn command(root: &Path, operation: &str) -> Result<Value, String> {

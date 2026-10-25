@@ -297,7 +297,8 @@ impl Router {
         self.pending.values()
     }
     /// Recovery can retire one unambiguously completed historical input once
-    /// a root result and its server PROCESSED receipt have both been observed.
+    /// a root result and its server PROCESSED receipt have both been observed,
+    /// or an immutable migrated reply has an exact native end_turn identity.
     /// Multiple pending inputs require normal native turn identity evidence.
     pub fn settle_historical_result(&mut self, public_turn: &str, processed: &[String]) -> bool {
         if self.active.is_some() || self.pending.len() != 1 || self.background.busy() {

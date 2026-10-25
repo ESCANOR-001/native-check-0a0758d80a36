@@ -358,16 +358,40 @@ pub async fn project(
     if value.get("session_id").is_some() {
         value["session_id"] = json!(chat.native_id);
     }
-    let event_time = event
-        .created_at
-        .as_deref()
-        .or_else(|| value["timestamp"].as_str())
+    // New relay links timestamp an old transcript upload at upload time. The
+    // original worker's timestamp is the time of the work, not that upload.
+    let event_time = value["timestamp"]
+        .as_str()
+        .or(event.created_at.as_deref())
         .filter(|s| {
             time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).is_ok()
         })
         .map(str::to_owned)
         .unwrap_or_else(now);
     let id = s(&chat.thread["id"]).to_owned();
+    let mut exported_reply = None;
+    if catchup && event.source == "worker" && value["type"] == "assistant" {
+        if let (Some(before), Some(uuid)) = (reduced.relink_before, value["uuid"].as_str()) {
+            let cid = id.clone();
+            let key = uuid.to_owned();
+            let old = db
+                .call(move |a| {
+                    a.store
+                        .claude_relink_rows(&cid, before, &[("messages", key)])
+                })
+                .await?
+                .map_err(|_| "Claude exported reply unavailable")?;
+            if let Some((_, row)) = old
+                .into_iter()
+                .find(|(_, row)| row["role"] == "assistant" && row["streaming"] != true)
+            {
+                // SDK imports use event UUIDs; the live stream uses API message
+                // IDs. The exact event identity proves this is the same row.
+                value["message"]["id"] = row["id"].clone();
+                exported_reply = Some(row);
+            }
+        }
+    }
     // Fetch exact spilled rows, never the full transcript or tool output.
     let mut keys = vec![
         s(&value["uuid"]).to_owned(),
@@ -483,6 +507,33 @@ pub async fn project(
         }
         chat.thread["latestUserMessageAt"] = json!(event_time);
     }
+    if let Some(row) = exported_reply.as_ref().filter(|_| {
+        value["message"]["stop_reason"] == "end_turn" && value["parent_tool_use_id"].is_null()
+    }) {
+        let pending = reduced
+            .router
+            .pending()
+            .filter(|p| row["turnId"] == p.public_turn)
+            .cloned()
+            .collect::<Vec<_>>();
+        if pending.len() == 1 {
+            let (cid, sid, iid) = (
+                id.clone(),
+                chat.native_id.clone(),
+                pending[0].native.clone(),
+            );
+            let proven = db
+                .call(move |a| a.store.claude_input(&cid, &sid, &iid))
+                .await?
+                .map_err(|_| "Claude exported prompt mapping unavailable")?
+                .is_some_and(|r| r.state == "legacy-consumed" && r.input == pending[0]);
+            if proven {
+                reduced
+                    .router
+                    .settle_historical_result(s(&row["turnId"]), &[pending[0].native.clone()]);
+            }
+        }
+    }
     let change = reduced.router.observe(&value)?;
     if catchup
         && event.source == "worker"
@@ -533,7 +584,11 @@ pub async fn project(
                 row["turnId"] = json!(turn.public_turn);
             }
         }
-    } else if catchup && reduced.router.active().is_none() && value["type"] == "assistant" {
+    } else if catchup
+        && exported_reply.is_none()
+        && reduced.router.active().is_none()
+        && value["type"] == "assistant"
+    {
         // Historical peer output may predate consumption receipts. This is
         // display-only grouping; it grants no ownership/control of live work.
         if let Some(turn) = &reduced.history_turn {

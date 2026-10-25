@@ -1974,6 +1974,108 @@ async fn reconciled_alias_native_replay_retains_original_prompt_and_turn() {
     assert_eq!(saved["thread"]["session"]["status"], "ready");
 }
 
+#[tokio::test]
+async fn exported_sdk_reply_uuid_settles_replayed_prompt_without_a_new_result() {
+    use remodex_connect_native::{
+        auth::Auth, auth_service::AuthService, claude_host::Identity, claude_remote::Envelope,
+    };
+    for terminal in [false, true] {
+        let (dir, mut store, _) = setup();
+        let mut value = source(dir.path());
+        value["external"] = json!(true);
+        value["upgradeNativeReplay"] = json!(true);
+        value["thread"]["messages"][1]["id"] = json!("00000000-0000-4000-8000-000000000028");
+        store.prepare_legacy_claude(&raw(&value)).unwrap();
+        let export = native_export(|_, _| {});
+        store
+            .prepare_legacy_claude_native(
+                "original-android-chat",
+                &export.snapshot,
+                &export.transcript,
+            )
+            .unwrap();
+        let checkpoint = store
+            .prepare_legacy_claude_resume("original-android-chat")
+            .unwrap();
+        assert_eq!(checkpoint["sequence"], 0);
+        assert_eq!(checkpoint["phase"], "owned-replay-prepared");
+        drop(store);
+        let mut store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store
+                .prepare_legacy_claude_resume("original-android-chat")
+                .unwrap(),
+            checkpoint
+        );
+        let identity = Identity {
+            native_session: NATIVE.into(),
+            bridge_session: "cse_legacy_fixture".into(),
+        };
+        let mut cursor = store
+            .claude_remote_cursor("original-android-chat", identity)
+            .unwrap();
+        let mut current = store.load_chat("original-android-chat").unwrap();
+        let original = current["thread"]["messages"].clone();
+        let service = AuthService::new(Auth::new(store)).unwrap();
+        for (seq, source, payload) in [
+            (
+                1,
+                "client",
+                json!({"type":"user","uuid":INPUT_NATIVE,"session_id":NATIVE,"message":{"role":"user","content":"Original prompt"}}),
+            ),
+            (
+                2,
+                "worker",
+                json!({"type":"assistant","uuid":"00000000-0000-4000-8000-000000000028","timestamp":TIME,"session_id":NATIVE,"message":{"id":"assistant-message","role":"assistant","stop_reason":if terminal {"end_turn"} else {"tool_use"},"content":[{"type":"text","text":"Original reply"}]}}),
+            ),
+        ] {
+            let event = Envelope {
+                deliveries: vec![],
+                receipt_checkpoint: false,
+                recovery: None,
+                sequence: Some(seq),
+                event_id: Some(format!("echo-{seq}")),
+                source: source.into(),
+                created_at: Some("2026-10-25T05:30:00Z".into()),
+                payload: Some(payload),
+            };
+            let (next, projection) = remodex_connect_native::claude_history::project(
+                &service, current, &cursor, &event, true,
+            )
+            .await
+            .unwrap();
+            let after = cursor.advance(&event, projection).unwrap();
+            let a = cursor.clone();
+            let b = after.clone();
+            let saved = next.clone();
+            service
+                .call(move |auth| auth.store.save_claude_remote(&saved, &a, &b))
+                .await
+                .unwrap()
+                .unwrap();
+            current = next;
+            cursor = after;
+        }
+        let saved = service
+            .call(|a| a.store.load_chat("original-android-chat"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved["thread"]["messages"], original);
+        assert_eq!(saved["thread"]["latestTurn"]["turnId"], "old-turn");
+        assert_eq!(
+            saved["thread"]["session"]["status"],
+            current["thread"]["session"]["status"]
+        );
+        let (router, _) =
+            remodex_connect_native::claude_history::control_state(&cursor.projection).unwrap();
+        assert!(router.active().is_none());
+        assert_eq!(router.pending().count(), if terminal { 0 } else { 1 });
+        assert_eq!(saved["thread"]["latestTurn"], value["thread"]["latestTurn"]);
+        assert_eq!(saved["thread"]["messages"][1]["createdAt"], TIME);
+    }
+}
+
 #[test]
 fn checkpoint_prompt_excerpts_keep_newlines_but_reject_terminal_controls() {
     let (dir, mut store, db) = setup();
