@@ -148,7 +148,12 @@ async fn latest_window_and_status_are_independent_of_older_scroll_pages() {
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|error| {
+        panic!(
+            "Desktop window did not refresh: {error}; reader requests: {}",
+            std::fs::read_to_string(profile.join("requests.jsonl")).unwrap_or_default()
+        )
+    });
     assert_eq!(current["messages"].as_array().unwrap().len(), 6);
     assert_eq!(
         current["messages"]

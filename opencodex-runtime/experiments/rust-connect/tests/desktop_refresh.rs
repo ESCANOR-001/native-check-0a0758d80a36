@@ -47,10 +47,12 @@ fn update(profile: &Path, status: &str, revision: i64) {
     writeln!(std::fs::OpenOptions::new().append(true).open(profile.join("sessions/chat.jsonl")).unwrap(),"{}",json!({"type":"event_msg","payload":{"type":if status=="inProgress"{"task_started"}else{"task_complete"},"turn_id":turn}})).unwrap();
 }
 async fn wait_status(h: &Chats, expected: &str) -> Value {
+    let mut last = Value::Null;
     tokio::time::timeout(Duration::from_secs(35), async {
         loop {
             let v = call(h, "orchestration.subscribeShell", json!({})).await;
             let t = &v["snapshot"]["threads"][0];
+            last = t.clone();
             if t["session"]["executionState"] == expected {
                 return t.clone();
             }
@@ -58,7 +60,7 @@ async fn wait_status(h: &Chats, expected: &str) -> Value {
         }
     })
     .await
-    .expect("List status did not refresh without opening the chat")
+    .unwrap_or_else(|error| panic!("List status did not refresh to {expected}: {error}; last thread: {last}"))
 }
 #[tokio::test]
 async fn android_origin_adopts_verified_desktop_owner_and_idle_list_detects_next_turn() {
