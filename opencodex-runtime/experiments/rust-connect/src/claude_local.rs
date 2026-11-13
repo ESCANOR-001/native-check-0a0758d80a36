@@ -387,7 +387,7 @@ fn auth_frame(profile: &Path, owner: &Owner, socket: &Path) -> Result<Zeroizing<
 }
 
 /// Offers one explicitly authorized input. No automatic retry after writing.
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", windows)))]
 pub(crate) async fn offer(
     profile: PathBuf,
     expected: Owner,
