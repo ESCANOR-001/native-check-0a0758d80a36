@@ -47,8 +47,11 @@ fn update(profile: &Path, status: &str, revision: i64) {
     writeln!(std::fs::OpenOptions::new().append(true).open(profile.join("sessions/chat.jsonl")).unwrap(),"{}",json!({"type":"event_msg","payload":{"type":if status=="inProgress"{"task_started"}else{"task_complete"},"turn_id":turn}})).unwrap();
 }
 async fn wait_status(h: &Chats, expected: &str) -> Value {
+    wait_status_with_timeout(h, expected, Duration::from_secs(35)).await
+}
+async fn wait_status_with_timeout(h: &Chats, expected: &str, timeout: Duration) -> Value {
     let mut last = Value::Null;
-    tokio::time::timeout(Duration::from_secs(35), async {
+    tokio::time::timeout(timeout, async {
         loop {
             let v = call(h, "orchestration.subscribeShell", json!({})).await;
             let t = &v["snapshot"]["threads"][0];
@@ -60,7 +63,9 @@ async fn wait_status(h: &Chats, expected: &str) -> Value {
         }
     })
     .await
-    .unwrap_or_else(|error| panic!("List status did not refresh to {expected}: {error}; last thread: {last}"))
+    .unwrap_or_else(|error| {
+        panic!("List status did not refresh to {expected}: {error}; last thread: {last}")
+    })
 }
 #[tokio::test]
 async fn android_origin_adopts_verified_desktop_owner_and_idle_list_detects_next_turn() {
@@ -163,11 +168,13 @@ async fn android_origin_adopts_verified_desktop_owner_and_idle_list_detects_next
         "No owner is not permission to promote or start one"
     );
     std::fs::write(profile.join("owned"), b"owner").unwrap();
-    // Reads fail beyond the old ten-second idle watch. Recovery must retry
-    // this same native revision without a phone-open or another Desktop turn.
-    std::fs::write(profile.join("read-failures"), b"3").unwrap();
+    // Unchanged failed histories now wait 60 seconds before retrying, keeping
+    // dormant files from consuming CPU. Exercise that real cooldown once;
+    // Revisions unit tests cover repeated failures and the longer backoff.
+    // Recovery must still retry without a phone-open or another Desktop turn.
+    std::fs::write(profile.join("read-failures"), b"1").unwrap();
     update(&profile, "inProgress", 2);
-    let running = wait_status(&hub, "running").await;
+    let running = wait_status_with_timeout(&hub, "running", Duration::from_secs(75)).await;
     assert_eq!(running["id"], "android-alias");
     assert_eq!(running["nativeSessionId"], NATIVE);
     assert_eq!(running["title"], "Keep my title");

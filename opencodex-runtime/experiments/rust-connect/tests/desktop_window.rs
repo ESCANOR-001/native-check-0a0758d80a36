@@ -12,6 +12,16 @@ use std::{os::unix::fs::PermissionsExt, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const NATIVE: &str = "12345678-1234-4234-8234-123456789abc";
 async fn detail(hub: &Chats) -> Value {
+    // The network subscription renews this watch before reading its snapshot.
+    // A direct Chats call must do the same; snapshots alone are read-only.
+    hub.call(
+        AgentKind::Codex,
+        "phone",
+        "native.watchShared",
+        json!({"threadId":"window"}),
+    )
+    .await
+    .unwrap();
     hub.call(
         AgentKind::Codex,
         "phone",
