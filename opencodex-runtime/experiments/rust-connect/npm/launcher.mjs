@@ -39,7 +39,7 @@ function versionAtLeast(actual, minimum) {
   return true;
 }
 export async function verifyBinary(root, target, glibc = process.report?.getReport()?.header?.glibcVersionRuntime) {
-  const metadata = join(root, 'native.json');
+  const metadata = join(root, 'native-experiment.json');
   const st = await lstat(metadata);
   if (!st.isFile() || st.isSymbolicLink() || st.size > 4096) throw new Error('Native package metadata is invalid.');
   const handle = await open(metadata, 'r');

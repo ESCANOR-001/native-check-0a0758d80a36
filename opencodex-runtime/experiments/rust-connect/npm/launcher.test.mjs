@@ -33,7 +33,7 @@ test('Checksums, platform, metadata bounds and libc floor are checked before exe
     const executable = join(root, 'remodex-connect-native');
     await writeFile(executable, body);
     const manifest = { formatVersion: 1, version: '0.0.0', migrationComplete: false, target: 'linux-x64-gnu', minimumGlibc: '2.31', bytes: body.length, sha256: createHash('sha256').update(body).digest('hex') };
-    const save = m => writeFile(join(root, 'native.json'), JSON.stringify(m));
+    const save = m => writeFile(join(root, 'native-experiment.json'), JSON.stringify(m));
     await save(manifest);
     assert.equal(await verifyBinary(root, 'linux-x64-gnu', '2.39'), executable);
     await assert.rejects(verifyBinary(root, 'linux-x64-gnu', '2.30'), /newer glibc/);
@@ -42,7 +42,7 @@ test('Checksums, platform, metadata bounds and libc floor are checked before exe
     await assert.rejects(verifyBinary(root, 'linux-x64-gnu', '2.39'), /does not match/);
     await save({ ...manifest, sha256: '0'.repeat(64) });
     await assert.rejects(verifyBinary(root, 'linux-x64-gnu', '2.39'), /checksum failed/);
-    await writeFile(join(root, 'native.json'), 'x'.repeat(4097));
+    await writeFile(join(root, 'native-experiment.json'), 'x'.repeat(4097));
     await assert.rejects(verifyBinary(root, 'linux-x64-gnu', '2.39'), /metadata is invalid/);
     await save(manifest); await writeFile(executable, Buffer.concat([body, Buffer.from('extra')]));
     await assert.rejects(verifyBinary(root, 'linux-x64-gnu', '2.39'), /executable is invalid/);

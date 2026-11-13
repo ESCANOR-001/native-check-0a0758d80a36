@@ -27,8 +27,10 @@ export async function buildPackages(binary, destination, version = VERSION) {
   for await (const b of createReadStream(path, { highWaterMark: 64 * 1024 })) hash.update(b);
   const manifest = { formatVersion: 1, version, target, migrationComplete: false, bytes: stat.size, sha256: hash.digest('hex') };
   if (target.endsWith('-gnu')) manifest.minimumGlibc = process.report.getReport().header.glibcVersionRuntime; // Conservative tested build baseline.
-  await writeFile(join(native, 'native.json'), JSON.stringify(manifest, null, 2));
-  await writeFile(join(native, 'package.json'), JSON.stringify({ name, version, private: true, os: [process.platform], cpu: [process.arch], files: [executable, 'native.json'], exports: { './package.json': './package.json' } }, null, 2));
+  // This older Node-launched experiment has its own manifest format. Keep it
+  // separate from native.json, which the Rust-only distribution verifies.
+  await writeFile(join(native, 'native-experiment.json'), JSON.stringify(manifest, null, 2));
+  await writeFile(join(native, 'package.json'), JSON.stringify({ name, version, private: true, os: [process.platform], cpu: [process.arch], files: [executable, 'native-experiment.json'], exports: { './package.json': './package.json' } }, null, 2));
   const optionalDependencies = Object.fromEntries(['linux-x64-gnu', 'win32-x64', 'darwin-arm64'].map(t => [`@remodex/native-connect-experiment-${t}`, version]));
   await writeFile(join(launcher, 'package.json'), JSON.stringify({ name: '@remodex/native-connect-experiment', version, private: true, type: 'module', bin: { 'rmx-native-experiment': 'bin/launcher.mjs' }, files: ['bin'], engines: { node: '>=20.9.0' }, optionalDependencies }, null, 2));
   const template = await readFile(join(dirname(fileURLToPath(import.meta.url)), 'launcher.mjs'), 'utf8');

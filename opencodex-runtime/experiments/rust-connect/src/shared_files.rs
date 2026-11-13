@@ -89,27 +89,25 @@ fn links_file(text: &str, workspace: &Path, requested: &Path) -> bool {
                 if linked == requested {
                     return true;
                 }
+                // Windows short names and macOS /var aliases can spell the
+                // same exact file differently. Only compare canonical files,
+                // never filenames or a directory prefix.
                 #[cfg(windows)]
-                {
-                    // Windows can report one local directory as both RUNNER~1
-                    // and runneradmin. Resolve both spellings to the same exact
-                    // file; never grant another file merely for sharing a name.
-                    // Only disk paths enter this fallback, avoiding network or
-                    // device namespace lookups while inspecting message links.
-                    let disk = |path: &Path| {
-                        matches!(path.components().next(),
+                let local = |path: &Path| {
+                    matches!(path.components().next(),
                         Some(Component::Prefix(prefix)) if matches!(prefix.kind(),
                             std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)))
-                    };
-                    if disk(&linked) && disk(requested) {
-                        return linked
-                            .canonicalize()
-                            .ok()
-                            .zip(requested.canonicalize().ok())
-                            .is_some_and(|(linked, requested)| linked == requested);
-                    }
-                }
-                false
+                };
+                #[cfg(not(windows))]
+                let local = |path: &Path| path.is_absolute();
+                // Windows network/device namespaces must not trigger lookups.
+                local(&linked)
+                    && local(requested)
+                    && linked
+                        .canonicalize()
+                        .ok()
+                        .zip(requested.canonicalize().ok())
+                        .is_some_and(|(linked, requested)| linked == requested)
             })
         }
         _ => false,
@@ -263,6 +261,25 @@ mod tests {
             None,
             "matching filenames must not authorize a different file"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_alias_grants_only_the_exact_linked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let actual = dir.path().join("actual");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&actual).unwrap();
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        std::fs::write(actual.join("report.txt"), b"shared").unwrap();
+        std::fs::write(dir.path().join("report.txt"), b"private").unwrap();
+        let text = format!("[Report](<{}>)", alias.join("report.txt").display());
+        assert!(links_file(&text, dir.path(), &actual.join("report.txt")));
+        assert!(!links_file(
+            &text,
+            dir.path(),
+            &dir.path().join("report.txt")
+        ));
     }
 
     #[test]

@@ -20,6 +20,7 @@ test('a version-changing package binds the launcher, native manifest and optiona
       const published = await buildPublishedPackage(source, built);
       const launcher = await import(pathToFileURL(join(published, 'bin/native/launcher.mjs')).href);
       assert.equal(launcher.VERSION, version);
+      await assert.rejects(access(join(built.native, 'native.json')), { code: 'ENOENT' });
       assert(await launcher.verifyBinary(built.native, built.target));
       for (const directory of [built.native, built.launcher, published]) {
         const pkg = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'));
@@ -34,7 +35,7 @@ test('a version-changing package binds the launcher, native manifest and optiona
     }
     const old = await import(pathToFileURL(join(root, 'packages-0.0.0/launcher/bin/launcher.mjs')).href);
     const next = join(root, 'packages-0.0.1/native');
-    const target = JSON.parse(await readFile(join(next, 'native.json'), 'utf8')).target;
+    const target = JSON.parse(await readFile(join(next, 'native-experiment.json'), 'utf8')).target;
     await assert.rejects(old.verifyBinary(next, target), /does not match/);
     for (const version of ['01.2.3', '1.2', '../escape', "1.2.3';throw 1;//"]) {
       const destination = join(root, 'invalid');

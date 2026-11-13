@@ -295,8 +295,13 @@ async fn expanded_setup_record_is_bounded_before_commit_and_can_be_retried() {
 async fn busy_listener_never_commits_setup_and_retry_can_succeed() {
     for phone in [false, true] {
         let f = Fixture::new();
-        let busy =
-            std::net::TcpListener::bind(("127.0.0.1", f.port + if phone { 5 } else { 0 })).unwrap();
+        // Occupy the address the setup actually reserves. On macOS a
+        // loopback-only listener can coexist with a wildcard listener.
+        let busy = std::net::TcpListener::bind((
+            if phone { "0.0.0.0" } else { "127.0.0.1" },
+            f.port + if phone { 5 } else { 0 },
+        ))
+        .unwrap();
         let error = installation::prepare(&f.root, &f.gui, None, Some(&f.config))
             .await
             .unwrap_err();
@@ -526,7 +531,7 @@ async fn configuration_revisions_are_atomic_recoverable_and_do_not_rewind_data()
         );
         drop(lease);
     }
-    let busy = std::net::TcpListener::bind(("127.0.0.1", f.port + 5)).unwrap();
+    let busy = std::net::TcpListener::bind(("0.0.0.0", f.port + 5)).unwrap();
     assert!(
         installation::configure(&f.root, "apply", f.config.to_str().unwrap(), Some(0)).is_err()
     );
