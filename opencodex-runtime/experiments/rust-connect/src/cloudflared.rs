@@ -266,24 +266,18 @@ async fn executable_check(path: &Path) -> Result<(), &'static str> {
     command.process_group(0);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
-    let mut child = command.spawn().map_err(|_error| {
-        #[cfg(test)]
-        eprintln!("Pinned helper version spawn failed: {_error}");
-        FAILED
-    })?;
-    let _tree = crate::process_tree::ProcessTree::attach(&child).map_err(|_error| {
-        #[cfg(test)]
-        eprintln!("Pinned helper process ownership failed: {_error}");
-        FAILED
-    })?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| unavailable("version spawn", e))?;
+    let _tree = crate::process_tree::ProcessTree::attach(&child)
+        .map_err(|e| unavailable("process ownership", e))?;
     match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
         Ok(Ok(status)) if status.success() => Ok(()),
-        _result => {
-            #[cfg(test)]
-            eprintln!("Pinned helper version check failed: {_result:?}");
+        result => {
+            let error = unavailable("version check", result);
             let _ = child.kill().await;
             let _ = child.wait().await;
-            Err(FAILED)
+            Err(error)
         }
     }
 }
@@ -328,7 +322,6 @@ pub(crate) async fn resolve(executable: &Path, directory: &Path) -> Result<PathB
         release.name
     );
     download(&client, &url, &downloaded, release.sha256, MAX_BYTES).await?;
-    let bin = temporary.0.join(name());
     let working = temporary.0.clone();
     tokio::task::spawn_blocking(move || -> io::Result<()> {
         if release.archive {
@@ -353,7 +346,6 @@ pub(crate) async fn resolve(executable: &Path, directory: &Path) -> Result<PathB
     .await
     .map_err(|_| FAILED)?
     .map_err(|_| FAILED)?;
-    executable_check(&bin).await?;
     // Only one manager owns this locked profile. Never replace an existing cache
     // entry, including a corrupt cache: preserve it and report the failure.
     if target.symlink_metadata().is_ok() {
@@ -364,7 +356,14 @@ pub(crate) async fn resolve(executable: &Path, directory: &Path) -> Result<PathB
     crate::storage_stage::open(&parent, true)
         .and_then(|f| f.sync_all())
         .map_err(|_| FAILED)?;
-    Ok(target.join(name()))
+    // Publish the complete, checksum-verified files before executing them.
+    // Windows ARM can keep the x64 helper image locked after --version exits,
+    // so executing in staging first can prevent its directory from moving.
+    // A failed launch still fails resolve and leaves only a verified cache;
+    // every later use verifies the cache and checks execution again.
+    let installed = target.join(name());
+    executable_check(&installed).await?;
+    Ok(installed)
 }
 
 #[cfg(test)]
