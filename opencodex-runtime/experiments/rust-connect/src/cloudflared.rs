@@ -252,11 +252,21 @@ async fn executable_check(path: &Path) -> Result<(), &'static str> {
     command.process_group(0);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
-    let mut child = command.spawn().map_err(|_| FAILED)?;
-    let _tree = crate::process_tree::ProcessTree::attach(&child).map_err(|_| FAILED)?;
+    let mut child = command.spawn().map_err(|_error| {
+        #[cfg(test)]
+        eprintln!("Pinned helper version spawn failed: {_error}");
+        FAILED
+    })?;
+    let _tree = crate::process_tree::ProcessTree::attach(&child).map_err(|_error| {
+        #[cfg(test)]
+        eprintln!("Pinned helper process ownership failed: {_error}");
+        FAILED
+    })?;
     match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
         Ok(Ok(status)) if status.success() => Ok(()),
-        _ => {
+        _result => {
+            #[cfg(test)]
+            eprintln!("Pinned helper version check failed: {_result:?}");
             let _ = child.kill().await;
             let _ = child.wait().await;
             Err(FAILED)
