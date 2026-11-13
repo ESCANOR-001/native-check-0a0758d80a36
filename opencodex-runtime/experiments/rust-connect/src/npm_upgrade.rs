@@ -1,0 +1,569 @@
+//! Durable npm-launcher handoff from an exactly closed legacy owner. Package
+//! installation never executes this module. The next explicit bridge launch
+//! prepares and selects one generation, without moving the agent profiles.
+use crate::{legacy_export, profile_lock, profile_snapshot, service_cutover, storage_stage};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+#[path = "npm_control.rs"]
+mod control;
+pub use control::{command, managed_generation};
+
+const ERROR: &str =
+    "The npm upgrade could not be verified. Existing chat data and recovery files were retained";
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Plan {
+    version: u32,
+    closed_owner: PathBuf,
+    configuration: PathBuf,
+    bind: String,
+    public_url: String,
+    gui: PathBuf,
+}
+fn hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+fn read(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+    let file = storage_stage::open(path, false).map_err(|_| ERROR)?;
+    if storage_stage::links(&file).map_err(|_| ERROR)? != 1 {
+        return Err(ERROR.into());
+    }
+    profile_snapshot::bytes(path, limit).map_err(|_| ERROR.into())
+}
+fn location(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute()
+        || path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(ERROR.into());
+    }
+    let parent = path.parent().ok_or(ERROR)?;
+    storage_stage::open(parent, true).map_err(|_| ERROR)?;
+    Ok(parent
+        .canonicalize()
+        .map_err(|_| ERROR)?
+        .join(path.file_name().ok_or(ERROR)?))
+}
+fn write_once(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    if fs::symlink_metadata(path).is_ok() {
+        let previous = read(path, 262144)?;
+        if previous == bytes {
+            return Ok(());
+        }
+        // Only the same journal-bound intent can complete an interrupted write.
+        if !bytes.starts_with(&previous) {
+            return Err(ERROR.into());
+        }
+        options.truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000);
+    }
+    let mut file = options.open(path).map_err(|_| ERROR)?;
+    if !file
+        .metadata()
+        .is_ok_and(|m| m.is_file() && profile_snapshot::regular(&m))
+        || storage_stage::links(&file).map_err(|_| ERROR)? != 1
+    {
+        return Err(ERROR.into());
+    }
+    file.write_all(bytes).map_err(|_| ERROR)?;
+    file.sync_all().map_err(|_| ERROR)?;
+    #[cfg(unix)]
+    storage_stage::open(path.parent().ok_or(ERROR)?, true)
+        .map_err(|_| ERROR)?
+        .sync_all()
+        .map_err(|_| ERROR)?;
+    Ok(())
+}
+struct Journal {
+    db: Connection,
+    _lease: profile_lock::Lease,
+    root: PathBuf,
+}
+impl Journal {
+    fn open(root: &Path, create: bool) -> Result<Self, String> {
+        let root = location(root)?;
+        if !create
+            && !root
+                .join("npm-upgrade.sqlite")
+                .try_exists()
+                .map_err(|_| ERROR)?
+        {
+            return Err(ERROR.into());
+        }
+        if root.try_exists().map_err(|_| ERROR)? {
+            storage_stage::open(&root, true).map_err(|_| ERROR)?;
+            for entry in fs::read_dir(&root).map_err(|_| ERROR)? {
+                let entry = entry.map_err(|_| ERROR)?;
+                let name = entry.file_name();
+                let name = name.to_str().ok_or(ERROR)?;
+                if ![
+                    "server.lock",
+                    "npm-upgrade.sqlite",
+                    "npm-upgrade.sqlite-wal",
+                    "npm-upgrade.sqlite-shm",
+                    "npm-upgrade.sqlite-journal",
+                    "npm-source.json",
+                    "cutover.json",
+                    "service",
+                ]
+                .contains(&name)
+                    && !matches!(name, "attempt-1" | "attempt-2" | "attempt-3")
+                {
+                    return Err(ERROR.into());
+                }
+            }
+        }
+        let lease = profile_lock::acquire(&root)?;
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let path = root.join(format!("npm-upgrade.sqlite{suffix}"));
+            if fs::symlink_metadata(&path).is_ok() {
+                let file = storage_stage::open(&path, false).map_err(|_| ERROR)?;
+                if storage_stage::links(&file).map_err(|_| ERROR)? != 1 {
+                    return Err(ERROR.into());
+                }
+            }
+        }
+        let db = Connection::open(root.join("npm-upgrade.sqlite")).map_err(|_| ERROR)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                root.join("npm-upgrade.sqlite"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .map_err(|_| ERROR)?;
+        }
+        db.busy_timeout(Duration::from_millis(100))
+            .map_err(|_| ERROR)?;
+        db.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, 262144)
+            .map_err(|_| ERROR)?;
+        db.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA synchronous=FULL; PRAGMA cache_size=-256; PRAGMA mmap_size=0; CREATE TABLE IF NOT EXISTS upgrade(id INTEGER PRIMARY KEY CHECK(id=1),plan BLOB NOT NULL,receipt_hash TEXT NOT NULL,config_hash TEXT NOT NULL,attempt INTEGER NOT NULL,phase TEXT NOT NULL CHECK(phase IN ('preparing','selected','cancelled')));").map_err(|_| ERROR)?;
+        Ok(Self {
+            db,
+            _lease: lease,
+            root,
+        })
+    }
+}
+/// Closed-owner proof is mandatory: this command never guesses a process from a
+/// PID, stops Desktop, executes npm hooks, or resumes a native session itself.
+pub fn prepare(root: &Path, plan_path: &Path) -> Result<Value, String> {
+    let raw = read(plan_path, 32768)?;
+    let plan: Plan = serde_json::from_slice(&raw).map_err(|_| ERROR)?;
+    let receipt = read(&plan.closed_owner, 8 * 1024 * 1024)?;
+    let owner: Value = serde_json::from_slice(&receipt).map_err(|_| ERROR)?;
+    let config = read(&plan.configuration, 262144)?;
+    let parsed: crate::chat::Config = serde_json::from_slice(&config).map_err(|_| ERROR)?;
+    parsed.validate_export()?;
+    let address: std::net::SocketAddr = plan.bind.parse().map_err(|_| ERROR)?;
+    let url = reqwest::Url::parse(&plan.public_url).map_err(|_| ERROR)?;
+    if plan.version != 1
+        || owner["profile_mode"] != "existing"
+        || owner["source_hold"].as_str().is_none()
+        || address.port() == 0
+        || !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ERROR.into());
+    }
+    storage_stage::open(&plan.gui, true).map_err(|_| ERROR)?;
+    let root_path = location(root)?;
+    for input in [
+        &plan.closed_owner,
+        &plan.configuration,
+        &plan.gui,
+        plan_path,
+    ]
+    .into_iter()
+    .chain(
+        parsed
+            .codex
+            .iter()
+            .chain(parsed.claude.iter())
+            .map(|c| c.profile.as_path()),
+    ) {
+        let input = input.canonicalize().map_err(|_| ERROR)?;
+        if root_path.starts_with(&input) || input.starts_with(&root_path) {
+            return Err(ERROR.into());
+        }
+    }
+    let journal = Journal::open(root, true)?;
+    let old: Option<(Vec<u8>, String, String, u32, String)> = journal
+        .db
+        .query_row(
+            "SELECT plan,receipt_hash,config_hash,attempt,phase FROM upgrade WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()
+        .map_err(|_| ERROR)?;
+    let mut attempt = 1;
+    if let Some((saved, rh, ch, n, phase)) = old {
+        if saved != raw
+            || rh != hash(&receipt)
+            || ch != hash(&config)
+            || phase == "cancelled"
+            || !(1..=3).contains(&n)
+        {
+            return Err(ERROR.into());
+        }
+        attempt = n;
+    } else {
+        if journal.root.join("service").exists()
+            || journal.root.join("attempt-1").exists()
+            || journal.root.join("cutover.json").exists()
+        {
+            return Err(ERROR.into());
+        }
+        journal
+            .db
+            .execute(
+                "INSERT INTO upgrade VALUES(1,?1,?2,?3,1,'preparing')",
+                params![raw, hash(&receipt), hash(&config)],
+            )
+            .map_err(|_| ERROR)?;
+    }
+    let mut export = journal.root.join(format!("attempt-{attempt}"));
+    if export.try_exists().map_err(|_| ERROR)?
+        && !export
+            .join("prepared.json")
+            .try_exists()
+            .map_err(|_| ERROR)?
+    {
+        // An unpublished partial export cannot be reused or deleted. Allocate a
+        // bounded fresh attempt only before any cutover was selected.
+        if journal.root.join("service").exists()
+            || journal.root.join("cutover.json").exists()
+            || attempt == 3
+        {
+            return Err(ERROR.into());
+        }
+        attempt += 1;
+        journal
+            .db
+            .execute(
+                "UPDATE upgrade SET attempt=?1 WHERE id=1 AND phase='preparing'",
+                [attempt],
+            )
+            .map_err(|_| ERROR)?;
+        export = journal.root.join(format!("attempt-{attempt}"));
+        if fs::symlink_metadata(&export).is_ok() {
+            return Err(ERROR.into());
+        }
+    }
+    if !export.try_exists().map_err(|_| ERROR)? {
+        legacy_export::run(&export, &plan.closed_owner, &plan.configuration)?;
+    }
+    if read(plan_path, 32768)? != raw
+        || read(&plan.closed_owner, 8 * 1024 * 1024)? != receipt
+        || read(&plan.configuration, 262144)? != config
+    {
+        return Err(ERROR.into());
+    }
+    let cutover = json!({"version":1,"export_root":export,"bind":plan.bind,"public_url":plan.public_url,"gui":plan.gui});
+    let cutover_path = journal.root.join("cutover.json");
+    write_once(
+        &cutover_path,
+        &serde_json::to_vec(&cutover).map_err(|_| ERROR)?,
+    )?;
+    let selected = service_cutover::select(&journal.root.join("service"), &cutover_path)?;
+    journal
+        .db
+        .execute("UPDATE upgrade SET phase='selected' WHERE id=1", [])
+        .map_err(|_| ERROR)?;
+    Ok(
+        json!({"phase":selected["phase"],"service":journal.root.join("service"),"attempt":attempt,"profilesKeptInPlace":true,"migrationComplete":false}),
+    )
+}
+
+/// Preparation requires the immutable source plan. Once selected, ordinary
+/// starts use the retained journal and generation; updating/replacing the npm
+/// package does not reread a source export or require its original plan file.
+pub async fn run<F: std::future::Future<Output = ()>>(
+    root: &Path,
+    plan: &Path,
+    stop: F,
+) -> Result<i32, String> {
+    prepare(root, plan)?;
+    resume(root, stop).await
+}
+
+/// First launch acquires the source owner's export. Later package launches use
+/// only the retained selected generation, even when the old owner is gone.
+pub async fn launch<F: std::future::Future<Output = ()>>(
+    root: &Path,
+    source: &Path,
+    stop: F,
+) -> Result<i32, String> {
+    launch_registered(root, Some(source), stop).await
+}
+
+pub async fn start<F: std::future::Future<Output = ()>>(
+    root: &Path,
+    stop: F,
+) -> Result<i32, String> {
+    launch_registered(root, None, stop).await
+}
+
+/// Finish the one-time compatible-source process before the npm launcher
+/// replaces itself. This publishes a selected generation but starts no agent.
+pub async fn prepare_registered(root: &Path) -> Result<Value, String> {
+    if root
+        .join("npm-upgrade.sqlite")
+        .try_exists()
+        .map_err(|_| ERROR)?
+        && resume_info(root).is_ok()
+    {
+        return resume_info(root);
+    }
+    let source = crate::upgrade_source::registered(root)?;
+    let plan = crate::upgrade_source::acquire(root, &source).await?;
+    prepare(root, &plan)
+}
+/// Prepare through npx before replacing the old global npm package.
+pub async fn prepare_with_gui(root: &Path, gui: &Path) -> Result<Value, String> {
+    if resume_info(root).is_ok() {
+        return resume_info(root);
+    }
+    storage_stage::open(gui, true).map_err(|_| ERROR)?;
+    if crate::npm_legacy::applicable(root)? {
+        crate::npm_legacy::stopped(root.parent().ok_or(ERROR)?)?;
+        crate::native_service::stage_legacy_startup(root, gui)?;
+        crate::npm_legacy::prepare(root, gui, None).await
+    } else {
+        crate::native_service::stage_legacy_startup(root, gui)?;
+        prepare_registered(root).await
+    }
+}
+pub async fn start_on_port<F: std::future::Future<Output = ()>>(
+    root: &Path,
+    port: u16,
+    stop: F,
+) -> Result<i32, String> {
+    if port == 0 {
+        return Err(ERROR.into());
+    }
+    if resume_info(root).is_err() {
+        let source = crate::upgrade_source::registered(root)?;
+        let plan = crate::upgrade_source::acquire_on_port(root, &source, port).await?;
+        prepare(root, &plan)?;
+    }
+    if resume_info(root)?["dashboardPort"] != port {
+        return Err("The requested port differs from this installation's retained dashboard port; no runtime was started".into());
+    }
+    resume(root, stop).await
+}
+
+/// A replacement npm package supplies its current dashboard rather than relying
+/// on the path saved by an older package/cache entry. Cutover evidence is retained.
+pub async fn start_with_gui(
+    root: &Path,
+    gui: &Path,
+    port: Option<u16>,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<i32, String> {
+    if !gui.is_absolute() || port == Some(0) {
+        return Err(ERROR.into());
+    }
+    storage_stage::open(gui, true).map_err(|_| ERROR)?;
+    if resume_info(root).is_err() && crate::npm_legacy::applicable(root)? {
+        // Historical npm releases cannot produce a modern source descriptor.
+        // Check that their clean shutdown already completed before staging any
+        // startup replacement, then read their original saved layout in Rust.
+        crate::npm_legacy::stopped(root.parent().ok_or(ERROR)?)?;
+        crate::native_service::stage_legacy_startup(root, gui)?;
+        crate::npm_legacy::prepare(root, gui, port).await?;
+    }
+    // A previously completed native migration may still have a disabled or
+    // protected historical task. Restarting it must not adopt that task anew.
+    // An in-progress startup handover retains its own receipt for finish below.
+    if resume_info(root).is_err() {
+        crate::native_service::stage_legacy_startup(root, gui)?;
+    }
+    if let Some(port) = port {
+        if resume_info(root).is_err() {
+            let source = crate::upgrade_source::registered(root)?;
+            let plan = crate::upgrade_source::acquire_on_port(root, &source, port).await?;
+            prepare(root, &plan)?;
+        }
+        if resume_info(root)?["dashboardPort"] != port {
+            return Err("The requested port differs from this installation's retained dashboard port; no runtime was started".into());
+        }
+    } else {
+        prepare_registered(root).await?;
+    }
+    if crate::native_service::finish_legacy_startup(root, gui).await? {
+        return Ok(0);
+    }
+    resume_with_gui(root, gui, stop).await
+}
+
+async fn launch_registered<F: std::future::Future<Output = ()>>(
+    root: &Path,
+    source: Option<&Path>,
+    stop: F,
+) -> Result<i32, String> {
+    let selected = if root
+        .join("npm-upgrade.sqlite")
+        .try_exists()
+        .map_err(|_| ERROR)?
+    {
+        let journal = Journal::open(root, false)?;
+        let phase: String = journal
+            .db
+            .query_row("SELECT phase FROM upgrade WHERE id=1", [], |r| r.get(0))
+            .map_err(|_| ERROR)?;
+        match phase.as_str() {
+            "selected" => true,
+            "preparing" => false,
+            _ => return Err(ERROR.into()),
+        }
+    } else {
+        false
+    };
+    if selected {
+        return resume(root, stop).await;
+    }
+    let registered;
+    let source = match source {
+        Some(source) => source,
+        None => {
+            registered = crate::upgrade_source::registered(root)?;
+            &registered
+        }
+    };
+    let plan = crate::upgrade_source::acquire(root, source).await?;
+    run(root, &plan, stop).await
+}
+
+fn selected(root: &Path) -> Result<Journal, String> {
+    let journal = Journal::open(root, false)?;
+    let (raw, attempt, phase): (Vec<u8>, u32, String) = journal
+        .db
+        .query_row(
+            "SELECT plan,attempt,phase FROM upgrade WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|_| ERROR)?;
+    if phase != "selected" || !(1..=3).contains(&attempt) {
+        return Err(ERROR.into());
+    }
+    let plan: Plan = serde_json::from_slice(&raw).map_err(|_| ERROR)?;
+    if plan.version != 1 {
+        return Err(ERROR.into());
+    }
+    let expected = json!({"version":1,"export_root":journal.root.join(format!("attempt-{attempt}")),
+        "bind":plan.bind,"public_url":plan.public_url,"gui":plan.gui});
+    let saved: Value = serde_json::from_slice(&read(&journal.root.join("cutover.json"), 32768)?)
+        .map_err(|_| ERROR)?;
+    if saved != expected {
+        return Err(ERROR.into());
+    }
+    // This revalidates the selected configuration, original profile binding,
+    // source hold and service identity, without opening an agent process.
+    if crate::service_cutover::registration_for_plan(
+        &journal.root.join("service"),
+        Some(&expected),
+    )? != crate::profile_handoff::ProfileMode::Existing
+    {
+        return Err(ERROR.into());
+    }
+    Ok(journal)
+}
+
+pub fn resume_info(root: &Path) -> Result<Value, String> {
+    let journal = selected(root)?;
+    let (raw, attempt): (Vec<u8>, u32) = journal
+        .db
+        .query_row("SELECT plan,attempt FROM upgrade WHERE id=1", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .map_err(|_| ERROR)?;
+    let plan: Plan = serde_json::from_slice(&raw).map_err(|_| ERROR)?;
+    let config: crate::chat::Config = serde_json::from_slice(&read(
+        &journal
+            .root
+            .join(format!("attempt-{attempt}/generation/configuration.json")),
+        262144,
+    )?)
+    .map_err(|_| ERROR)?;
+    let config = crate::migrated_configuration::current(
+        &journal.root.join(format!("attempt-{attempt}/generation")),
+    )?
+    .map(|(_, _, c)| c)
+    .unwrap_or(config);
+    let dashboard = match config.connection {
+        Some(c) => c.dashboard_bind,
+        None => plan.bind.parse().map_err(|_| ERROR)?,
+    };
+    Ok(
+        json!({"resumable":true,"service":journal.root.join("service"),"profilesKeptInPlace":true,
+        "runtimeStarted":false,"migrationComplete":false,"dashboardPort":dashboard.port()}),
+    )
+}
+
+pub async fn resume<F: std::future::Future<Output = ()>>(
+    root: &Path,
+    stop: F,
+) -> Result<i32, String> {
+    // The journal lease covers the service lifetime, preventing a second npm
+    // launcher from concurrently changing selection or cancelling preparation.
+    let journal = selected(root)?;
+    service_cutover::run(&journal.root.join("service"), stop).await
+}
+pub(crate) async fn resume_with_gui(
+    root: &Path,
+    gui: &Path,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<i32, String> {
+    let journal = selected(root)?;
+    service_cutover::run_with_gui(&journal.root.join("service"), Some(gui), stop).await
+}
+pub fn cancel(root: &Path) -> Result<Value, String> {
+    let journal = Journal::open(root, false)?;
+    let phase: String = journal
+        .db
+        .query_row("SELECT phase FROM upgrade WHERE id=1", [], |r| r.get(0))
+        .map_err(|_| ERROR)?;
+    if phase == "preparing" {
+        return Err("Preparation has not selected a service. Keep the partial export and use source recovery; no data was restored".into());
+    }
+    let report = service_cutover::cancel(&journal.root.join("service"))?;
+    journal
+        .db
+        .execute("UPDATE upgrade SET phase='cancelled' WHERE id=1", [])
+        .map_err(|_| ERROR)?;
+    Ok(report)
+}

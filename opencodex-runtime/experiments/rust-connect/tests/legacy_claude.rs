@@ -1,0 +1,2349 @@
+use remodex_connect_native::{legacy_connection::Prepared, store::Store};
+use serde_json::{json, Value};
+const ENV: &str = "opencodex-0123456789abcdef01234567";
+const NATIVE: &str = "00000000-0000-4000-8000-000000000001";
+const TIME: &str = "2026-01-01T12:00:00.000Z";
+fn setup() -> (tempfile::TempDir, Store, rusqlite::Connection) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let source = json!({"version":1,"settings":{"controlEnabled":false,"tunnelMode":"quick"},"clients":[],"threadAliases":[],"taskSelections":[]});
+    store
+        .prepare_legacy_connection(&Prepared::parse(source.to_string().as_bytes(), ENV).unwrap())
+        .unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("native-connect.sqlite")).unwrap();
+    (dir, store, db)
+}
+fn source(dir: &std::path::Path) -> Value {
+    let messages = json!([
+        {"id":"user-message","role":"user","text":"Original prompt","createdAt":TIME,"turnId":"old-turn","sequence":50,"streaming":false,"attachments":[]},
+        {"id":"assistant-message","role":"assistant","text":"Original reply","createdAt":TIME,"turnId":"old-turn","sequence":53,"streaming":false}
+    ]);
+    let tool = json!({"id":"tool-row","kind":"tool.completed","createdAt":TIME,"turnId":"old-turn","sequence":52,"payload":{"status":"completed","data":{"inputDetail":"Read example.txt","toolImages":[{"path":"/fixture/preserved.png"}],"changes":[{"patch":"original patch"}]}}});
+    let activities = json!([tool,
+        {"id":"summary-row","kind":"reasoning.updated","createdAt":TIME,"turnId":"old-turn","sequence":51,"payload":{"text":"Public thinking summary"}},
+        {"id":"old-link-status","kind":"claude.desktop-sync.updated","createdAt":TIME,"sequence":54,"payload":{"status":"connected"}}
+    ]);
+    let thread = json!({
+        "id":"original-android-chat","nativeSessionId":NATIVE,"projectId":"original-project","title":"Original title","worktreePath":dir,
+        "modelSelection":{"instanceId":"claude-code","model":"sonnet","options":[{"id":"effort","value":"high"}]},"runtimeMode":"approval-required","interactionMode":"plan","createdAt":TIME,"updatedAt":TIME,"archivedAt":null,"deletedAt":null,
+        "latestTurn":{"turnId":"old-turn","state":"completed","startedAt":TIME,"completedAt":TIME},
+        "session":{"threadId":"original-android-chat","status":"ready","activeTurnId":null},"hasPendingApprovals":false,"hasPendingUserInput":false,
+        "messages":messages,"activities":activities,"proposedPlans":[]
+    });
+    json!({"version":1,"nativeId":NATIVE,"resumed":true,"bridgeId":"cse_legacy_fixture","commands":["fixture-client:old-command"],"userUuids":["old-native-message"],"remoteSequence":98,"remoteEventUuids":["keep-in-original-backup"],"fileCheckpoints":[{"id":"old-file-point","label":"Before change"}],"futureMetadata":{"neverLose":"unknown original field"},"thread":thread})
+}
+fn raw(value: &Value) -> Vec<u8> {
+    format!("  {}\n", value).into_bytes()
+}
+#[test]
+fn owned_saved_permissions_preserve_exact_rules_source_and_rollback_without_profile_writes() {
+    let (dir, mut store, db) = setup();
+    let mut original = source(dir.path());
+    original["permissionRules"] = json!(["Read(/fixture/**)", "Bash(echo fixture)"]);
+    let bytes = raw(&original);
+    store.prepare_legacy_claude(&bytes).unwrap();
+    let saved = store.load_chat("original-android-chat").unwrap();
+    assert_eq!(
+        saved["claude_permission_rules"],
+        original["permissionRules"]
+    );
+    assert!(saved["thread"].get("claude_permission_rules").is_none());
+    assert!(!dir.path().join("settings.json").exists());
+    assert_eq!(
+        db.query_row("SELECT raw FROM legacy_claude_import", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        bytes
+    );
+    store.prepare_legacy_claude(&bytes).unwrap();
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    assert_eq!(count(&db, "chats"), 0);
+    assert!(store.assert_migration_ready().is_err());
+    let (dir, mut store, _) = setup();
+    let mut original = source(dir.path());
+    original["external"] = json!(true);
+    original["permissionRules"] = json!(["Read"]);
+    assert!(store
+        .prepare_legacy_claude(&raw(&original))
+        .unwrap_err()
+        .contains("owner reconciliation"));
+}
+fn count(db: &rusqlite::Connection, table: &str) -> i64 {
+    db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+
+struct Images {
+    export: tempfile::TempDir,
+    old_root: std::path::PathBuf,
+    source: std::path::PathBuf,
+    destination: std::path::PathBuf,
+    bytes: Vec<u8>,
+    raw: Vec<u8>,
+}
+fn images(dir: &std::path::Path) -> Images {
+    use sha2::{Digest, Sha256};
+    let export = tempfile::tempdir().unwrap();
+    let old_root = dir.join("old-install-not-read");
+    let bytes = b"\x89PNG\r\n\x1a\nlegacy-tool-screenshot".to_vec();
+    let bucket = format!("{:x}", Sha256::digest(b"original-android-chat"));
+    let name = format!("{:x}.png", Sha256::digest(&bytes));
+    let source = export.path().join(&bucket).join(&name);
+    std::fs::create_dir(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, &bytes).unwrap();
+    let mut value = source_fixture(dir);
+    value["thread"]["activities"][0]["payload"]["data"]["toolImages"] =
+        json!([old_root.join(&bucket).join(&name)]);
+    Images {
+        export,
+        old_root,
+        source,
+        destination: dir.join("tool-images").join(bucket).join(name),
+        bytes,
+        raw: raw(&value),
+    }
+}
+fn source_fixture(dir: &std::path::Path) -> Value {
+    source(dir)
+}
+
+#[test]
+fn exported_tool_images_keep_bytes_ids_text_and_chat_scoped_access_across_retry_and_rollback() {
+    let (dir, mut store, db) = setup();
+    let img = images(dir.path());
+    store.prepare_legacy_claude(&img.raw).unwrap();
+    let before: String = db
+        .query_row(
+            "SELECT data FROM chat_rows WHERE id='assistant-message'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let report = store
+        .prepare_legacy_claude_tool_images(
+            "original-android-chat",
+            &img.old_root,
+            img.export.path(),
+        )
+        .unwrap();
+    assert_eq!(report["images"], 1);
+    assert!(!img.old_root.exists()); // serialized original path is never opened or recreated
+    assert_eq!(std::fs::read(&img.destination).unwrap(), img.bytes);
+    assert!(store.owns_tool_image("original-android-chat", &img.destination));
+    assert!(!store.owns_tool_image("other-chat", &img.destination));
+    let tool: Value = serde_json::from_str(
+        &db.query_row("SELECT data FROM chat_rows WHERE id='tool-row'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        tool["payload"]["data"]["toolImages"],
+        json!([img.destination])
+    );
+    assert_eq!(tool["payload"]["data"]["inputDetail"], "Read example.txt");
+    assert_eq!(
+        db.query_row(
+            "SELECT data FROM chat_rows WHERE id='assistant-message'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        before
+    );
+    assert_eq!(
+        db.query_row("SELECT raw FROM legacy_claude_import", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        img.raw
+    );
+    drop(store);
+    let mut store = Store::open(dir.path()).unwrap();
+    store.init_chats().unwrap();
+    assert!(store.assert_migration_ready().is_err());
+    store.prepare_legacy_claude(&img.raw).unwrap();
+    assert_eq!(
+        store
+            .prepare_legacy_claude_tool_images(
+                "original-android-chat",
+                &img.old_root,
+                img.export.path()
+            )
+            .unwrap(),
+        report
+    );
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    assert_eq!(count(&db, "tool_images"), 0);
+    assert_eq!(std::fs::read(&img.destination).unwrap(), img.bytes); // rollback retains copied blobs and original receipt
+    assert_eq!(
+        db.query_row("SELECT phase FROM legacy_claude_assets", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "rolled-back"
+    );
+    store.rollback_legacy_connection().unwrap();
+    store.rollback_legacy_connection().unwrap();
+    db.execute("INSERT INTO storage_assets VALUES('unexpected-file',9)", [])
+        .unwrap();
+    assert!(store.rollback_legacy_connection().is_err());
+}
+
+#[test]
+fn tool_image_transaction_failure_keeps_original_rows_and_retry_reuses_verified_blobs() {
+    let (dir, mut store, db) = setup();
+    let img = images(dir.path());
+    store.prepare_legacy_claude(&img.raw).unwrap();
+    let before: String = db
+        .query_row("SELECT data FROM chat_rows WHERE id='tool-row'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    db.execute_batch("CREATE TRIGGER fail_image BEFORE INSERT ON tool_images BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+    assert!(store
+        .prepare_legacy_claude_tool_images(
+            "original-android-chat",
+            &img.old_root,
+            img.export.path()
+        )
+        .is_err());
+    assert_eq!(count(&db, "tool_images"), 0);
+    assert_eq!(count(&db, "legacy_claude_assets"), 0);
+    assert_eq!(
+        db.query_row("SELECT data FROM chat_rows WHERE id='tool-row'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap(),
+        before
+    );
+    let file_count = std::fs::read_dir(img.destination.parent().unwrap())
+        .unwrap()
+        .count();
+    assert_eq!(file_count, 1);
+    db.execute_batch("DROP TRIGGER fail_image").unwrap();
+    store
+        .prepare_legacy_claude_tool_images(
+            "original-android-chat",
+            &img.old_root,
+            img.export.path(),
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_dir(img.destination.parent().unwrap())
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(std::fs::read(&img.source).unwrap(), img.bytes);
+}
+
+#[test]
+fn missing_changed_wrong_chat_and_malformed_tool_images_never_gain_read_access() {
+    for defect in [
+        "missing",
+        "changed",
+        "foreign-chat",
+        "object",
+        "outside-prefix",
+        "live-source",
+    ] {
+        let (dir, mut store, db) = setup();
+        let mut img = images(dir.path());
+        let mut value: Value = serde_json::from_slice(&img.raw).unwrap();
+        match defect {
+            "missing" => std::fs::remove_file(&img.source).unwrap(),
+            "changed" => std::fs::write(&img.source, b"wrong bytes").unwrap(),
+            "foreign-chat" => {
+                value["thread"]["activities"][0]["payload"]["data"]["toolImages"] = json!([img
+                    .old_root
+                    .join("other-chat")
+                    .join(img.source.file_name().unwrap())])
+            }
+            "object" => {
+                value["thread"]["activities"][0]["payload"]["data"]["toolImages"] =
+                    json!([{"path":img.source}])
+            }
+            "outside-prefix" => img.old_root = dir.path().join("unrelated"),
+            "live-source" => img.old_root = img.export.path().to_owned(),
+            _ => unreachable!(),
+        }
+        img.raw = raw(&value);
+        store.prepare_legacy_claude(&img.raw).unwrap();
+        assert!(
+            store
+                .prepare_legacy_claude_tool_images(
+                    "original-android-chat",
+                    &img.old_root,
+                    img.export.path()
+                )
+                .is_err(),
+            "{defect}"
+        );
+        assert_eq!(count(&db, "tool_images"), 0);
+        assert!(!img.destination.exists());
+        assert!(store.assert_migration_ready().is_err());
+    }
+}
+
+#[test]
+fn changed_destination_or_receipt_blocks_asset_retry_and_metadata_rollback() {
+    for defect in ["bytes", "reference", "extra-access", "ledger"] {
+        let (dir, mut store, db) = setup();
+        let img = images(dir.path());
+        store.prepare_legacy_claude(&img.raw).unwrap();
+        store
+            .prepare_legacy_claude_tool_images(
+                "original-android-chat",
+                &img.old_root,
+                img.export.path(),
+            )
+            .unwrap();
+        match defect {
+            "bytes" => std::fs::write(&img.destination, b"changed").unwrap(),
+            "reference" => {
+                db.execute("UPDATE chat_rows SET data=json_set(data,'$.payload.data.toolImages',json('[]')) WHERE id='tool-row'",[]).unwrap();
+            }
+            "extra-access" => {
+                db.execute(
+                    "INSERT INTO tool_images VALUES('original-android-chat','unrelated')",
+                    [],
+                )
+                .unwrap();
+            }
+            "ledger" => {
+                db.execute("UPDATE legacy_claude_assets SET data='[]'", [])
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            store
+                .prepare_legacy_claude_tool_images(
+                    "original-android-chat",
+                    &img.old_root,
+                    img.export.path()
+                )
+                .is_err(),
+            "{defect}"
+        );
+        assert!(store.prepare_legacy_claude(&img.raw).is_err(), "{defect}");
+        assert!(
+            store
+                .rollback_legacy_claude("original-android-chat")
+                .is_err(),
+            "{defect}"
+        );
+        assert_eq!(count(&db, "chats"), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn exported_image_and_bucket_symlinks_are_not_followed() {
+    for bucket in [false, true] {
+        let (dir, mut store, db) = setup();
+        let img = images(dir.path());
+        let other = tempfile::tempdir().unwrap();
+        let target = other.path().join(img.source.file_name().unwrap());
+        std::fs::write(&target, &img.bytes).unwrap();
+        std::fs::remove_file(&img.source).unwrap();
+        if bucket {
+            std::fs::remove_dir(img.source.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(other.path(), img.source.parent().unwrap()).unwrap();
+        } else {
+            std::os::unix::fs::symlink(target, &img.source).unwrap();
+        }
+        store.prepare_legacy_claude(&img.raw).unwrap();
+        assert!(store
+            .prepare_legacy_claude_tool_images(
+                "original-android-chat",
+                &img.old_root,
+                img.export.path()
+            )
+            .is_err());
+        assert_eq!(count(&db, "tool_images"), 0);
+    }
+}
+
+#[test]
+fn imports_exact_messages_tools_choices_identity_and_receipts_with_a_startup_barrier() {
+    for external in [false, true] {
+        let (dir, mut store, db) = setup();
+        let mut original = source(dir.path());
+        original["external"] = json!(external);
+        let bytes = raw(&original);
+        let report = store.prepare_legacy_claude(&bytes).unwrap();
+        assert_eq!(report["messages"], 2);
+        assert_eq!(report["migrationComplete"], false);
+        assert!(!report.to_string().contains("Original prompt"));
+        assert_eq!(store.prepare_legacy_claude(&bytes).unwrap(), report);
+        assert!(store.assert_migration_ready().is_err());
+        let header: Value = serde_json::from_str(
+            &db.query_row("SELECT data FROM chats", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(header["native_id"], NATIVE);
+        assert_eq!(header["external_claude"], external);
+        assert_eq!(
+            header["remote_identity"]["bridge_session"],
+            "cse_legacy_fixture"
+        );
+        assert_eq!(
+            header["thread"]["modelSelection"],
+            original["thread"]["modelSelection"]
+        );
+        assert_eq!(header["thread"]["runtimeMode"], "approval-required");
+        assert_eq!(header["claude_plan_access"], "approval-required");
+        assert_eq!(header["paused"], true);
+        assert_eq!(header["queue"], json!([]));
+        assert!(header["pending_message"].is_null());
+        assert_eq!(header["thread"]["session"]["status"], "disconnected");
+        for row in original["thread"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(
+                original["thread"]["activities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r["kind"] != "claude.desktop-sync.updated"),
+            )
+        {
+            let found: String = db
+                .query_row(
+                    "SELECT data FROM chat_rows WHERE id=?1",
+                    [row["id"].as_str().unwrap()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&found).unwrap(), *row);
+        }
+        let mut q = db.prepare("SELECT id FROM chat_rows ORDER BY seq").unwrap();
+        let ids: Vec<String> = q
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![
+                "user-message",
+                "summary-row",
+                "tool-row",
+                "assistant-message",
+                "claude-native-sync"
+            ]
+        );
+        let backup: Vec<u8> = db
+            .query_row("SELECT raw FROM legacy_claude_import", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(backup, bytes);
+        assert!(store
+            .command_digest("claude-code:fixture-client:old-command")
+            .unwrap()
+            .is_some());
+        drop(store);
+        let mut store = Store::open(dir.path()).unwrap();
+        store.init_chats().unwrap();
+        assert_eq!(store.prepare_legacy_claude(&bytes).unwrap(), report);
+        assert!(store.assert_migration_ready().is_err());
+    }
+}
+#[test]
+fn transaction_failure_rolls_back_every_row_and_rollback_preserves_original_backup() {
+    let (dir, mut store, db) = setup();
+    store.init_chats().unwrap();
+    db.execute_batch("CREATE TRIGGER fail_checkpoint BEFORE INSERT ON native_checkpoints BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+    let bytes = raw(&source(dir.path()));
+    assert!(store.prepare_legacy_claude(&bytes).is_err());
+    for table in [
+        "chats",
+        "chat_rows",
+        "chat_commands",
+        "native_checkpoints",
+        "legacy_claude_import",
+    ] {
+        assert_eq!(count(&db, table), 0);
+    }
+    db.execute_batch("DROP TRIGGER fail_checkpoint").unwrap();
+    store.prepare_legacy_claude(&bytes).unwrap();
+    assert!(store.rollback_legacy_connection().is_err());
+    let rolled = store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    assert_eq!(
+        store
+            .rollback_legacy_claude("original-android-chat")
+            .unwrap(),
+        rolled
+    );
+    assert_eq!(
+        db.query_row("SELECT raw FROM legacy_claude_import", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        bytes
+    );
+    for table in ["chats", "chat_rows", "chat_commands", "native_checkpoints"] {
+        assert_eq!(count(&db, table), 0);
+    }
+    assert!(store.prepare_legacy_claude(&bytes).is_err());
+    store.rollback_legacy_connection().unwrap();
+    assert!(store.assert_migration_ready().is_err());
+}
+#[test]
+fn changed_messages_or_native_side_effects_are_never_erased_on_retry_or_rollback() {
+    for change in ["content", "image", "turn-index"] {
+        let (dir, mut store, db) = setup();
+        let bytes = raw(&source(dir.path()));
+        store.prepare_legacy_claude(&bytes).unwrap();
+        if change == "image" {
+            db.execute(
+                "INSERT INTO tool_images VALUES('original-android-chat','new-image')",
+                [],
+            )
+            .unwrap();
+        } else if change == "turn-index" {
+            db.execute(
+                "UPDATE chat_rows SET turn='other-turn' WHERE id='assistant-message'",
+                [],
+            )
+            .unwrap();
+        } else {
+            db.execute("UPDATE chat_rows SET data=json_set(data,'$.text','new content') WHERE id='assistant-message'",[]).unwrap();
+        }
+        assert!(store
+            .rollback_legacy_claude("original-android-chat")
+            .is_err());
+        assert!(store.prepare_legacy_claude(&bytes).is_err());
+        assert_eq!(count(&db, "chats"), 1);
+        assert_eq!(count(&db, "chat_rows"), 5);
+    }
+}
+#[test]
+fn active_queued_uncertain_or_permission_state_cannot_be_silently_dropped() {
+    for (path, value) in [
+        ("/thread/session/status", json!("running")),
+        ("/thread/session/status", json!("unknown-future-state")),
+        ("/thread/session/activeTurnId", json!("active")),
+        ("/thread/hasPendingApprovals", json!(true)),
+        ("/thread/hasPendingUserInput", json!(true)),
+        ("/thread/messages/0/streaming", json!(true)),
+        ("/thread/messages/0/streaming", json!("true")),
+    ] {
+        let (dir, mut store, _) = setup();
+        let mut original = source(dir.path());
+        *original.pointer_mut(path).unwrap() = value;
+        assert!(
+            store.prepare_legacy_claude(&raw(&original)).is_err(),
+            "{path}"
+        );
+        assert!(store.assert_migration_ready().is_err());
+    }
+    for (key, value) in [
+        ("followUps", json!([{"id":"pending"}])),
+        ("deliveries", json!([{"state":"offered"}])),
+        ("deliveries", json!([{"state":"unknown-future-state"}])),
+        ("permissionRules", json!(["invalid\npermission"])),
+        ("branchImportPending", json!(true)),
+    ] {
+        let (dir, mut store, _) = setup();
+        let mut original = source(dir.path());
+        original[key] = value;
+        assert!(
+            store.prepare_legacy_claude(&raw(&original)).is_err(),
+            "{key}"
+        );
+    }
+}
+#[test]
+fn conflicts_bad_rows_oversized_inputs_and_wrong_agent_never_replace_a_chat() {
+    let (dir, mut store, db) = setup();
+    let original = source(dir.path());
+    let bytes = raw(&original);
+    store.prepare_legacy_claude(&bytes).unwrap();
+    for (path, value) in [
+        ("/thread/title", json!("Changed title")),
+        ("/nativeId", json!("invalid")),
+        ("/thread/modelSelection/instanceId", json!("codex")),
+        ("/thread/worktreePath", json!("relative")),
+        ("/thread/messages/0/createdAt", json!("bad date")),
+        ("/thread/messages/1/id", json!("user-message")),
+    ] {
+        let mut value_root = original.clone();
+        *value_root.pointer_mut(path).unwrap() = value;
+        assert!(
+            store.prepare_legacy_claude(&raw(&value_root)).is_err(),
+            "{path}"
+        );
+    }
+    let mut duplicate = original.clone();
+    duplicate["thread"]["id"] = json!("second-chat");
+    duplicate["thread"]["session"]["threadId"] = json!("second-chat");
+    assert!(store.prepare_legacy_claude(&raw(&duplicate)).is_err());
+    assert!(store
+        .prepare_legacy_claude(&vec![b' '; 16 * 1024 * 1024 + 1])
+        .is_err());
+    assert_eq!(count(&db, "chats"), 1);
+    assert_eq!(count(&db, "chat_rows"), 5);
+    assert_eq!(
+        db.query_row("SELECT raw FROM legacy_claude_import", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        bytes
+    );
+}
+#[test]
+fn timestamp_order_survives_legacy_sequence_reset_between_bridge_runs() {
+    let (dir, mut store, db) = setup();
+    let mut original = source(dir.path());
+    original["thread"]["messages"].as_array_mut().unwrap().push(json!({"id":"after-restart","role":"user","text":"Later prompt","sequence":1,"createdAt":"2026-01-01T13:00:00Z","streaming":false}));
+    store.prepare_legacy_claude(&raw(&original)).unwrap();
+    let last: String = db
+        .query_row(
+            "SELECT id FROM chat_rows ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(last, "after-restart");
+}
+#[test]
+fn a_live_or_unprepared_profile_cannot_receive_legacy_chats() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    assert!(store
+        .prepare_legacy_claude(&raw(&source(dir.path())))
+        .is_err());
+    assert!(store.assert_migration_ready().is_ok());
+}
+
+#[test]
+fn external_observer_checkpoint_keeps_original_sequence_without_inventing_native_event_identity() {
+    let (dir, mut store, db) = setup();
+    let mut value = source(dir.path());
+    value["external"] = json!(true);
+    value["remoteSequence"] = json!(98);
+    let raw = raw(&value);
+    store.prepare_legacy_claude(&raw).unwrap();
+    let report = store
+        .prepare_legacy_claude_resume("original-android-chat")
+        .unwrap();
+    assert_eq!(report["sequence"], 98);
+    assert_eq!(report["migrationComplete"], false);
+    let identity = remodex_connect_native::claude_host::Identity {
+        native_session: NATIVE.into(),
+        bridge_session: "cse_legacy_fixture".into(),
+    };
+    let cursor = store
+        .claude_remote_cursor("original-android-chat", identity.clone())
+        .unwrap();
+    assert_eq!(cursor.sequence, 98);
+    assert!(cursor.event_id.is_empty());
+    assert!(cursor.digest.is_empty());
+    assert_eq!(
+        serde_json::to_value(&cursor).unwrap()["legacy_source"],
+        remodex_connect_native::auth::digest(std::str::from_utf8(&raw).unwrap())
+    );
+    drop(store);
+    let mut store = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        store
+            .prepare_legacy_claude_resume("original-android-chat")
+            .unwrap(),
+        report
+    );
+    assert_eq!(
+        store
+            .claude_remote_cursor("original-android-chat", identity)
+            .unwrap(),
+        cursor
+    );
+    store.prepare_legacy_claude(&raw).unwrap();
+    assert_eq!(count(&db, "chat_rows"), 5);
+    assert!(store.assert_migration_ready().is_err());
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    assert_eq!(count(&db, "native_sync"), 0);
+    assert_eq!(
+        db.query_row("SELECT phase FROM legacy_claude_resume", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "rolled-back"
+    );
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    store.rollback_legacy_connection().unwrap();
+}
+#[test]
+fn missing_owned_or_changed_checkpoints_never_skip_unknown_history() {
+    for (external, sequence) in [
+        (false, json!(98)),
+        (true, Value::Null),
+        (true, json!(0)),
+        (true, json!(9_007_199_254_740_992_u64)),
+        (true, json!("98")),
+    ] {
+        let (dir, mut store, db) = setup();
+        let mut value = source(dir.path());
+        value["external"] = json!(external);
+        value["remoteSequence"] = sequence;
+        store.prepare_legacy_claude(&raw(&value)).unwrap();
+        assert!(store
+            .prepare_legacy_claude_resume("original-android-chat")
+            .is_err());
+        assert_eq!(count(&db, "native_sync"), 0);
+        assert_eq!(count(&db, "chat_rows"), 5);
+    }
+    for mutation in [
+        "UPDATE native_sync SET cursor=json_set(cursor,'$.sequence',99)",
+        "UPDATE legacy_claude_resume SET source_hash='changed'",
+        "UPDATE legacy_claude_resume SET cursor='{}'",
+    ] {
+        let (dir, mut store, db) = setup();
+        let mut value = source(dir.path());
+        value["external"] = json!(true);
+        store.prepare_legacy_claude(&raw(&value)).unwrap();
+        store
+            .prepare_legacy_claude_resume("original-android-chat")
+            .unwrap();
+        db.execute_batch(mutation).unwrap();
+        assert!(store
+            .prepare_legacy_claude_resume("original-android-chat")
+            .is_err());
+        assert!(store
+            .rollback_legacy_claude("original-android-chat")
+            .is_err());
+        assert_eq!(count(&db, "chats"), 1);
+    }
+}
+#[tokio::test]
+async fn first_native_event_after_upgrade_advances_anchor_and_preserves_old_prompt_bubbles() {
+    use remodex_connect_native::{
+        auth::Auth, auth_service::AuthService, claude_host::Identity, claude_remote::Envelope,
+    };
+    let (dir, mut store, db) = setup();
+    let mut value = source(dir.path());
+    value["external"] = json!(true);
+    store.prepare_legacy_claude(&raw(&value)).unwrap();
+    store
+        .prepare_legacy_claude_resume("original-android-chat")
+        .unwrap();
+    let identity = Identity {
+        native_session: NATIVE.into(),
+        bridge_session: "cse_legacy_fixture".into(),
+    };
+    let before = store
+        .claude_remote_cursor("original-android-chat", identity.clone())
+        .unwrap();
+    let initial = store.load_chat("original-android-chat").unwrap();
+    let old = initial["thread"]["messages"].clone();
+    let service = AuthService::new(Auth::new(store)).unwrap();
+    let native = "00000000-0000-4000-8000-000000000019";
+    let mut cursor = before.clone();
+    let mut current = initial;
+    for (sequence, source, payload) in [
+        (
+            99,
+            "client",
+            json!({"type":"user","uuid":native,"session_id":NATIVE,"message":{"role":"user","content":"New Desktop prompt"},"client_platform":"desktop"}),
+        ),
+        (
+            100,
+            "worker",
+            json!({"type":"assistant","uuid":"00000000-0000-4000-8000-000000000020","session_id":NATIVE,"user_message_uuids":[native],"message":{"id":"new-native-reply","role":"assistant","content":[{"type":"text","text":"New reply"}]}}),
+        ),
+        (
+            101,
+            "worker",
+            json!({"type":"result","session_id":NATIVE,"user_message_uuids":[native],"subtype":"success","result":"New reply"}),
+        ),
+    ] {
+        let mut event = Envelope {
+            deliveries: vec![],
+            receipt_checkpoint: false,
+            recovery: None,
+            sequence: Some(sequence),
+            event_id: Some(format!("native-{sequence}")),
+            created_at: Some("2026-01-01T12:00:01.000Z".into()),
+            source: source.into(),
+            payload: Some(payload),
+        };
+        event.sequence = Some(98);
+        assert!(before.advance(&event, Value::Null).is_err());
+        event.sequence = Some(sequence);
+        let (state, projection) = remodex_connect_native::claude_history::project(
+            &service, current, &cursor, &event, true,
+        )
+        .await
+        .unwrap();
+        let after = cursor.advance(&event, projection).unwrap();
+        assert!(serde_json::to_value(&after)
+            .unwrap()
+            .get("legacy_source")
+            .is_none());
+        let saved = state.clone();
+        let start = cursor.clone();
+        let finish = after.clone();
+        service
+            .call(move |a| a.store.save_claude_remote(&saved, &start, &finish))
+            .await
+            .unwrap()
+            .unwrap();
+        current = state;
+        cursor = after;
+    }
+    assert_eq!(cursor.sequence, 101);
+    assert_eq!(cursor.event_id, "native-101");
+    assert_eq!(cursor.digest.len(), 64);
+    let final_state = service
+        .call(|a| a.store.load_chat("original-android-chat"))
+        .await
+        .unwrap()
+        .unwrap();
+    let messages = final_state["thread"]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4);
+    for original in old.as_array().unwrap() {
+        assert_eq!(
+            messages.iter().find(|m| m["id"] == original["id"]).unwrap(),
+            original
+        );
+    }
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m["text"] == "New Desktop prompt")
+            .count(),
+        1
+    );
+    assert_eq!(
+        messages.iter().filter(|m| m["text"] == "New reply").count(),
+        1
+    );
+    assert!(service
+        .call(|a| a.store.rollback_legacy_claude("original-android-chat"))
+        .await
+        .unwrap()
+        .is_err());
+    assert_eq!(count(&db, "chats"), 1);
+}
+
+const INPUT_NATIVE: &str = "00000000-0000-4000-8000-000000000025";
+struct NativeExport {
+    root: tempfile::TempDir,
+    snapshot: std::path::PathBuf,
+    transcript: String,
+    original: Vec<u8>,
+}
+fn native_export(change: impl FnOnce(&mut Vec<Value>, &std::path::Path)) -> NativeExport {
+    let root = tempfile::tempdir().unwrap();
+    let export = root.path().join("export");
+    let transcript = format!("projects/fixture/{NATIVE}.jsonl");
+    std::fs::create_dir_all(export.join("projects/fixture")).unwrap();
+    let backup = export.join("file-history").join(NATIVE);
+    std::fs::create_dir_all(&backup).unwrap();
+    std::fs::write(backup.join("saved@v1"), b"original file before edit\n").unwrap();
+    std::fs::write(export.join("unknown-metadata.json"), b"{\"future\":true}\n").unwrap();
+    let mut rows = vec![
+        json!({"type":"user","uuid":INPUT_NATIVE,"parentUuid":null,"sessionId":NATIVE,"message":{"role":"user","content":"Original prompt"}}),
+        json!({"type":"assistant","uuid":"00000000-0000-4000-8000-000000000028","parentUuid":INPUT_NATIVE,"sessionId":NATIVE,"message":{"id":"assistant-message","role":"assistant","content":[{"type":"text","text":"Original reply"}]}}),
+        json!({"type":"file-history-snapshot","messageId":"old-file-point","snapshot":{"trackedFileBackups":{"/old/project/file.txt":{"backupFileName":"saved@v1","version":1}}}}),
+        json!({"type":"unknown-future-row","data":{"preserve":true}}),
+    ];
+    change(&mut rows, &export);
+    let original = rows
+        .iter()
+        .map(|v| format!("{v}\n"))
+        .collect::<String>()
+        .into_bytes();
+    std::fs::write(export.join(&transcript), &original).unwrap();
+    let snapshot = root.path().join("snapshot");
+    remodex_connect_native::migration_snapshot::capture(&export, &snapshot, ENV).unwrap();
+    NativeExport {
+        root,
+        snapshot,
+        transcript,
+        original,
+    }
+}
+#[test]
+fn owned_native_export_preserves_bytes_checkpoints_unknown_files_retry_reopen_and_rollback() {
+    let (dir, mut store, db) = setup();
+    let export = native_export(|_, _| {});
+    let bytes = raw(&bound_source(dir.path()));
+    store.prepare_legacy_claude(&bytes).unwrap();
+    store
+        .prepare_legacy_claude_bindings("original-android-chat")
+        .unwrap();
+    let before = store.load_chat("original-android-chat").unwrap();
+    let report = store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        )
+        .unwrap();
+    assert_eq!(report["prompts"], 1);
+    assert_eq!(report["replies"], 1);
+    assert_eq!(report["fileCheckpoints"], 1);
+    assert_eq!(report["migrationComplete"], false);
+    let bundle: String = db
+        .query_row("SELECT bundle FROM legacy_claude_native", [], |r| r.get(0))
+        .unwrap();
+    let data = dir.path().join("legacy-native").join(&bundle).join("data");
+    assert_eq!(
+        std::fs::read(data.join(&export.transcript)).unwrap(),
+        export.original
+    );
+    assert_eq!(
+        std::fs::read(data.join("file-history").join(NATIVE).join("saved@v1")).unwrap(),
+        b"original file before edit\n"
+    );
+    assert_eq!(
+        std::fs::read(data.join("unknown-metadata.json")).unwrap(),
+        b"{\"future\":true}\n"
+    );
+    assert_eq!(
+        std::fs::read(export.root.path().join("export").join(&export.transcript)).unwrap(),
+        export.original
+    );
+    assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+    assert!(store.assert_migration_ready().is_err());
+    drop(store);
+    let mut store = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        store
+            .prepare_legacy_claude_native(
+                "original-android-chat",
+                &export.snapshot,
+                &export.transcript
+            )
+            .unwrap(),
+        report
+    );
+    store.prepare_legacy_claude(&bytes).unwrap();
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    store.rollback_legacy_connection().unwrap();
+    store.rollback_legacy_connection().unwrap();
+    assert_eq!(
+        std::fs::read(data.join(&export.transcript)).unwrap(),
+        export.original
+    );
+    assert_eq!(count(&db, "legacy_claude_bindings"), 0);
+    assert_eq!(
+        db.query_row("SELECT phase FROM legacy_claude_native", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "rolled-back"
+    );
+    assert!(store.assert_migration_ready().is_err());
+}
+#[test]
+fn incomplete_wrong_session_or_missing_native_backups_never_activate_or_change_messages() {
+    for case in 0..6 {
+        let (dir, mut store, db) = setup();
+        let export = native_export(|rows, export| match case {
+            0 => {
+                rows.remove(0);
+            }
+            1 => {
+                rows.remove(1);
+            }
+            2 => rows[0]["sessionId"] = json!("00000000-0000-4000-8000-000000000029"),
+            3 => {
+                std::fs::remove_file(export.join("file-history").join(NATIVE).join("saved@v1"))
+                    .unwrap();
+            }
+            4 => {
+                rows[2]["snapshot"]["trackedFileBackups"]["/old/project/file.txt"]
+                    ["backupFileName"] = json!("../outside")
+            }
+            _ => {
+                rows[2]["snapshot"]["trackedFileBackups"]["/old/project/file.txt"] =
+                    json!({"version":1});
+            }
+        });
+        store
+            .prepare_legacy_claude(&raw(&bound_source(dir.path())))
+            .unwrap();
+        let before = store.load_chat("original-android-chat").unwrap();
+        assert!(
+            store
+                .prepare_legacy_claude_native(
+                    "original-android-chat",
+                    &export.snapshot,
+                    &export.transcript
+                )
+                .is_err(),
+            "case {case}"
+        );
+        assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+        assert!(store.assert_migration_ready().is_err());
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='legacy_claude_native'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            std::fs::read(export.root.path().join("export").join(&export.transcript)).unwrap(),
+            export.original
+        );
+    }
+}
+#[test]
+fn native_bundle_receipt_failure_retries_verified_copy_and_changed_copy_blocks_rollback() {
+    let (dir, mut store, db) = setup();
+    let export = native_export(|_, _| {});
+    store
+        .prepare_legacy_claude(&raw(&bound_source(dir.path())))
+        .unwrap();
+    db.execute_batch("CREATE TABLE legacy_claude_native(chat TEXT PRIMARY KEY,source_hash TEXT NOT NULL,bundle TEXT NOT NULL,transcript TEXT NOT NULL,report TEXT NOT NULL,phase TEXT NOT NULL);CREATE TRIGGER fail_native BEFORE INSERT ON legacy_claude_native BEGIN SELECT RAISE(ABORT,'fixture full'); END;").unwrap();
+    let before = store.load_chat("original-android-chat").unwrap();
+    assert!(store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript
+        )
+        .is_err());
+    assert_eq!(count(&db, "legacy_claude_native"), 0);
+    assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+    // An interrupted copy is resumable only with its intact, immutable plan.
+    let staged = std::fs::read_dir(dir.path().join("legacy-native"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::remove_file(staged.join("restored.json")).unwrap();
+    std::fs::remove_file(staged.join("data/unknown-metadata.json")).unwrap();
+    db.execute_batch("DROP TRIGGER fail_native").unwrap();
+    store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        )
+        .unwrap();
+    let bundle: String = db
+        .query_row("SELECT bundle FROM legacy_claude_native", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        std::fs::read(staged.join("data/unknown-metadata.json")).unwrap(),
+        b"{\"future\":true}\n"
+    );
+    std::fs::write(
+        dir.path()
+            .join("legacy-native")
+            .join(bundle)
+            .join("data")
+            .join(&export.transcript),
+        b"changed\n",
+    )
+    .unwrap();
+    assert!(store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript
+        )
+        .is_err());
+    assert!(store
+        .rollback_legacy_claude("original-android-chat")
+        .is_err());
+    assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+    assert_eq!(
+        std::fs::read(export.root.path().join("export").join(&export.transcript)).unwrap(),
+        export.original
+    );
+}
+#[test]
+fn partial_native_copy_and_ambiguous_prompt_identity_refuse_without_overwrite() {
+    for partial in [true, false] {
+        let (dir, mut store, _) = setup();
+        let export = native_export(|rows, _| {
+            if !partial {
+                rows[1]["parentUuid"] = json!("00000000-0000-4000-8000-000000000099");
+            }
+        });
+        let value = if partial {
+            bound_source(dir.path())
+        } else {
+            source(dir.path())
+        };
+        store.prepare_legacy_claude(&raw(&value)).unwrap();
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(export.snapshot.join("snapshot.json")).unwrap())
+                .unwrap();
+        let path = dir
+            .path()
+            .join("legacy-native")
+            .join(remodex_connect_native::auth::digest(&manifest.to_string()));
+        if partial {
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("interrupted-copy"), b"keep").unwrap();
+        }
+        assert!(store
+            .prepare_legacy_claude_native(
+                "original-android-chat",
+                &export.snapshot,
+                &export.transcript
+            )
+            .is_err());
+        if partial {
+            assert_eq!(
+                std::fs::read(path.join("interrupted-copy")).unwrap(),
+                b"keep"
+            );
+        }
+        assert!(store.assert_migration_ready().is_err());
+        assert!(store
+            .prepare_legacy_claude_native(
+                "original-android-chat",
+                &export.snapshot,
+                "projects/../foreign.jsonl"
+            )
+            .is_err());
+    }
+}
+#[test]
+fn native_compaction_summary_is_preserved_without_becoming_a_sendable_prompt() {
+    const SUMMARY: &str = "00000000-0000-4000-8000-000000000080";
+    for case in 0..5 {
+        let (dir, mut store, db) = setup();
+        let mut value = source(dir.path());
+        value["thread"]["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id":SUMMARY,"role":"user","text":"Internal compaction summary",
+                "createdAt":TIME,"turnId":"old-summary","sequence":55,"streaming":false
+            }));
+        if case == 1 {
+            value["thread"]["messages"][2]["text"] = json!("Changed text");
+        }
+        if case == 4 {
+            value["thread"]["messages"][2]["attachments"] = json!([{"path":"unproven"}]);
+        }
+        let original = raw(&value);
+        store.prepare_legacy_claude(&original).unwrap();
+        let before = store.load_chat("original-android-chat").unwrap();
+        let export = native_export(|rows, _| {
+            rows.push(
+                json!({"type":"user","uuid":SUMMARY,"parentUuid":INPUT_NATIVE,
+                "sessionId":NATIVE,"isCompactSummary":true,"isVisibleInTranscriptOnly":true,
+                "message":{"role":"user","content":"Internal compaction summary"}}),
+            );
+            if case == 2 {
+                rows.last_mut().unwrap()["uuid"] = json!("00000000-0000-4000-8000-000000000081");
+            }
+            if case == 3 {
+                rows.last_mut().unwrap()["isCompactSummary"] = json!(false);
+            }
+        });
+        let report = store.prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        );
+        if case == 0 {
+            let report = report.unwrap();
+            assert_eq!(report["prompts"], 1);
+            assert_eq!(report["reconciledPromptIds"], 1);
+            assert!(store
+                .claude_input("original-android-chat", NATIVE, SUMMARY)
+                .unwrap()
+                .is_none());
+            assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+            assert_eq!(count(&db, "claude_outbox"), 0);
+            drop(store);
+            store = Store::open(dir.path()).unwrap();
+            assert_eq!(
+                store
+                    .prepare_legacy_claude_native(
+                        "original-android-chat",
+                        &export.snapshot,
+                        &export.transcript
+                    )
+                    .unwrap(),
+                report
+            );
+            store
+                .rollback_legacy_claude("original-android-chat")
+                .unwrap();
+        } else {
+            assert!(
+                report.is_err(),
+                "case {case} must not infer a summary from text alone"
+            );
+        }
+        assert_eq!(
+            std::fs::read(export.root.path().join("export").join(&export.transcript)).unwrap(),
+            export.original
+        );
+    }
+}
+
+#[test]
+fn trimmed_delivery_ledger_recovers_prompt_id_from_native_reply_parents_not_text() {
+    for public in [
+        "user-message",
+        "00000000-0000-4000-8000-000000000098",
+        INPUT_NATIVE,
+    ] {
+        let (dir, mut store, db) = setup();
+        let mut value = source(dir.path());
+        value["thread"]["messages"][0]["id"] = json!(public);
+        let original = raw(&value);
+        store.prepare_legacy_claude(&original).unwrap();
+        let before = store.load_chat("original-android-chat").unwrap();
+        let export = native_export(|rows, _| {
+            // Same text in another native input is not grounds for merging it.
+            rows.push(json!({"type":"user","uuid":"00000000-0000-4000-8000-000000000097","sessionId":NATIVE,"parentUuid":null,"message":{"role":"user","content":"Original prompt"}}));
+            // A non-user parent can lie between the original prompt and reply.
+            rows[1]["parentUuid"] = json!("00000000-0000-4000-8000-000000000096");
+            rows.push(json!({"type":"progress","uuid":"00000000-0000-4000-8000-000000000096","parentUuid":INPUT_NATIVE,"sessionId":NATIVE}));
+        });
+        let report = store
+            .prepare_legacy_claude_native(
+                "original-android-chat",
+                &export.snapshot,
+                &export.transcript,
+            )
+            .unwrap();
+        assert_eq!(report["reconciledPromptIds"], 1);
+        let binding = store
+            .claude_input("original-android-chat", NATIVE, INPUT_NATIVE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.input.message, public);
+        assert_eq!(binding.input.public_turn, "old-turn");
+        assert_eq!(binding.state, "legacy-consumed");
+        assert!(!binding.input.steer);
+        assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+        assert_eq!(count(&db, "claude_outbox"), 0);
+        assert_eq!(
+            db.query_row("SELECT raw FROM legacy_claude_import", [], |r| r
+                .get::<_, Vec<u8>>(0))
+                .unwrap(),
+            original
+        );
+        assert!(store.offer_claude_input("original-android-chat",NATIVE,&binding.input,&json!({"type":"user","uuid":INPUT_NATIVE,"message":{"role":"user","content":"Original prompt"}})).is_err());
+        drop(store);
+        let mut store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store
+                .prepare_legacy_claude_native(
+                    "original-android-chat",
+                    &export.snapshot,
+                    &export.transcript
+                )
+                .unwrap(),
+            report
+        );
+        store
+            .prepare_legacy_claude_bindings("original-android-chat")
+            .unwrap();
+        store
+            .rollback_legacy_claude("original-android-chat")
+            .unwrap();
+        assert_eq!(count(&db, "legacy_claude_native_bindings"), 0);
+        store.rollback_legacy_connection().unwrap();
+        assert_eq!(
+            std::fs::read(export.root.path().join("export").join(&export.transcript)).unwrap(),
+            export.original
+        );
+    }
+}
+#[test]
+fn external_reply_event_uuid_preserves_history_and_reconciles_its_prompt_by_parent() {
+    const REPLY: &str = "00000000-0000-4000-8000-000000000028";
+    for case in 0..4 {
+        let (dir, mut store, db) = setup();
+        let mut value = source(dir.path());
+        value["external"] = json!(true);
+        value["thread"]["messages"][1]["id"] = json!(REPLY);
+        let original = raw(&value);
+        store.prepare_legacy_claude(&original).unwrap();
+        let before = store.load_chat("original-android-chat").unwrap();
+        let export = native_export(|rows, _| match case {
+            1 => rows[1]["uuid"] = json!("00000000-0000-4000-8000-000000000029"),
+            2 => rows[1]["isSidechain"] = json!(true),
+            3 => rows[1]["parentUuid"] = Value::Null,
+            _ => {}
+        });
+        let result = store.prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        );
+        if case == 0 {
+            let report = result.unwrap();
+            assert_eq!(report["replies"], 1);
+            assert_eq!(report["reconciledPromptIds"], 1);
+            let binding = store
+                .claude_input("original-android-chat", NATIVE, INPUT_NATIVE)
+                .unwrap()
+                .unwrap();
+            assert_eq!(binding.input.message, "user-message");
+            drop(store);
+            store = Store::open(dir.path()).unwrap();
+            assert_eq!(
+                store
+                    .prepare_legacy_claude_native(
+                        "original-android-chat",
+                        &export.snapshot,
+                        &export.transcript,
+                    )
+                    .unwrap(),
+                report
+            );
+        } else {
+            assert!(
+                result.is_err(),
+                "case {case} must not guess from identical reply text"
+            );
+        }
+        assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+        assert_eq!(count(&db, "claude_outbox"), 0);
+        assert_eq!(
+            std::fs::read(export.root.path().join("export").join(&export.transcript)).unwrap(),
+            export.original
+        );
+    }
+}
+#[test]
+fn ambiguous_missing_or_changed_native_prompt_ancestry_never_guesses_an_alias() {
+    for case in 0..7 {
+        let (dir, mut store, db) = setup();
+        let mut value = source(dir.path());
+        if case == 4 {
+            let mut extra = value["thread"]["messages"][0].clone();
+            extra["id"] = json!("steered-message");
+            value["thread"]["messages"]
+                .as_array_mut()
+                .unwrap()
+                .push(extra);
+        }
+        if case == 5 {
+            value["thread"]["messages"][0]["attachments"] = json!([{"type":"image"}]);
+        }
+        let export = native_export(|rows, _| match case {
+            0 => rows[1]["parentUuid"] = Value::Null,
+            1 => rows[1]["parentUuid"] = rows[1]["uuid"].clone(),
+            2 => rows[0]["message"]["content"] = json!("Different prompt"),
+            3 => rows[1]["isSidechain"] = json!(true),
+            6 => {
+                rows[0]["message"]["content"] = json!([{"type":"text","text":"Original prompt"},{"type":"image","source":{"type":"base64","data":"not-identity-proof"}}])
+            }
+            _ => {}
+        });
+        store.prepare_legacy_claude(&raw(&value)).unwrap();
+        let before = store.load_chat("original-android-chat").unwrap();
+        assert!(
+            store
+                .prepare_legacy_claude_native(
+                    "original-android-chat",
+                    &export.snapshot,
+                    &export.transcript
+                )
+                .is_err(),
+            "case {case}"
+        );
+        assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+        assert_eq!(count(&db, "claude_outbox"), 0);
+    }
+}
+#[test]
+fn history_older_than_the_512_delivery_limit_keeps_all_public_prompt_identities() {
+    let (dir, mut store, db) = setup();
+    let mut source = source(dir.path());
+    let mut deliveries = vec![];
+    let export = native_export(|rows, _| {
+        for i in 0..520u128 {
+            let native = uuid::Uuid::from_u128(1000 + i * 2).to_string();
+            let reply = uuid::Uuid::from_u128(1001 + i * 2).to_string();
+            let public = format!("public-{i}");
+            let turn = format!("turn-{i}");
+            let answer = format!("answer-{i}");
+            let text = format!("Prompt {i}");
+            source["thread"]["messages"].as_array_mut().unwrap().extend([
+                json!({"id":public,"role":"user","text":text,"turnId":turn,"createdAt":TIME,"streaming":false,"sequence":100+i*2}),
+                json!({"id":answer,"role":"assistant","text":"Reply","turnId":turn,"createdAt":TIME,"streaming":false,"sequence":101+i*2})]);
+            rows.extend([
+                json!({"type":"user","uuid":native,"sessionId":NATIVE,"parentUuid":null,"message":{"role":"user","content":text}}),
+                json!({"type":"assistant","uuid":reply,"sessionId":NATIVE,"parentUuid":native,"message":{"id":answer,"role":"assistant","content":[{"type":"text","text":"Reply"}]}})]);
+            if i >= 8 {
+                deliveries.push(
+                    json!({"uuid":native,"messageId":public,"turnId":turn,"state":"consumed"}),
+                );
+            }
+        }
+    });
+    source["deliveries"] = json!(deliveries);
+    let original = raw(&source);
+    store.prepare_legacy_claude(&original).unwrap();
+    store
+        .prepare_legacy_claude_bindings("original-android-chat")
+        .unwrap();
+    let report = store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        )
+        .unwrap();
+    assert_eq!(report["reconciledPromptIds"], 9);
+    assert_eq!(report["prompts"], 521);
+    assert_eq!(count(&db, "legacy_claude_bindings"), 512);
+    assert_eq!(count(&db, "legacy_claude_native_bindings"), 9);
+    assert_eq!(count(&db, "claude_outbox"), 0);
+    for i in 0..520u128 {
+        let native = uuid::Uuid::from_u128(1000 + i * 2).to_string();
+        let record = store
+            .claude_input("original-android-chat", NATIVE, &native)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.input.message, format!("public-{i}"));
+        assert_eq!(record.input.public_turn, format!("turn-{i}"));
+    }
+    assert_eq!(
+        db.query_row("SELECT raw FROM legacy_claude_import", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        original
+    );
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    assert_eq!(count(&db, "legacy_claude_native_bindings"), 0);
+    store.rollback_legacy_connection().unwrap();
+}
+#[test]
+fn reconciled_prompt_bindings_commit_atomically_and_changed_bindings_block_rollback() {
+    let (dir, mut store, db) = setup();
+    store
+        .prepare_legacy_claude(&raw(&source(dir.path())))
+        .unwrap();
+    let export = native_export(|_, _| {});
+    db.execute_batch("CREATE TABLE legacy_claude_native_bindings(chat TEXT NOT NULL,session TEXT NOT NULL,native TEXT NOT NULL,message TEXT NOT NULL,turn TEXT NOT NULL,PRIMARY KEY(chat,session,native),UNIQUE(chat,session,message));CREATE TRIGGER fail_binding BEFORE INSERT ON legacy_claude_native_bindings BEGIN SELECT RAISE(ABORT,'fixture full'); END;").unwrap();
+    assert!(store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript
+        )
+        .is_err());
+    assert_eq!(count(&db, "legacy_claude_native_bindings"), 0);
+    assert_eq!(count(&db, "legacy_claude_native"), 0);
+    db.execute_batch("DROP TRIGGER fail_binding").unwrap();
+    store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        )
+        .unwrap();
+    db.execute_batch("UPDATE legacy_claude_native_bindings SET message='changed'")
+        .unwrap();
+    assert!(store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript
+        )
+        .is_err());
+    assert!(store
+        .rollback_legacy_claude("original-android-chat")
+        .is_err());
+    assert_eq!(count(&db, "chats"), 1);
+    assert_eq!(count(&db, "legacy_claude_native_bindings"), 1);
+}
+fn bound_source(dir: &std::path::Path) -> Value {
+    let mut value = source(dir);
+    value["deliveries"] = json!([{"uuid":INPUT_NATIVE,"messageId":"user-message","turnId":"old-turn","state":"consumed","steer":false}]);
+    value
+}
+fn saved_steer() -> Value {
+    json!({"id":"user-message","clientId":"fixture-client","staged":null,
+        "createdAt":TIME,"updatedAt":TIME,"command":{
+            "type":"thread.turn.start","threadId":"original-android-chat",
+            "message":{"messageId":"user-message","role":"user","text":"Original prompt","attachments":[]}
+        },"futureField":{"keep":true}})
+}
+#[test]
+fn actual_saved_steer_objects_keep_identity_without_resending_a_command() {
+    let (dir, mut store, db) = setup();
+    let mut value = bound_source(dir.path());
+    value["deliveries"][0]["steer"] = saved_steer();
+    let original = raw(&value);
+    store.prepare_legacy_claude(&original).unwrap();
+    store
+        .prepare_legacy_claude_bindings("original-android-chat")
+        .unwrap();
+    let record = store
+        .claude_input("original-android-chat", NATIVE, INPUT_NATIVE)
+        .unwrap()
+        .unwrap();
+    assert!(record.input.steer);
+    assert_eq!(record.input.message, "user-message");
+    assert_eq!(record.input.public_turn, "old-turn");
+    assert_eq!(record.state, "legacy-consumed");
+    assert_eq!(count(&db, "claude_outbox"), 0);
+    assert_eq!(
+        db.query_row("SELECT raw FROM legacy_claude_import", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        original
+    );
+    drop(store);
+    let mut store = Store::open(dir.path()).unwrap();
+    store
+        .prepare_legacy_claude_bindings("original-android-chat")
+        .unwrap();
+    let export = native_export(|_, _| {});
+    store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        )
+        .unwrap();
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    assert_eq!(count(&db, "legacy_claude_bindings"), 0);
+}
+#[test]
+fn mismatched_saved_steer_objects_never_bind_a_different_prompt_or_chat() {
+    for case in 0..5 {
+        let (dir, mut store, db) = setup();
+        let mut value = bound_source(dir.path());
+        let mut steer = saved_steer();
+        match case {
+            0 => steer["id"] = json!("other-message"),
+            1 => steer["command"]["threadId"] = json!("other-chat"),
+            2 => steer["command"]["message"]["messageId"] = json!("other-message"),
+            3 => steer["command"]["type"] = json!("thread.stop"),
+            _ => steer["command"]["message"]["role"] = json!("assistant"),
+        }
+        value["deliveries"][0]["steer"] = steer;
+        store.prepare_legacy_claude(&raw(&value)).unwrap();
+        assert!(
+            store
+                .prepare_legacy_claude_bindings("original-android-chat")
+                .is_err(),
+            "case {case}"
+        );
+        assert_eq!(count(&db, "claude_outbox"), 0);
+    }
+}
+#[test]
+fn cancelled_saved_steer_without_a_bubble_stays_cancelled_after_import() {
+    let (dir, mut store, db) = setup();
+    let mut value = bound_source(dir.path());
+    value["deliveries"][0]["steer"] = saved_steer();
+    value["deliveries"][0]["state"] = json!("cancelled");
+    value["thread"]["messages"]
+        .as_array_mut()
+        .unwrap()
+        .remove(0);
+    store.prepare_legacy_claude(&raw(&value)).unwrap();
+    store
+        .prepare_legacy_claude_bindings("original-android-chat")
+        .unwrap();
+    let record = store
+        .claude_input("original-android-chat", NATIVE, INPUT_NATIVE)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.state, "cancelled");
+    assert!(record.input.steer);
+    assert_eq!(
+        store.load_chat("original-android-chat").unwrap()["thread"]["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(count(&db, "claude_outbox"), 0);
+    assert!(store.offer_claude_input("original-android-chat",NATIVE,&record.input,&json!({"type":"user","uuid":INPUT_NATIVE,"message":{"role":"user","content":"Original prompt"}})).is_err());
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+
+    let (dir, mut store, _) = setup();
+    value["deliveries"][0]["state"] = json!("consumed");
+    value["thread"]["worktreePath"] = json!(dir.path());
+    store.prepare_legacy_claude(&raw(&value)).unwrap();
+    assert!(store
+        .prepare_legacy_claude_bindings("original-android-chat")
+        .is_err());
+}
+#[test]
+fn native_history_rejects_truncated_and_oversized_lines_before_any_native_receipt() {
+    use std::io::Write;
+    for oversized in [false, true] {
+        let (dir, mut store, db) = setup();
+        let export = native_export(|_, _| {});
+        let source_path = export.root.path().join("export").join(&export.transcript);
+        let mut out = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source_path)
+            .unwrap();
+        if oversized {
+            out.write_all(b"{\"type\":\"extra\",\"content\":\"")
+                .unwrap();
+            let chunk = [b'x'; 64 * 1024];
+            for _ in 0..128 {
+                out.write_all(&chunk).unwrap();
+            }
+            out.write_all(b"\"}\n").unwrap();
+        } else {
+            out.write_all(b"{\"type\":\"partial").unwrap();
+        }
+        drop(out);
+        let fresh = export.root.path().join("second-snapshot");
+        remodex_connect_native::migration_snapshot::capture(
+            &export.root.path().join("export"),
+            &fresh,
+            ENV,
+        )
+        .unwrap();
+        store
+            .prepare_legacy_claude(&raw(&bound_source(dir.path())))
+            .unwrap();
+        let before = store.load_chat("original-android-chat").unwrap();
+        assert!(store
+            .prepare_legacy_claude_native("original-android-chat", &fresh, &export.transcript)
+            .is_err());
+        assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='legacy_claude_native'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert!(store.assert_migration_ready().is_err());
+    }
+}
+#[test]
+fn legacy_prompt_bindings_preserve_aliases_without_fabricating_delivery_receipts() {
+    let (dir, mut store, db) = setup();
+    let value = bound_source(dir.path());
+    let bytes = raw(&value);
+    store.prepare_legacy_claude(&bytes).unwrap();
+    let before = store.load_chat("original-android-chat").unwrap();
+    let report = store
+        .prepare_legacy_claude_bindings("original-android-chat")
+        .unwrap();
+    assert_eq!(report["bindings"], 1);
+    let record = store
+        .claude_input("original-android-chat", NATIVE, INPUT_NATIVE)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.state, "legacy-consumed");
+    assert_eq!(record.input.message, "user-message");
+    assert_eq!(record.input.public_turn, "old-turn");
+    assert_eq!(count(&db, "claude_outbox"), 0);
+    assert!(store
+        .unresolved_claude_inputs("original-android-chat", NATIVE)
+        .unwrap()
+        .is_empty());
+    let payload = json!({"type":"user","uuid":INPUT_NATIVE,"session_id":NATIVE,"message":{"role":"user","content":"Original prompt"}});
+    assert!(store
+        .offer_claude_input("original-android-chat", NATIVE, &record.input, &payload)
+        .unwrap_err()
+        .contains("not offered again"));
+    assert_eq!(
+        store
+            .prepare_legacy_claude_bindings("original-android-chat")
+            .unwrap(),
+        report
+    );
+    assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+    store.prepare_legacy_claude(&bytes).unwrap();
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    assert_eq!(count(&db, "legacy_claude_bindings"), 0);
+    assert_eq!(
+        db.query_row("SELECT raw FROM legacy_claude_import", [], |r| r
+            .get::<_, Vec<u8>>(0))
+            .unwrap(),
+        bytes
+    );
+    assert!(store.assert_migration_ready().is_err());
+    assert!(store
+        .claude_input("original-android-chat", NATIVE, INPUT_NATIVE)
+        .unwrap()
+        .is_none());
+}
+#[test]
+fn invalid_legacy_aliases_fail_without_touching_history_and_tampering_blocks_rollback() {
+    for (key, value) in [
+        ("uuid", json!("bad-uuid")),
+        ("messageId", json!("missing-message")),
+        ("turnId", json!("wrong-turn")),
+        ("steer", json!("yes")),
+    ] {
+        let (dir, mut store, _) = setup();
+        let mut value_root = bound_source(dir.path());
+        value_root["deliveries"][0][key] = value;
+        store.prepare_legacy_claude(&raw(&value_root)).unwrap();
+        let before = store.load_chat("original-android-chat").unwrap();
+        assert!(store
+            .prepare_legacy_claude_bindings("original-android-chat")
+            .is_err());
+        assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+    }
+    for sql in [
+        "UPDATE legacy_claude_bindings SET message='changed'",
+        "UPDATE legacy_claude_binding_import SET source_hash='changed'",
+    ] {
+        let (dir, mut store, db) = setup();
+        let value = bound_source(dir.path());
+        store.prepare_legacy_claude(&raw(&value)).unwrap();
+        store
+            .prepare_legacy_claude_bindings("original-android-chat")
+            .unwrap();
+        db.execute_batch(sql).unwrap();
+        assert!(store
+            .prepare_legacy_claude_bindings("original-android-chat")
+            .is_err());
+        assert!(store
+            .rollback_legacy_claude("original-android-chat")
+            .is_err());
+        assert_eq!(count(&db, "chats"), 1);
+    }
+}
+#[test]
+fn legacy_alias_transaction_failure_rolls_back_all_bindings_and_retry_is_scoped() {
+    let (dir, mut store, db) = setup();
+    let mut value = bound_source(dir.path());
+    value["thread"]["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id":"second-user","role":"user","text":"Second prompt","createdAt":TIME,
+            "turnId":"second-turn","sequence":55,"streaming":false
+        }));
+    let second = "00000000-0000-4000-8000-000000000026";
+    value["deliveries"].as_array_mut().unwrap().push(json!({
+        "uuid":second,"messageId":"second-user","turnId":"second-turn","state":"cancelled","steer":true
+    }));
+    let bytes = raw(&value);
+    store.prepare_legacy_claude(&bytes).unwrap();
+    let before = store.load_chat("original-android-chat").unwrap();
+    // Provision only the empty ledger, then fail the second insert to exercise
+    // a real mid-transaction storage error rather than a parser rejection.
+    db.execute_batch("CREATE TABLE legacy_claude_binding_import(chat TEXT PRIMARY KEY,source_hash TEXT NOT NULL,phase TEXT NOT NULL);CREATE TABLE legacy_claude_bindings(chat TEXT NOT NULL,session TEXT NOT NULL,native TEXT NOT NULL,message TEXT NOT NULL,turn TEXT NOT NULL,steer INTEGER NOT NULL,state TEXT NOT NULL,PRIMARY KEY(chat,session,native),UNIQUE(chat,session,message));CREATE TRIGGER fail_second BEFORE INSERT ON legacy_claude_bindings WHEN NEW.message='second-user' BEGIN SELECT RAISE(ABORT,'fixture full'); END;").unwrap();
+    assert!(store
+        .prepare_legacy_claude_bindings("original-android-chat")
+        .is_err());
+    assert_eq!(count(&db, "legacy_claude_bindings"), 0);
+    assert_eq!(count(&db, "legacy_claude_binding_import"), 0);
+    assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+    db.execute_batch("DROP TRIGGER fail_second").unwrap();
+    assert_eq!(
+        store
+            .prepare_legacy_claude_bindings("original-android-chat")
+            .unwrap()["bindings"],
+        2
+    );
+    let record = store
+        .claude_input("original-android-chat", NATIVE, second)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.state, "cancelled");
+    assert!(record.input.steer);
+    assert!(store
+        .claude_input("other-chat", NATIVE, second)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .claude_input("original-android-chat", second, INPUT_NATIVE)
+        .unwrap()
+        .is_none());
+    // A different native UUID must not reuse the same public prompt identity.
+    let mut input = record.input;
+    input.native = "00000000-0000-4000-8000-000000000027".into();
+    let payload = json!({"type":"user","uuid":input.native,"session_id":NATIVE,"message":{"role":"user","content":"Changed"}});
+    assert!(store
+        .offer_claude_input("original-android-chat", NATIVE, &input, &payload)
+        .unwrap_err()
+        .contains("not offered again"));
+    assert!(store
+        .offer_claude_input("other-chat", NATIVE, &input, &payload)
+        .is_err());
+    assert_eq!(count(&db, "claude_outbox"), 0);
+    assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+    store.prepare_legacy_claude(&bytes).unwrap();
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    assert_eq!(count(&db, "legacy_claude_bindings"), 0);
+}
+#[tokio::test]
+async fn legacy_alias_echo_after_checkpoint_keeps_one_original_prompt_with_exact_old_rows() {
+    use remodex_connect_native::{
+        auth::Auth, auth_service::AuthService, claude_host::Identity, claude_remote::Envelope,
+    };
+    let (dir, mut store, _) = setup();
+    let mut value = bound_source(dir.path());
+    value["external"] = json!(true);
+    store.prepare_legacy_claude(&raw(&value)).unwrap();
+    store
+        .prepare_legacy_claude_bindings("original-android-chat")
+        .unwrap();
+    store
+        .prepare_legacy_claude_resume("original-android-chat")
+        .unwrap();
+    let identity = Identity {
+        native_session: NATIVE.into(),
+        bridge_session: "cse_legacy_fixture".into(),
+    };
+    let mut cursor = store
+        .claude_remote_cursor("original-android-chat", identity)
+        .unwrap();
+    let mut current = store.load_chat("original-android-chat").unwrap();
+    let original = current["thread"]["messages"].clone();
+    let service = AuthService::new(Auth::new(store)).unwrap();
+    for (seq, source, payload) in [
+        (
+            99,
+            "client",
+            json!({"type":"user","uuid":INPUT_NATIVE,"session_id":NATIVE,"message":{"role":"user","content":"Original prompt"}}),
+        ),
+        (
+            100,
+            "worker",
+            json!({"type":"assistant","session_id":NATIVE,"user_message_uuids":[INPUT_NATIVE],"message":{"id":"assistant-message","role":"assistant","content":[{"type":"text","text":"Original reply"}]}}),
+        ),
+        (
+            101,
+            "worker",
+            json!({"type":"result","session_id":NATIVE,"user_message_uuids":[INPUT_NATIVE],"subtype":"success"}),
+        ),
+    ] {
+        let event = Envelope {
+            deliveries: vec![],
+            receipt_checkpoint: false,
+            recovery: None,
+            sequence: Some(seq),
+            event_id: Some(format!("echo-{seq}")),
+            source: source.into(),
+            created_at: Some(TIME.into()),
+            payload: Some(payload),
+        };
+        let (next, projection) = remodex_connect_native::claude_history::project(
+            &service, current, &cursor, &event, true,
+        )
+        .await
+        .unwrap();
+        let after = cursor.advance(&event, projection).unwrap();
+        let a = cursor.clone();
+        let b = after.clone();
+        let saved = next.clone();
+        service
+            .call(move |auth| auth.store.save_claude_remote(&saved, &a, &b))
+            .await
+            .unwrap()
+            .unwrap();
+        current = next;
+        cursor = after;
+    }
+    let saved = service
+        .call(|a| a.store.load_chat("original-android-chat"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved["thread"]["messages"], original);
+    assert_eq!(saved["thread"]["latestTurn"]["turnId"], "old-turn");
+    assert_eq!(saved["thread"]["session"]["status"], "ready");
+}
+
+#[tokio::test]
+async fn reconciled_alias_native_replay_retains_original_prompt_and_turn() {
+    use remodex_connect_native::{
+        auth::Auth, auth_service::AuthService, claude_host::Identity, claude_remote::Envelope,
+    };
+    let (dir, mut store, _) = setup();
+    let value = source(dir.path());
+    store.prepare_legacy_claude(&raw(&value)).unwrap();
+    let export = native_export(|_, _| {});
+    store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        )
+        .unwrap();
+    let checkpoint = store
+        .prepare_legacy_claude_resume("original-android-chat")
+        .unwrap();
+    assert_eq!(checkpoint["sequence"], 0);
+    assert_eq!(checkpoint["phase"], "owned-replay-prepared");
+    drop(store);
+    let mut store = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        store
+            .prepare_legacy_claude_resume("original-android-chat")
+            .unwrap(),
+        checkpoint
+    );
+    let identity = Identity {
+        native_session: NATIVE.into(),
+        bridge_session: "cse_legacy_fixture".into(),
+    };
+    let mut cursor = store
+        .claude_remote_cursor("original-android-chat", identity)
+        .unwrap();
+    let mut current = store.load_chat("original-android-chat").unwrap();
+    let original = current["thread"]["messages"].clone();
+    let service = AuthService::new(Auth::new(store)).unwrap();
+    for (seq, source, payload) in [
+        (
+            1,
+            "client",
+            json!({"type":"user","uuid":INPUT_NATIVE,"session_id":NATIVE,"message":{"role":"user","content":"Original prompt"}}),
+        ),
+        (
+            2,
+            "worker",
+            json!({"type":"assistant","session_id":NATIVE,"user_message_uuids":[INPUT_NATIVE],"message":{"id":"assistant-message","role":"assistant","content":[{"type":"text","text":"Original reply"}]}}),
+        ),
+        (
+            3,
+            "worker",
+            json!({"type":"result","session_id":NATIVE,"user_message_uuids":[INPUT_NATIVE],"subtype":"success"}),
+        ),
+    ] {
+        let event = Envelope {
+            deliveries: vec![],
+            receipt_checkpoint: false,
+            recovery: None,
+            sequence: Some(seq),
+            event_id: Some(format!("echo-{seq}")),
+            source: source.into(),
+            created_at: Some(TIME.into()),
+            payload: Some(payload),
+        };
+        let (next, projection) = remodex_connect_native::claude_history::project(
+            &service, current, &cursor, &event, true,
+        )
+        .await
+        .unwrap();
+        let after = cursor.advance(&event, projection).unwrap();
+        let a = cursor.clone();
+        let b = after.clone();
+        let saved = next.clone();
+        service
+            .call(move |auth| auth.store.save_claude_remote(&saved, &a, &b))
+            .await
+            .unwrap()
+            .unwrap();
+        current = next;
+        cursor = after;
+    }
+    let saved = service
+        .call(|a| a.store.load_chat("original-android-chat"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved["thread"]["messages"], original);
+    assert_eq!(saved["thread"]["latestTurn"]["turnId"], "old-turn");
+    assert_eq!(saved["thread"]["session"]["status"], "ready");
+}
+
+#[tokio::test]
+async fn exported_sdk_reply_uuid_settles_replayed_prompt_without_a_new_result() {
+    use remodex_connect_native::{
+        auth::Auth, auth_service::AuthService, claude_host::Identity, claude_remote::Envelope,
+    };
+    for terminal in [false, true] {
+        let (dir, mut store, _) = setup();
+        let mut value = source(dir.path());
+        value["external"] = json!(true);
+        value["upgradeNativeReplay"] = json!(true);
+        value["thread"]["messages"][1]["id"] = json!("00000000-0000-4000-8000-000000000028");
+        store.prepare_legacy_claude(&raw(&value)).unwrap();
+        let export = native_export(|_, _| {});
+        store
+            .prepare_legacy_claude_native(
+                "original-android-chat",
+                &export.snapshot,
+                &export.transcript,
+            )
+            .unwrap();
+        let checkpoint = store
+            .prepare_legacy_claude_resume("original-android-chat")
+            .unwrap();
+        assert_eq!(checkpoint["sequence"], 0);
+        assert_eq!(checkpoint["phase"], "owned-replay-prepared");
+        drop(store);
+        let mut store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store
+                .prepare_legacy_claude_resume("original-android-chat")
+                .unwrap(),
+            checkpoint
+        );
+        let identity = Identity {
+            native_session: NATIVE.into(),
+            bridge_session: "cse_legacy_fixture".into(),
+        };
+        let mut cursor = store
+            .claude_remote_cursor("original-android-chat", identity)
+            .unwrap();
+        let mut current = store.load_chat("original-android-chat").unwrap();
+        let original = current["thread"]["messages"].clone();
+        let service = AuthService::new(Auth::new(store)).unwrap();
+        for (seq, source, payload) in [
+            (
+                1,
+                "client",
+                json!({"type":"user","uuid":INPUT_NATIVE,"session_id":NATIVE,"message":{"role":"user","content":"Original prompt"}}),
+            ),
+            (
+                2,
+                "worker",
+                json!({"type":"assistant","uuid":"00000000-0000-4000-8000-000000000028","timestamp":TIME,"session_id":NATIVE,"message":{"id":"assistant-message","role":"assistant","stop_reason":if terminal {"end_turn"} else {"tool_use"},"content":[{"type":"text","text":"Original reply"}]}}),
+            ),
+        ] {
+            let event = Envelope {
+                deliveries: vec![],
+                receipt_checkpoint: false,
+                recovery: None,
+                sequence: Some(seq),
+                event_id: Some(format!("echo-{seq}")),
+                source: source.into(),
+                created_at: Some("2026-10-25T05:30:00Z".into()),
+                payload: Some(payload),
+            };
+            let (next, projection) = remodex_connect_native::claude_history::project(
+                &service, current, &cursor, &event, true,
+            )
+            .await
+            .unwrap();
+            let after = cursor.advance(&event, projection).unwrap();
+            let a = cursor.clone();
+            let b = after.clone();
+            let saved = next.clone();
+            service
+                .call(move |auth| auth.store.save_claude_remote(&saved, &a, &b))
+                .await
+                .unwrap()
+                .unwrap();
+            current = next;
+            cursor = after;
+        }
+        let saved = service
+            .call(|a| a.store.load_chat("original-android-chat"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved["thread"]["messages"], original);
+        assert_eq!(saved["thread"]["latestTurn"]["turnId"], "old-turn");
+        assert_eq!(
+            saved["thread"]["session"]["status"],
+            current["thread"]["session"]["status"]
+        );
+        let (router, _) =
+            remodex_connect_native::claude_history::control_state(&cursor.projection).unwrap();
+        assert!(router.active().is_none());
+        assert_eq!(router.pending().count(), if terminal { 0 } else { 1 });
+        assert_eq!(saved["thread"]["latestTurn"], value["thread"]["latestTurn"]);
+        assert_eq!(saved["thread"]["messages"][1]["createdAt"], TIME);
+    }
+}
+
+#[test]
+fn checkpoint_prompt_excerpts_keep_newlines_but_reject_terminal_controls() {
+    let (dir, mut store, db) = setup();
+    let mut original = source(dir.path());
+    let label = "Read the attachment.\n\nAttached files on this PC:\nexample.txt";
+    original["fileCheckpoints"][0]["label"] = json!(label);
+    let bytes = raw(&original);
+    store.prepare_legacy_claude(&bytes).unwrap();
+    let saved: Vec<u8> = db
+        .query_row("SELECT raw FROM legacy_claude_import", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(saved, bytes);
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+    original["fileCheckpoints"][0]["label"] = json!("bad\u{1b}[2J");
+    assert!(store.prepare_legacy_claude(&raw(&original)).is_err());
+}
+
+#[test]
+fn external_native_replay_needs_complete_proof_and_keeps_an_immutable_history_boundary() {
+    let (dir, mut store, db) = setup();
+    let mut value = source(dir.path());
+    value["external"] = json!(true);
+    value["upgradeNativeReplay"] = json!(true);
+    value["remoteSequence"] = json!(0);
+    store.prepare_legacy_claude(&raw(&value)).unwrap();
+    let rows = count(&db, "chat_rows");
+    assert!(store
+        .prepare_legacy_claude_resume("original-android-chat")
+        .is_err());
+    let export = native_export(|_, _| {});
+    store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        )
+        .unwrap();
+    let checkpoint = store
+        .prepare_legacy_claude_resume("original-android-chat")
+        .unwrap();
+    assert_eq!(checkpoint["sequence"], 0);
+    assert_eq!(count(&db, "chat_rows"), rows);
+    let cursor: Value = serde_json::from_str(
+        &db.query_row("SELECT cursor FROM native_sync", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cursor["sequence"], 0);
+    assert!(!cursor["projection"].is_null());
+    assert!(cursor["legacy_source"].is_null());
+    store
+        .rollback_legacy_claude("original-android-chat")
+        .unwrap();
+}
+
+#[test]
+fn complete_old_uuid_ledger_recovers_attachment_prompts_but_rejects_conflicts() {
+    for case in 0..4 {
+        let (dir, mut store, db) = setup();
+        let mut value = source(dir.path());
+        value["userUuids"] = json!([INPUT_NATIVE]);
+        if case == 1 {
+            value["userUuids"] = json!(["00000000-0000-4000-8000-000000000099"]);
+        }
+        if case == 2 {
+            value["thread"]["messages"][0]["text"] = json!("Changed prompt");
+        }
+        let original = raw(&value);
+        store.prepare_legacy_claude(&original).unwrap();
+        let export = native_export(|rows, _| {
+            rows[0]["message"]["content"] = json!([
+                {"type":"text","text": if case == 3 {"Original prompt\n\nAttached files on this PC:\nrelative-or-prose"} else {"Original prompt\n\nAttached files on this PC:\n/fixture/old-upload.txt"}},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"eA=="}}
+            ]);
+        });
+        let result = store.prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        );
+        if case == 0 {
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(
+                store
+                    .claude_input("original-android-chat", NATIVE, INPUT_NATIVE)
+                    .unwrap()
+                    .unwrap()
+                    .input
+                    .message,
+                "user-message"
+            );
+            assert_eq!(
+                db.query_row("SELECT raw FROM legacy_claude_import", [], |r| r
+                    .get::<_, Vec<u8>>(0))
+                    .unwrap(),
+                original
+            );
+        } else {
+            assert!(result.is_err());
+        }
+    }
+}
+
+#[test]
+fn settled_export_retains_unmapped_interrupted_history_without_inventing_delivery() {
+    for opted_in in [false, true] {
+        let (dir, mut store, db) = setup();
+        let mut value = source(dir.path());
+        value["upgradePreserveUnmappedHistory"] = json!(opted_in);
+        value["thread"]["messages"].as_array_mut().unwrap().push(json!({"id":"old-interrupted-prompt","role":"user","text":"Keep my interrupted prompt","turnId":"old-interrupted-turn","createdAt":TIME,"sequence":60}));
+        value["thread"]["messages"].as_array_mut().unwrap().push(json!({"id":"old-cached-reply","role":"assistant","text":"Retain cached reply","turnId":"old-interrupted-turn","createdAt":TIME,"sequence":61}));
+        let original = raw(&value);
+        store.prepare_legacy_claude(&original).unwrap();
+        let before = store.load_chat("original-android-chat").unwrap();
+        let export = native_export(|_, _| {});
+        let result = store.prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        );
+        if opted_in {
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+            assert_eq!(count(&db, "claude_outbox"), 0);
+            assert_eq!(count(&db, "legacy_claude_native_bindings"), 1);
+            store
+                .rollback_legacy_claude("original-android-chat")
+                .unwrap();
+            assert_eq!(
+                db.query_row("SELECT raw FROM legacy_claude_import", [], |r| r
+                    .get::<_, Vec<u8>>(0))
+                    .unwrap(),
+                original
+            );
+        } else {
+            assert!(result.is_err());
+        }
+    }
+}
+
+#[test]
+fn missing_older_ledger_entry_is_history_only_without_rebinding_to_another_prompt() {
+    let (dir, mut store, db) = setup();
+    let mut value = source(dir.path());
+    value["userUuids"] = json!([INPUT_NATIVE]);
+    value["thread"]["messages"][0]["id"] = json!(INPUT_NATIVE);
+    value["upgradePreserveUnmappedHistory"] = json!(true);
+    store.prepare_legacy_claude(&raw(&value)).unwrap();
+    let before = store.load_chat("original-android-chat").unwrap();
+    let export = native_export(|rows, _| {
+        rows[0]["uuid"] = json!("00000000-0000-4000-8000-000000000099");
+        rows[0]["message"]["content"] = json!("A different old prompt");
+        rows[1]["parentUuid"] = rows[0]["uuid"].clone();
+    });
+    store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        )
+        .unwrap();
+    assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+    assert_eq!(count(&db, "legacy_claude_native_bindings"), 0);
+    assert_eq!(count(&db, "claude_outbox"), 0);
+}
+
+#[test]
+fn old_native_meta_bubble_is_preserved_without_a_delivery_binding() {
+    let (dir, mut store, db) = setup();
+    let mut value = source(dir.path());
+    value["userUuids"] = json!([INPUT_NATIVE]);
+    value["thread"]["messages"][0]["id"] = json!(INPUT_NATIVE);
+    value["upgradePreserveUnmappedHistory"] = json!(true);
+    store.prepare_legacy_claude(&raw(&value)).unwrap();
+    let before = store.load_chat("original-android-chat").unwrap();
+    let export = native_export(|rows, _| {
+        rows[0]["isMeta"] = json!(true);
+    });
+    store
+        .prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        )
+        .unwrap();
+    assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+    assert_eq!(count(&db, "legacy_claude_native_bindings"), 0);
+    assert_eq!(count(&db, "claude_outbox"), 0);
+}
+
+#[test]
+fn mixed_old_uuid_and_delivery_ledgers_retain_missing_history_without_rebinding() {
+    const MISSING: &str = "00000000-0000-4000-8000-000000000098";
+    for case in [
+        "retained",
+        "conflicting-receipt",
+        "duplicate-ledger",
+        "attachment",
+        "not-settled",
+    ] {
+        let (dir, mut store, db) = setup();
+        let mut value = bound_source(dir.path());
+        value["upgradePreserveUnmappedHistory"] = json!(case != "not-settled");
+        value["userUuids"] = json!([INPUT_NATIVE, MISSING]);
+        value["thread"]["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id":MISSING,"role":"user","text":"Older missing prompt",
+                "turnId":"missing-turn","createdAt":TIME,"sequence":60,"attachments":[]
+            }));
+        // A cached reply now follows a different native prompt. Its text or
+        // parent must not replace the missing identity in the saved ledger.
+        value["thread"]["messages"][1]["turnId"] = json!("missing-turn");
+        match case {
+            "conflicting-receipt" => {
+                value["userUuids"][0] = json!("00000000-0000-4000-8000-000000000099")
+            }
+            "duplicate-ledger" => value["userUuids"][1] = json!(INPUT_NATIVE),
+            "attachment" => {
+                value["thread"]["messages"][2]["attachments"] = json!([{"id":"missing-proof","type":"file","name":"old.txt","mimeType":"text/plain","sizeBytes":3,"path":"/fixture/old.txt"}])
+            }
+            _ => {}
+        }
+        let original = raw(&value);
+        store.prepare_legacy_claude(&original).unwrap();
+        store
+            .prepare_legacy_claude_bindings("original-android-chat")
+            .unwrap();
+        let before = store.load_chat("original-android-chat").unwrap();
+        let export = native_export(|_, _| {});
+        let result = store.prepare_legacy_claude_native(
+            "original-android-chat",
+            &export.snapshot,
+            &export.transcript,
+        );
+        if case == "retained" {
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(count(&db, "legacy_claude_native_bindings"), 0);
+            assert_eq!(count(&db, "legacy_claude_bindings"), 1);
+            assert!(store
+                .claude_input("original-android-chat", NATIVE, MISSING)
+                .unwrap()
+                .is_none());
+            assert_eq!(store.load_chat("original-android-chat").unwrap(), before);
+            store
+                .rollback_legacy_claude("original-android-chat")
+                .unwrap();
+            assert_eq!(
+                db.query_row("SELECT raw FROM legacy_claude_import", [], |r| r
+                    .get::<_, Vec<u8>>(0))
+                    .unwrap(),
+                original
+            );
+        } else {
+            assert!(
+                result.is_err(),
+                "{case} must not create an inferred binding"
+            );
+        }
+        assert_eq!(count(&db, "claude_outbox"), 0);
+        assert_eq!(
+            std::fs::read(export.root.path().join("export").join(&export.transcript)).unwrap(),
+            export.original
+        );
+    }
+}

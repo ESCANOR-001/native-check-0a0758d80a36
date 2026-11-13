@@ -1,0 +1,62 @@
+[package]
+name = "remodex-connect-native"
+version = "2.0.0-beta.6"
+edition = "2021"
+publish = false
+
+[features]
+# Development-only window for exercising the same tray actions with UI tools.
+# Normal builds have only a notification-area icon and its menu.
+tray-test-controls = []
+
+[dependencies]
+futures-util = { version = "0.3", features = ["sink"] }
+axum = { version = "0.8", features = ["ws", "form"] }
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+rand = "0.8"
+rusqlite = { version = "0.40.1", features = ["bundled", "hooks", "limits"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.10"
+subtle = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "sync", "signal", "time", "process", "io-util", "fs"] }
+tokio-tungstenite = "0.29"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+flate2 = "1.1"
+tar = { version = "0.4", default-features = false }
+zeroize = "1"
+memmap2 = "0.9"
+pulldown-cmark = { version = "0.13", default-features = false }
+percent-encoding = "2"
+roxmltree = "0.21"
+tempfile = "3"
+zstd = { version = "=0.13.3", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "=3.6.3", features = ["sync-secret-service", "crypto-rust", "vendored"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.6.3", features = ["apple-native"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "=3.6.3", features = ["windows-native"] }
+socket2 = "=0.6.5"
+windows = { version = "=0.62.2", features = ["Win32_System_Com", "Win32_System_Ole", "Win32_System_TaskScheduler", "Win32_System_Variant"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_Storage_FileSystem", "Win32_Storage_Packaging_Appx", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Services", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_RemoteDesktop", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_Networking_WinSock", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[build-dependencies]
+find-msvc-tools = "=0.1.15"
+
+[profile.release]
+codegen-units = 1
+strip = "symbols"

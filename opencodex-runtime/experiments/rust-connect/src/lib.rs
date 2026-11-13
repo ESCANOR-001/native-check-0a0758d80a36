@@ -1,0 +1,167 @@
+//! Native Connect migration, opt-in and isolated from the production runtime.
+//! Only advertise a capability when its implementation and parity checks exist.
+mod activity;
+pub mod agent;
+mod agent_setup;
+pub mod auth;
+pub mod auth_service;
+pub mod chat;
+mod chat_projection;
+mod chat_store;
+mod claude_background;
+pub mod claude_cursor;
+mod claude_fork_resume;
+pub mod claude_history;
+pub mod claude_host;
+pub mod claude_link;
+mod claude_local;
+mod claude_local_history;
+pub mod claude_observer;
+pub mod claude_outbox;
+mod claude_permissions;
+mod claude_rebind;
+mod claude_reconnect;
+pub mod claude_remote;
+pub mod claude_turns;
+pub mod dashboard;
+pub mod desktop_activation;
+pub mod desktop_ipc;
+mod desktop_refresh;
+mod desktop_sidebar;
+pub mod desktop_snapshot;
+pub mod diagnostics;
+pub mod native_tray;
+mod handoff_codex;
+pub mod launch_config;
+pub mod legacy_activation;
+mod legacy_claude;
+mod legacy_claude_assets;
+mod legacy_claude_bindings;
+mod legacy_claude_native;
+mod legacy_claude_reconcile;
+mod legacy_claude_resume;
+mod legacy_codex;
+mod legacy_codex_headers;
+mod legacy_codex_history;
+mod legacy_codex_native;
+pub mod legacy_connection;
+mod legacy_desktop_reference;
+pub mod legacy_export;
+mod legacy_export_assets;
+mod legacy_preferences;
+pub mod legacy_rollback;
+pub mod legacy_stage;
+pub mod legacy_upgrade;
+mod legacy_upload_display;
+mod legacy_upload_native;
+mod legacy_uploads;
+pub mod management_listener;
+mod migration_assets;
+pub mod migration_snapshot;
+pub mod named_tunnel;
+pub mod profile_handoff;
+pub mod restart_drain;
+pub mod server;
+pub mod service_cutover;
+pub mod service_registration;
+pub mod store;
+mod subscription_delivery;
+mod tool_details;
+
+pub mod attachments;
+mod tool_media;
+mod turn_timing;
+
+mod models;
+mod projects;
+mod workspace;
+
+mod branches;
+mod capabilities;
+mod checkpoints;
+mod codex_catalog;
+mod codex_inventory;
+mod codex_saved_history;
+mod codex_saved_items;
+mod controls;
+mod desktop_questions;
+mod discovery;
+mod editing;
+mod elicitation;
+mod native_control;
+mod private_directory;
+mod process_tree;
+mod questions;
+mod retention;
+mod usage;
+mod vcs;
+mod worktrees;
+
+mod cloudflared;
+mod codex_rollout;
+pub mod installation;
+pub mod invitation_file;
+pub mod legacy_quick_launcher;
+pub mod listener;
+mod local_network;
+pub mod mobile_connection;
+pub mod network_access;
+pub mod profile_lock;
+mod profile_snapshot;
+pub mod quick_handoff;
+mod repository_clone;
+mod runtime_metrics;
+pub mod storage;
+mod storage_disk;
+mod storage_legacy;
+mod storage_policy;
+mod storage_policy_job;
+mod storage_preview;
+mod storage_report;
+mod storage_trash;
+pub mod tunnel;
+
+mod subprocess;
+
+mod codex_assets;
+mod codex_compact;
+mod codex_error;
+mod desktop_window;
+mod shared_files;
+mod shared_history;
+
+mod codex_executable;
+pub mod supervisor;
+
+pub mod storage_stage;
+
+pub mod storage_rows;
+
+pub mod storage_cleanup;
+
+#[cfg(test)]
+mod storage_native_schema_tests;
+
+pub mod codex_history_reader;
+pub mod export_recovery;
+mod npm_legacy;
+pub mod npm_upgrade;
+mod source_hold;
+pub mod upgrade_source;
+
+pub(crate) mod codex_lifecycle;
+
+mod task_state;
+mod work_snapshot;
+
+mod phone_uploads;
+
+pub mod native_service;
+
+pub mod tunnel_provisioning;
+
+pub mod feature_policy;
+
+pub mod migrated_configuration;
+pub mod native_cli;
+pub mod native_package;

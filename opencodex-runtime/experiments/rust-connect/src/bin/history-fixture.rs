@@ -1,0 +1,195 @@
+//! Strict saved-history reader fixture. Any ownership mutation fails the test.
+use serde_json::{json, Value};
+use std::io::{self, BufRead, Write};
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--activate") {
+        assert_eq!(args.len(), 4);
+        assert!(args[3].starts_with(
+            "codex://threads/12345678-1234-4234-8234-123456789abc?opencodex-reactivate="
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&args[2])
+            .unwrap();
+        writeln!(file, "{}", args[3]).unwrap();
+        return;
+    }
+
+    let root = std::path::PathBuf::from(std::env::var_os("CODEX_HOME").unwrap());
+    let setup: Value =
+        serde_json::from_slice(&std::fs::read(root.join("fixture.json")).unwrap()).unwrap();
+    for line in io::stdin().lock().lines() {
+        let request: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        let method = request["method"].as_str().unwrap();
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("methods.log"))
+            .unwrap();
+        writeln!(log, "{method}").unwrap();
+        if setup["mode"] == "window" {
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(root.join("requests.jsonl"))
+                    .unwrap(),
+                "{request}"
+            )
+            .unwrap();
+        }
+        if method == "initialized" {
+            continue;
+        }
+        if method == "thread/read" {
+            let failures = root.join("read-failures");
+            let remaining = std::fs::read_to_string(&failures)
+                .ok()
+                .and_then(|n| n.parse::<u32>().ok())
+                .unwrap_or(0);
+            if remaining > 0 {
+                std::fs::write(failures, (remaining - 1).to_string()).unwrap();
+                println!(
+                    "{}",
+                    json!({"id":request["id"],"error":{"code":-32000,"message":"Temporary test history failure"}})
+                );
+                io::stdout().flush().unwrap();
+                continue;
+            }
+        }
+        let live: Value = std::fs::read(root.join("desktop-state.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or(Value::Null);
+        if setup["mode"] == "window" && matches!(method, "thread/turns/list" | "thread/items/list")
+        {
+            let turns = live["turns"].as_array().unwrap();
+            let desc = request["params"]["sortDirection"] == "desc";
+            let source: Vec<Value> = if method == "thread/turns/list" {
+                turns
+                    .iter()
+                    .map(|v| {
+                        let mut t = v.clone();
+                        t["items"] = if request["params"]["itemsView"] == "summary" {
+                            let rows = v["items"].as_array().unwrap();
+                            let last = rows.iter().rfind(|r| r["item"]["type"] == "agentMessage");
+                            json!(rows
+                                .iter()
+                                .filter(|r| r["item"]["type"] == "userMessage" || Some(*r) == last)
+                                .map(|r| r["item"].clone())
+                                .collect::<Vec<_>>())
+                        } else {
+                            json!([])
+                        };
+                        if t["status"] == "inProgress" {
+                            t["status"] = json!("interrupted");
+                        }
+                        t
+                    })
+                    .collect()
+            } else {
+                turns
+                    .iter()
+                    .find(|t| t["id"] == request["params"]["turnId"])
+                    .unwrap()["items"]
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            };
+            let source: Vec<_> = if desc {
+                source.into_iter().rev().collect()
+            } else {
+                source
+            };
+            let n = request["params"]["cursor"]
+                .as_str()
+                .unwrap_or("0")
+                .parse::<usize>()
+                .unwrap();
+            let limit = request["params"]["limit"].as_u64().unwrap() as usize;
+            let page: Vec<_> = source.iter().skip(n).take(limit).cloned().collect();
+            println!(
+                "{}",
+                json!({"id":request["id"],"result":{"data":page,"nextCursor":if n+limit<source.len(){json!((n+limit).to_string())}else{Value::Null}}})
+            );
+            io::stdout().flush().unwrap();
+            continue;
+        }
+        let result = match method {
+            "initialize" => json!({}),
+            "thread/list" => {
+                json!({"data":live.get("inventory").cloned().unwrap_or(json!([])),"nextCursor":null})
+            }
+            "model/list" => {
+                json!({"data":[{"model":"test","displayName":"Test model","supportedReasoningEfforts":[{"reasoningEffort":"high"},{"reasoningEffort":"low"}]}]})
+            }
+            "account/rateLimits/read" => setup.get("rateLimits").cloned().unwrap_or(json!({})),
+            "thread/read" => {
+                assert_eq!(request["params"]["includeTurns"], false);
+                json!({"thread":{"id":setup["native"],"path":setup["path"],"turns":[],"status":{"type":"notLoaded"}}})
+            }
+            "thread/turns/list" => {
+                assert_eq!(request["params"]["limit"], 1);
+                if setup["mode"] == "missing-index" {
+                    println!(
+                        "{}",
+                        json!({"id":request["id"],"result":{"data":[],"nextCursor":null}})
+                    );
+                    io::stdout().flush().unwrap();
+                    continue;
+                }
+                if setup["mode"] == "desktop" {
+                    println!(
+                        "{}",
+                        json!({"id":request["id"],"result":{"data":[{"id":live["turn"],"status":if live["status"]=="inProgress" {json!("interrupted")}else{live["status"].clone()},"items":[]}],"nextCursor":null}})
+                    );
+                    io::stdout().flush().unwrap();
+                    continue;
+                }
+                let second = request["params"]["cursor"] == "page-2";
+                json!({"data":[{"id":if second {"turn-2"}else{"turn-1"},"status":"completed","items":[]}],"nextCursor":if second {Value::Null}else{json!("page-2")}})
+            }
+            "thread/items/list" => {
+                assert_eq!(request["params"]["limit"], 1);
+                if setup["mode"] == "images" {
+                    let n = request["params"]["cursor"]
+                        .as_str()
+                        .unwrap_or("0")
+                        .parse::<usize>()
+                        .unwrap();
+                    println!(
+                        "{}",
+                        json!({"id":request["id"],"result":{
+                        "data":[{"turnId":"turn-1","item":{"id":format!("image-{n}"),"type":"imageGeneration","result":"x".repeat(3*1024*1024)}}],
+                        "nextCursor":if n < 3 {json!((n+1).to_string())} else {Value::Null}}})
+                    );
+                    io::stdout().flush().unwrap();
+                    continue;
+                }
+                if setup["mode"] == "desktop" {
+                    println!(
+                        "{}",
+                        json!({"id":request["id"],"result":{"data":[{"turnId":live["turn"],"completedAtMs":if live["status"]=="completed"{json!(10)}else{Value::Null},"item":{"id":"reply","type":"agentMessage","text":"OWNER_REPLY"}}],"nextCursor":null}})
+                    );
+                    io::stdout().flush().unwrap();
+                    continue;
+                }
+                if setup["mode"] == "changed" {
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(setup["path"].as_str().unwrap())
+                        .unwrap()
+                        .write_all(b"{}\n")
+                        .unwrap();
+                }
+                let second = request["params"]["cursor"] == "items-2";
+                json!({"data":[{"item":{"id":if second {"message-2"}else{"message-1"},"type":"agentMessage","text":"Synthetic saved history"}}],"nextCursor":if second && setup["mode"]!="cycle" {Value::Null}else{json!("items-2")}})
+            }
+            _ => panic!("Ownership or unsupported operation sent to saved-history reader"),
+        };
+        println!("{}", json!({"id":request["id"],"result":result}));
+        io::stdout().flush().unwrap();
+    }
+}
