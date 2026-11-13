@@ -161,15 +161,15 @@ pub fn translate(
             }
             let mut selected_port = None;
             let mut selected_config = None;
-            let mut pairs = rest.chunks_exact(2);
-            for pair in &mut pairs {
+            let (pairs, remainder) = rest.as_chunks::<2>();
+            for pair in pairs {
                 match pair {
                     ["--port", p] if selected_port.is_none() && port(p) => selected_port = Some(*p),
                     ["--config", file] if *op == "onboard" && selected_config.is_none() => selected_config = Some(path(file)?),
                     _ => return Err("Usage: rmx start [--port PORT] | onboard [--port PORT] [--config FILE]; dashboard ports are 1–65530".into()),
                 }
             }
-            if !pairs.remainder().is_empty() {
+            if !remainder.is_empty() {
                 return Err("Installation option needs a value".into());
             }
             let mut out = if kind == InstallationKind::Legacy {
