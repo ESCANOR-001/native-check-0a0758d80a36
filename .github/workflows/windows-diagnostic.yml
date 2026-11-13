@@ -60,7 +60,8 @@ jobs:
           path: opencodex-runtime/experiments/rust-connect/target
           key: native-v2-${{ matrix.os }}-${{ runner.arch }}-1.98.0-${{ hashFiles('**/Cargo.lock') }}-${{ github.sha }}
           restore-keys: native-v2-${{ matrix.os }}-${{ runner.arch }}-1.98.0-${{ hashFiles('**/Cargo.lock') }}-
-      - name: Run desktop fixtures
-        run: |
-          cargo test --locked --lib claude_local::windows::tests -- --test-threads=1 --show-output
-          cargo test --locked --lib shared_files::tests -- --test-threads=1 --show-output
+      - name: Check Windows callback ownership
+        run: cargo test --locked --lib claude_local::windows::tests -- --test-threads=1 --show-output
+      - name: Check Windows file links
+        if: success() || failure()
+        run: cargo test --locked --lib shared_files::tests -- --test-threads=1 --show-output
