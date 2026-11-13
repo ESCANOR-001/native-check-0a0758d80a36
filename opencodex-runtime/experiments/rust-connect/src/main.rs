@@ -228,8 +228,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let root = PathBuf::from(&args[3]);
         let gui = PathBuf::from(&args[4]);
         let (mut port, mut config) = (None, None);
-        let mut options = args[5..].chunks_exact(2);
-        for pair in &mut options {
+        let (options, remainder) = args[5..].as_chunks::<2>();
+        for pair in options {
             match pair[0].as_str() {
                 "--port" if port.is_none() => {
                     port = Some(
@@ -244,7 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => return Err("Unknown or repeated native installation option".into()),
             }
         }
-        if !options.remainder().is_empty() {
+        if !remainder.is_empty() {
             return Err("Native installation option needs a value".into());
         }
         if operation == "onboard" {
