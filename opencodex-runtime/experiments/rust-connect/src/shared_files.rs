@@ -85,7 +85,32 @@ fn local_path(workspace: &Path, target: &str) -> Option<PathBuf> {
 fn links_file(text: &str, workspace: &Path, requested: &Path) -> bool {
     Parser::new(text).any(|event| match event {
         Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) => {
-            local_path(workspace, &dest_url).as_deref() == Some(requested)
+            local_path(workspace, &dest_url).is_some_and(|linked| {
+                if linked == requested {
+                    return true;
+                }
+                #[cfg(windows)]
+                {
+                    // Windows can report one local directory as both RUNNER~1
+                    // and runneradmin. Resolve both spellings to the same exact
+                    // file; never grant another file merely for sharing a name.
+                    // Only disk paths enter this fallback, avoiding network or
+                    // device namespace lookups while inspecting message links.
+                    let disk = |path: &Path| {
+                        matches!(path.components().next(),
+                        Some(Component::Prefix(prefix)) if matches!(prefix.kind(),
+                            std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)))
+                    };
+                    if disk(&linked) && disk(requested) {
+                        return linked
+                            .canonicalize()
+                            .ok()
+                            .zip(requested.canonicalize().ok())
+                            .is_some_and(|(linked, requested)| linked == requested);
+                    }
+                }
+                false
+            })
         }
         _ => false,
     })
@@ -226,6 +251,17 @@ mod tests {
                 .resolve_shared_file("chat", &workspace, sibling.to_str().unwrap())
                 .unwrap(),
             None
+        );
+        let other_directory = dir.path().join("not-shared");
+        std::fs::create_dir(&other_directory).unwrap();
+        let same_name = other_directory.join(file.file_name().unwrap());
+        std::fs::write(&same_name, b"private").unwrap();
+        assert_eq!(
+            store
+                .resolve_shared_file("chat", &workspace, same_name.to_str().unwrap())
+                .unwrap(),
+            None,
+            "matching filenames must not authorize a different file"
         );
     }
 
