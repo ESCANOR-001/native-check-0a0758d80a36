@@ -14,6 +14,11 @@ use tokio::io::AsyncWriteExt;
 const VERSION: &str = "2026.8.3";
 const MAX_BYTES: u64 = 200 * 1024 * 1024;
 const FAILED: &str = "cloudflared_unavailable";
+fn unavailable(_stage: &str, _error: impl std::fmt::Debug) -> &'static str {
+    #[cfg(test)]
+    eprintln!("Pinned helper {_stage} failed: {_error:?}");
+    FAILED
+}
 #[derive(Clone, Copy)]
 struct Release {
     name: &'static str,
@@ -217,7 +222,10 @@ async fn download(
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options.open(path).await.map_err(|_| FAILED)?;
+    let mut file = options
+        .open(path)
+        .await
+        .map_err(|e| unavailable("create download", e))?;
     let mut stream = response.bytes_stream();
     let mut hash = Sha256::new();
     let mut total = 0u64;
@@ -231,10 +239,16 @@ async fn download(
             return Err("download_failed");
         }
         hash.update(&chunk);
-        file.write_all(&chunk).await.map_err(|_| FAILED)?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| unavailable("write download", e))?;
     }
-    file.flush().await.map_err(|_| FAILED)?;
-    file.sync_all().await.map_err(|_| FAILED)?;
+    file.flush()
+        .await
+        .map_err(|e| unavailable("flush download", e))?;
+    file.sync_all()
+        .await
+        .map_err(|e| unavailable("sync download", e))?;
     if total == 0 || format!("{:x}", hash.finalize()) != sha256 {
         return Err("invalid_checksum");
     }
@@ -282,9 +296,9 @@ pub(crate) async fn resolve(executable: &Path, directory: &Path) -> Result<PathB
     let mut parent = directory.to_owned();
     for component in ["tools", "cloudflared", VERSION] {
         parent.push(component);
-        crate::private_directory::prepare(&parent).map_err(|_| FAILED)?;
+        crate::private_directory::prepare(&parent).map_err(|e| unavailable("prepare parent", e))?;
     }
-    clear_interrupted_installs(&parent).map_err(|_| FAILED)?;
+    clear_interrupted_installs(&parent).map_err(|e| unavailable("clean staging", e))?;
     let target = executable.parent().ok_or(FAILED)?.to_owned();
     if target.try_exists().map_err(|_| FAILED)? {
         let path = tokio::task::spawn_blocking(move || cached(&target, release))
@@ -295,7 +309,8 @@ pub(crate) async fn resolve(executable: &Path, directory: &Path) -> Result<PathB
         return Ok(path);
     }
     let temporary = Temporary(parent.join(format!(".install-{}", uuid::Uuid::new_v4())));
-    crate::private_directory::prepare(&temporary.0).map_err(|_| FAILED)?;
+    crate::private_directory::prepare(&temporary.0)
+        .map_err(|e| unavailable("prepare staging", e))?;
     let downloaded = temporary.0.join(if release.archive {
         "release.tgz"
     } else {
@@ -344,7 +359,7 @@ pub(crate) async fn resolve(executable: &Path, directory: &Path) -> Result<PathB
     if target.symlink_metadata().is_ok() {
         return Err(FAILED);
     }
-    fs::rename(&temporary.0, &target).map_err(|_| FAILED)?;
+    fs::rename(&temporary.0, &target).map_err(|e| unavailable("publish verified helper", e))?;
     #[cfg(unix)]
     crate::storage_stage::open(&parent, true)
         .and_then(|f| f.sync_all())
