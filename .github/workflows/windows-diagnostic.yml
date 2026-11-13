@@ -60,8 +60,20 @@ jobs:
           path: opencodex-runtime/experiments/rust-connect/target
           key: native-v2-${{ matrix.os }}-${{ runner.arch }}-1.98.0-${{ hashFiles('**/Cargo.lock') }}-${{ github.sha }}
           restore-keys: native-v2-${{ matrix.os }}-${{ runner.arch }}-1.98.0-${{ hashFiles('**/Cargo.lock') }}-
-      - name: Check Windows callback ownership
-        run: cargo test --locked --lib claude_local::windows::tests -- --test-threads=1 --show-output
-      - name: Check Windows file links
+      - name: Inspect pinned helper execution
+        shell: pwsh
+        run: |
+          $helper = Join-Path $env:RUNNER_TEMP 'cloudflared-check.exe'
+          Invoke-WebRequest 'https://github.com/cloudflare/cloudflared/releases/download/2026.8.3/cloudflared-windows-amd64.exe' -OutFile $helper
+          if ((Get-FileHash -LiteralPath $helper -Algorithm SHA256).Hash -ne '83e726ed18ea78c5ad5213c4c3a3a27051393950d2bc8ed4de69bec12d14eaae') { throw 'Helper checksum mismatch' }
+          $stdout = Join-Path $env:RUNNER_TEMP 'helper.stdout'
+          $stderr = Join-Path $env:RUNNER_TEMP 'helper.stderr'
+          $check = Start-Process -FilePath $helper -ArgumentList '--version' -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          if (-not $check.WaitForExit(15000)) { $check.Kill(); throw 'Helper version timeout' }
+          Get-Content -LiteralPath $stdout
+          Get-Content -LiteralPath $stderr
+          Write-Output "Helper exit code: $($check.ExitCode)"
+          if ($check.ExitCode -ne 0) { throw 'Helper execution failed' }
+      - name: Check managed helper installation
         if: success() || failure()
-        run: cargo test --locked --lib shared_files::tests -- --test-threads=1 --show-output
+        run: cargo test --locked --lib cloudflared::tests::pinned_platform_helper_installs_and_reuses_verified_cache -- --exact --ignored --show-output
