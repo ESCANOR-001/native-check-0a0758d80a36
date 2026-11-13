@@ -214,7 +214,10 @@ mod tests {
                     file.canonicalize().unwrap().to_str().unwrap()
                 )
                 .unwrap(),
-            Some(file.canonicalize().unwrap())
+            Some(file.canonicalize().unwrap()),
+            "link={target:?}; parsed link={:?}; parsed canonical request={:?}",
+            local_path(&workspace, target),
+            local_path(&workspace, file.canonicalize().unwrap().to_str().unwrap())
         );
         let sibling = dir.path().join("private.txt");
         std::fs::write(&sibling, b"private").unwrap();

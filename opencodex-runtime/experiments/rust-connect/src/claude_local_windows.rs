@@ -253,7 +253,9 @@ fn private_descriptor() -> io::Result<LocalAllocation> {
     let sid_text = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_string, len) })
         .map_err(|_| denied())?;
     drop(sid_guard);
-    let sddl: Vec<u16> = format!("D:P(A;;GA;;;{sid_text})")
+    // Elevated tokens can default new files to the Administrators group owner.
+    // Set this user's ownership explicitly, matching private_key's strict check.
+    let sddl: Vec<u16> = format!("O:{sid_text}D:P(A;;GA;;;{sid_text})")
         .encode_utf16()
         .chain(Some(0))
         .collect();
