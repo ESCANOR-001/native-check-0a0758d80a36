@@ -359,13 +359,25 @@ async fn silent_disconnected_sockets_release_capacity_but_live_phones_remain_con
         let router = router.clone();
         let token = token.clone();
         async move {
-            let (_, ticket) = request(router, "/api/auth/websocket-ticket", Some(&token), Some(String::new())).await;
-            tokio_tungstenite::connect_async(format!("ws://{address}/ws?wsTicket={}", ticket["ticket"].as_str().unwrap())).await
+            let (_, ticket) = request(
+                router,
+                "/api/auth/websocket-ticket",
+                Some(&token),
+                Some(String::new()),
+            )
+            .await;
+            tokio_tungstenite::connect_async(format!(
+                "ws://{address}/ws?wsTicket={}",
+                ticket["ticket"].as_str().unwrap()
+            ))
+            .await
         }
     };
     let (mut live, _) = connect().await.unwrap();
     let mut silent = Vec::new();
-    for _ in 0..7 { silent.push(connect().await.unwrap().0); }
+    for _ in 0..7 {
+        silent.push(connect().await.unwrap().0);
+    }
     assert!(connect().await.is_err());
     // These sockets deliberately stop reading, like a phone whose network has
     // disappeared without a TCP close. The healthy but idle phone answers only
@@ -381,19 +393,44 @@ async fn silent_disconnected_sockets_release_capacity_but_live_phones_remain_con
             _ => panic!("An idle healthy phone received an unexpected frame"),
         }
     }
-    assert!(pongs >= 3, "An idle phone must receive periodic liveness checks");
-    live.send(Message::Text(json!({"id":"still-live","method":"server.getConfig","params":{}}).to_string().into())).await.unwrap();
+    assert!(
+        pongs >= 3,
+        "An idle phone must receive periodic liveness checks"
+    );
+    live.send(Message::Text(
+        json!({"id":"still-live","method":"server.getConfig","params":{}})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
     loop {
-        let frame = tokio::time::timeout(Duration::from_secs(2), live.next()).await.unwrap().unwrap().unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(2), live.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         if let Message::Ping(payload) = frame {
             live.send(Message::Pong(payload)).await.unwrap();
         } else if let Message::Text(text) = frame {
-            assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["id"], "still-live");
+            assert_eq!(
+                serde_json::from_str::<Value>(&text).unwrap()["id"],
+                "still-live"
+            );
             break;
-        } else { panic!("A healthy phone was disconnected"); }
+        } else {
+            panic!("A healthy phone was disconnected");
+        }
     }
     let mut replacements = Vec::new();
-    for _ in 0..7 { replacements.push(connect().await.expect("Silent sockets must release their allowances").0); }
+    for _ in 0..7 {
+        replacements.push(
+            connect()
+                .await
+                .expect("Silent sockets must release their allowances")
+                .0,
+        );
+    }
     // Cleanup must preserve the original per-phone bound.
     assert!(connect().await.is_err());
     server.abort();

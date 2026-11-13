@@ -614,7 +614,11 @@ fn host(
             WS_POPUP
         };
         let hwnd = CreateWindowExW(
-            if cfg!(feature = "tray-test-controls") { 0 } else { WS_EX_TOOLWINDOW },
+            if cfg!(feature = "tray-test-controls") {
+                0
+            } else {
+                WS_EX_TOOLWINDOW
+            },
             class.as_ptr(),
             title.as_ptr(),
             style,
