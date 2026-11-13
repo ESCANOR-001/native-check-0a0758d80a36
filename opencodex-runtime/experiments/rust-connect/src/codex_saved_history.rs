@@ -1140,6 +1140,7 @@ mod tests {
                 json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":child_id,"turn_id":"child-turn","item":{"type":"UserMessage","id":"child-user","content":[{"type":"text","text":"child question"}]}}}),
                 json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"child-turn","started_at":200,"completed_at":201}}),
             ];
+            let revision = std::cell::Cell::new(0u64);
             let write = |rows: &mut Vec<Value>| {
                 let mut out = vec![];
                 for (n, row) in rows.iter_mut().enumerate() {
@@ -1152,6 +1153,19 @@ mod tests {
                     zstd::stream::encode_all(out.as_slice(), 1).unwrap(),
                 )
                 .unwrap();
+                // Each fixture rewrite is a distinct history revision. Rapid
+                // same-size writes can share a filesystem timestamp on a VM;
+                // do not make cache invalidation depend on clock resolution.
+                revision.set(revision.get() + 1);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(child.with_extension("jsonl.zst"))
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(
+                        std::time::UNIX_EPOCH
+                            + std::time::Duration::from_secs(1_700_000_000 + revision.get()),
+                    ))
+                    .unwrap();
             };
             write(&mut rows);
             let page = page_sync(
