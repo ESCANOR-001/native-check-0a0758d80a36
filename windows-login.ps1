@@ -144,13 +144,25 @@ exit `$LASTEXITCODE
     if ($records.Count -ne 1) { throw 'Expected exactly one Remodex login registration' }
     $productTask = $records[0].TaskName
     [xml]$definition = Export-ScheduledTask -TaskName $productTask
-    if ($null -eq $definition.Task.Triggers.LogonTrigger -or $definition.Task.Triggers.LogonTrigger.Enabled -ne 'true') {
+    # Task Scheduler may omit Enabled when it has the default value true.
+    $trigger = $definition.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Triggers']/*[local-name()='LogonTrigger']")
+    $enabledValue = if ($trigger) { $trigger.SelectSingleNode("*[local-name()='Enabled']") }
+    if ($null -eq $trigger -or ($enabledValue -and $enabledValue.InnerText -eq 'false') -or $records[0].State -eq 'Disabled') {
         throw 'The Remodex trigger is missing or disabled'
     }
     $before = Refresh-QaRegistration $productTask
     Unregister-ScheduledTask -TaskName $bootstrap -Confirm:$false
     Write-Host 'Interactive Yes registered one enabled Windows logon trigger.'
 
+    $env:OPENCODEX_HOME = "$qa\state"
+    $env:REMODEX_GUI_DIR = "$qa\gui"
+    $stop = Start-Process -FilePath "$qa\rmx.exe" -ArgumentList 'stop' -WindowStyle Hidden -PassThru -Wait `
+        -RedirectStandardOutput "$qa\stop.json" -RedirectStandardError "$qa\stop.err"
+    if ($stop.ExitCode -ne 0) {
+        Get-Content "$qa\stop.err" -Tail 20
+        throw 'The first Remodex process did not stop cleanly'
+    }
+    if (Get-QaHealth ($port+5)) { throw 'The initial server still responded after stopping it' }
     Close-QaDesktop
     $null = Wait-ForCondition 'the original Windows server to go offline after sign-out' 50 {
         -not (Get-QaHealth ($port+5)) -and -not (Get-Process -Id $initial.initialPid -ErrorAction SilentlyContinue)
@@ -186,6 +198,7 @@ exit `$LASTEXITCODE
         answeredYes = $true
         firstInteractiveSession = $firstLogin
         signedOutAndServerStopped = $true
+        initialServerStoppedBeforeLogout = $true
         secondInteractiveSession = $secondLogin
         startup = 'Task Scheduler logon trigger'
         newServiceRun = ($after.LastRun -gt $before.LastRun)
