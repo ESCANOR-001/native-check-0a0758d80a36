@@ -21,12 +21,12 @@ jobs:
           defaults write com.apple.controlcenter 'NSStatusItem Visible UserSwitcher' -bool YES
           killall ControlCenter || true
           sleep 4
-          osascript <<'APPLESCRIPT'
+          osascript <<'APPLESCRIPT' || true
           tell application "System Events" to tell process "ControlCenter"
-            set button to (first menu bar item of menu bar 1 whose description is "User")
-            log (position of button)
-            log (size of button)
-            click button
+            set menuButton to (first menu bar item of menu bar 1 whose description is "User")
+            log (position of menuButton)
+            log (size of menuButton)
+            click menuButton
             delay 1
             log (count of windows)
             log (get entire contents of window 1)
@@ -50,7 +50,8 @@ jobs:
           end tell
           APPLESCRIPT
           /usr/sbin/screencapture -x "$RUNNER_TEMP/macos-test-screen.png"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: test-account-switcher
           path: ${{ runner.temp }}/macos-test-screen.png
