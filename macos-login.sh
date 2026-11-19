@@ -107,18 +107,9 @@ sign_in() {
 on_login_window() { case "$(console_user)" in root|loginwindow) return 0 ;; *) return 1 ;; esac; }
 sign_out() {
     test_console_is_qa
-    cat > "$control_dir/signout.plist" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>com.remodex.qa.signout</string>
-<key>ProgramArguments</key><array><string>/bin/launchctl</string><string>reboot</string><string>logout</string></array>
-<key>RunAtLoad</key><true/>
-</dict></plist>
-PLIST
-    # The launcher runs inside the test user's GUI domain, so a caller-
-    # relative logout cannot target the GitHub runner's own session.
-    sudo launchctl bootstrap "gui/$qa_uid" "$control_dir/signout.plist"
+    # Target the disposable user's GUI login domain explicitly. The runner's
+    # own separate login remains connected while the test signs back in.
+    sudo launchctl bootout "gui/$qa_uid"
 }
 test_console_is_qa() { [ "$(console_user)" = "$qa_user" ] && has_gui; }
 as_qa() { sudo launchctl asuser "$qa_uid" sudo -n -H -u "$qa_user" "$@"; }
@@ -126,7 +117,7 @@ health() {
     [[ "$(curl --noproxy '*' --silent --max-time 2 "http://127.0.0.1:$((port+5))/healthz" || true)" = *'"status":"running"'* ]]
 }
 app_gone() {
-    ! has_gui && ! health && ! ps -p "$original_pid" -o pid= >/dev/null 2>&1
+    ! has_gui && [ "$(console_user)" != "$qa_user" ] && ! health && ! ps -p "$original_pid" -o pid= >/dev/null 2>&1
 }
 # Record an OS login boundary, then start onboarding once from that login.
 if has_gui; then
