@@ -4,7 +4,13 @@ $installer = @(Get-ChildItem (Join-Path $BundleDir 'nsis') -Filter '*-setup.exe'
 if ($installer.Count -ne 1) { throw 'Expected one Windows NSIS installer' }
 $destination = Join-Path $env:SystemDrive 'remodex-desktop-qa'
 if (Test-Path $destination) { throw 'The isolated desktop install directory is occupied' }
-$process = Start-Process -FilePath $installer[0].FullName -ArgumentList @('/S', "/D=$destination") -WindowStyle Hidden -Wait -PassThru
+# The installer starts the desktop shell. Wait on the installer PID only,
+# since Start-Process -Wait also waits on that long-running child's tree.
+$process = Start-Process -FilePath $installer[0].FullName -ArgumentList @('/S', "/D=$destination") -WindowStyle Hidden -PassThru
+if (-not $process.WaitForExit(90000)) {
+    Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
+    throw 'The desktop installer did not finish within 90 seconds'
+}
 if ($process.ExitCode -ne 0) { throw "Desktop installer exited with $($process.ExitCode)" }
 try {
     if (-not (Test-Path "$destination\remodex.exe" -PathType Leaf)) { throw 'Installed application missing' }
@@ -14,7 +20,11 @@ try {
     Get-Process remodex -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -eq "$destination\remodex.exe" } | Stop-Process
     if (Test-Path "$destination\uninstall.exe" -PathType Leaf) {
-        $removed = Start-Process -FilePath "$destination\uninstall.exe" -ArgumentList '/S' -WindowStyle Hidden -Wait -PassThru
+        $removed = Start-Process -FilePath "$destination\uninstall.exe" -ArgumentList '/S' -WindowStyle Hidden -PassThru
+        if (-not $removed.WaitForExit(90000)) {
+            Stop-Process -Id $removed.Id -ErrorAction SilentlyContinue
+            throw 'The desktop uninstaller did not finish within 90 seconds'
+        }
         if ($removed.ExitCode -ne 0) { throw "Desktop uninstaller exited with $($removed.ExitCode)" }
     }
 }
