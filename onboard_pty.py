@@ -11,6 +11,7 @@ import time
 root = Path(sys.argv[1]).resolve()
 binary = root / ("rmx.exe" if os.name == "nt" else "rmx")
 dashboard_port = int(sys.argv[2])
+os.chdir(root)
 test_state = root / "state"
 test_gui = root / "gui"
 test_gui.mkdir(exist_ok=True)

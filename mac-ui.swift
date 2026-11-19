@@ -38,7 +38,6 @@ case "tab": key(48)
 case "down": key(125)
 case "return": key(36)
 case "escape": key(53)
-case "logout": key(12, [.maskShift, .maskAlternate, .maskCommand])
 case "read-screen":
     let request = VNRecognizeTextRequest()
     request.recognitionLevel = .accurate

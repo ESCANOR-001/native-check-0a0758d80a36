@@ -22,8 +22,8 @@ qa_uid="$(id -u "$qa_user")"
 qa_home="$(dscl . -read "/Users/$qa_user" NFSHomeDirectory | cut -d' ' -f2-)"
 cleanup() {
     # The test changes only the disposable VM and its separate QA user.
-    if [ "$(stat -f '%Su' /dev/console)" = "$qa_user" ] && [ -x "$ui" ]; then
-        sudo launchctl asuser "$qa_uid" sudo -n -H -u "$qa_user" "$ui" logout || true
+    if [ "$(stat -f '%Su' /dev/console)" = "$qa_user" ]; then
+        sudo launchctl bootout "gui/$qa_uid" >/dev/null 2>&1 || true
     fi
 }
 trap cleanup EXIT
@@ -56,9 +56,12 @@ wait_for() {
     done
 }
 take_screen() {
-    /usr/sbin/screencapture -x "$display_file" 2>/dev/null ||
-        sudo /usr/sbin/screencapture -x "$display_file"
-    "$ui" read-screen "$display_file"
+    local window_pid
+    window_pid="$(pgrep -u 0 -x loginwindow | tail -1 || true)"
+    if [ -n "$window_pid" ]; then
+        sudo launchctl bsexec "$window_pid" /usr/sbin/screencapture -x "$display_file" 2>/dev/null || true
+    fi
+    if [ -f "$display_file" ]; then sudo "$ui" read-screen "$display_file"; fi
 }
 use_switcher() {
     osascript <<'APPLESCRIPT'
@@ -77,30 +80,45 @@ click_text() {
 sign_in() {
     if [ "$(console_user)" = "$runner_user" ]; then
         use_switcher
-        sleep 3
-        printf '%s\n' "$qa_password" | "$ui" type
-        "$ui" return
-    else
-        # The post-logout view is the actual system login window. It may show
-        # the account list or the name/password form depending on the image.
+        wait_for 'the selected test account password screen' 18 on_login_window
+        # WindowServer has already switched sessions when /dev/console reports
+        # the login window. Allow the secure input field to take keyboard focus.
+        sleep 8
+    elif on_login_window; then
+        sleep 6
         local screen_text
         screen_text="$(take_screen)"
         if [[ "$screen_text" = *'Remodex QA'* || "$screen_text" = *'Remodex'* ]]; then
             click_text 'Remodex'
-            sleep 1
-        elif [[ "$screen_text" = *'Name'* ]]; then
-            click_text 'Name'
+            sleep 2
+        else
+            if [[ "$screen_text" = *'Name'* ]]; then click_text 'Name'; fi
             printf '%s\n' "$qa_user" | "$ui" type
             "$ui" tab
-        else
-            echo 'The post-logout login window did not expose the test account or its name field' >&2
-            printf '%s\n' "$screen_text"
-            return 1
         fi
-        printf '%s\n' "$qa_password" | "$ui" type
-        "$ui" return
+    else
+        echo "Unexpected console user $(console_user)" >&2
+        return 1
     fi
+    printf '%s\n' "$qa_password" | "$ui" type
+    "$ui" return
     wait_for 'a new macOS desktop session for the QA account' 55 test_console_is_qa
+}
+on_login_window() { case "$(console_user)" in root|loginwindow) return 0 ;; *) return 1 ;; esac; }
+sign_out() {
+    test_console_is_qa
+    cat > "$control_dir/signout.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.remodex.qa.signout</string>
+<key>ProgramArguments</key><array><string>/bin/launchctl</string><string>reboot</string><string>logout</string></array>
+<key>RunAtLoad</key><true/>
+</dict></plist>
+PLIST
+    # The launcher runs inside the test user's GUI domain, so a caller-
+    # relative logout cannot target the GitHub runner's own session.
+    sudo launchctl bootstrap "gui/$qa_uid" "$control_dir/signout.plist"
 }
 test_console_is_qa() { [ "$(console_user)" = "$qa_user" ] && has_gui; }
 as_qa() { sudo launchctl asuser "$qa_uid" sudo -n -H -u "$qa_user" "$@"; }
@@ -131,9 +149,9 @@ label="$(sudo /usr/libexec/PlistBuddy -c 'Print :Label' "$plist")"
 echo 'Interactive Yes registered one macOS LaunchAgent with RunAtLoad.'
 health
 
-as_qa "$ui" logout
+sign_out
 wait_for 'the macOS GUI domain and initial server to exit' 50 app_gone
-echo 'macOS signed out and the original server exited.'
+echo "macOS signed out and the original server exited. Console user $(console_user)."
 
 sign_in
 # No onboarding or service-start call from this point. The new GUI domain
