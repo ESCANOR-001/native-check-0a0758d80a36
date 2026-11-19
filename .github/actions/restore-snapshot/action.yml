@@ -11,13 +11,13 @@ runs:
       working-directory: ${{ github.workspace }}
       env:
         REMODEX_DESKTOP_QA_SNAPSHOT_KEY: ${{ inputs.key }}
-      run: node unseal.mjs "$RUNNER_TEMP/qa-source.tar.gz"
+      run: node unseal.mjs "./qa-source.tar.gz"
     - shell: bash
       working-directory: ${{ github.workspace }}
       run: |
         mkdir snapshot
-        tar -xzf "$RUNNER_TEMP/qa-source.tar.gz" -C snapshot
-        rm "$RUNNER_TEMP/qa-source.tar.gz"
+        tar -xzf "./qa-source.tar.gz" -C snapshot
+        rm "./qa-source.tar.gz"
         git -C snapshot init -q --initial-branch=dev
         git -C snapshot config core.longpaths true
         git -C snapshot config core.autocrlf false
