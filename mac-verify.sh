@@ -4,6 +4,7 @@ set -euo pipefail
 qa_user=remodexqa
 qa_password="qa$(openssl rand -hex 16)"
 qa_tmp="$(mktemp -d /private/tmp/remodex-switch-probe.XXXXXX)"
+chmod 755 "$qa_tmp"
 ui="$qa_tmp/ui"
 echo "::add-mask::$qa_password"
 sudo sysadminctl -addUser "$qa_user" -fullName 'Remodex QA User' -password "$qa_password"
@@ -36,7 +37,13 @@ for retry in {1..25}; do
     fi
     sleep 1
 done
-sleep 4
+for retry in {1..35}; do
+    if ! sudo launchctl print "gui/$qa_uid" >/dev/null 2>&1; then
+        echo "Confirmed that the test account signed out and its GUI domain ended."
+        break
+    fi
+    sleep 1
+done
 printf 'After sign-out attempt, console user %s\n' "$(stat -f %Su /dev/console)"
 sudo /usr/sbin/screencapture -x "$RUNNER_TEMP/macos-test-after.png" || true
 if test -f "$RUNNER_TEMP/macos-test-after.png"; then "$ui" read-screen "$RUNNER_TEMP/macos-test-after.png"; fi
