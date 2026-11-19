@@ -163,9 +163,12 @@ jobs:
         if: ${{ !cancelled() && steps.architecture.outcome == 'success' }}
         working-directory: snapshot/opencodex-runtime/experiments/relay-client
         run: cargo test --locked --all-targets --no-fail-fast -- --test-threads=1
-      - name: Verify unprivileged Windows and macOS native package scripts
+      - name: Native launcher verification
         if: ${{ !cancelled() && steps.architecture.outcome == 'success' }}
-        run: node --test npm/launcher.test.mjs npm/build.test.mjs
+        run: node --test npm/launcher.test.mjs
+      - name: Native package builder verification
+        if: ${{ !cancelled() && steps.architecture.outcome == 'success' && (matrix.os == 'windows-2025' || matrix.os == 'macos-15') }}
+        run: node --test npm/build.test.mjs
       - name: Download and verify the pinned tunnel helper
         if: ${{ !cancelled() && steps.architecture.outcome == 'success' }}
         run: cargo test --locked --lib cloudflared::tests::pinned_platform_helper_installs_and_reuses_verified_cache -- --exact --ignored
