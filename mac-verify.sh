@@ -103,18 +103,8 @@ sign_in() {
 on_login_window() { case "$(console_user)" in root|loginwindow) return 0 ;; *) return 1 ;; esac; }
 sign_out() {
     test_console_is_qa
-    cat > "$control_dir/signout.plist" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>com.remodex.qa.signout</string>
-<key>ProgramArguments</key><array><string>/bin/launchctl</string><string>reboot</string><string>logout</string></array>
-<key>RunAtLoad</key><true/>
-</dict></plist>
-PLIST
-    # The launcher runs inside the test user's GUI domain, so a caller-
-    # relative logout cannot target the GitHub runner's own session.
-    sudo launchctl bootstrap "gui/$qa_uid" "$control_dir/signout.plist"
+    sudo launchctl bootout "gui/$qa_uid"
+    echo "Requested teardown of the isolated GUI login domain."
 }
 test_console_is_qa() { [ "$(console_user)" = "$qa_user" ] && has_gui; }
 as_qa() { sudo launchctl asuser "$qa_uid" sudo -n -H -u "$qa_user" "$@"; }
@@ -129,7 +119,11 @@ test_session_gone() { ! has_gui && [ "$(console_user)" != "$qa_user" ]; }
 sign_in
 echo "Actual macOS sign-in 1: $(console_user)"
 sign_out
-wait_for 'the first macOS GUI domain to finish' 45 test_session_gone
+wait_for 'the first macOS GUI domain to finish' 40 test_session_gone || {
+    printf 'Console owner after teardown: %s\n' "$(console_user)"
+    has_gui && echo 'QA GUI domain remains present'
+    exit 1
+}
 echo "Actual macOS sign-out completed. Console user $(console_user)."
 sign_in
 echo "Actual macOS sign-in 2: $(console_user)"
