@@ -103,6 +103,11 @@ try {
     Copy-Item (Join-Path $PSScriptRoot 'onboard_pty.py') $qa
     & $python -m pip install --disable-pip-version-check --only-binary ':all:' --no-deps --target "$qa\python-packages" 'pywinpty==3.1.2'
     if ($LASTEXITCODE -ne 0) { throw 'Could not prepare Windows pseudoterminal' }
+    # pip can move package files from the runner admin's temporary directory.
+    # Grant the separate desktop test user access after those files exist.
+    & "$sys\icacls.exe" "$qa\python-packages" /grant "${userSpec}:(OI)(CI)RX" /T /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not grant read access to the pseudoterminal module' }
+
     # The test starts this one-shot task only for the first session.
     # It has no trigger, so it cannot run onboarding at the next sign-in.
     $port = 27130
@@ -121,7 +126,14 @@ exit `$LASTEXITCODE
     Register-ScheduledTask -TaskName $bootstrap -Action $action -Principal $principal | Out-Null
     Start-ScheduledTask -TaskName $bootstrap
     try {
-        $null = Wait-ForCondition 'Yes at the real rmx onboard prompt' 130 { Test-Path "$qa\onboard-result.json" }
+        $null = Wait-ForCondition 'Yes at the real rmx onboard prompt' 165 {
+            if (Test-Path "$qa\onboard-result.json") { return $true }
+            if ((Test-Path "$qa\harness.log") -and (Get-ScheduledTask -TaskName $bootstrap).State -eq 'Ready') {
+                $code = (Get-ScheduledTaskInfo -TaskName $bootstrap).LastTaskResult
+                if ($code -ne 0) { throw "The interactive onboarding harness exited with $code" }
+            }
+            return $false
+        }
     } catch {
         foreach ($file in @('harness.log', 'onboard.log')) { if (Test-Path "$qa\$file") { Get-Content "$qa\$file" -Tail 55 } }
         throw
