@@ -1,0 +1,25 @@
+name: Restore isolated test source
+description: Restore the content-addressed desktop test snapshot inside the disposable runner
+inputs:
+  key:
+    required: true
+    description: The disposable environment key for the encrypted snapshot
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        REMODEX_DESKTOP_QA_SNAPSHOT_KEY: ${{ inputs.key }}
+      run: node unseal.mjs "$RUNNER_TEMP/qa-source.tar.gz"
+    - shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        mkdir snapshot
+        tar -xzf "$RUNNER_TEMP/qa-source.tar.gz" -C snapshot
+        rm "$RUNNER_TEMP/qa-source.tar.gz"
+        git -C snapshot init -q --initial-branch=dev
+        git -C snapshot config core.longpaths true
+        git -C snapshot config core.autocrlf false
+        git -C snapshot add -f .
+        git -C snapshot -c user.name='Remodex QA' -c user.email='remodex-qa@example.invalid' -c commit.gpgsign=false commit -qm 'Assemble immutable test checkout'
