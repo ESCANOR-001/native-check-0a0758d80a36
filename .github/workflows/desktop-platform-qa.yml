@@ -1,4 +1,4 @@
-name: Verify corrected Rust npm platform metadata
+name: Verify Rust npm installation and bin links
 on:
   push:
     branches: [codex/desktop-platform-qa-20261119]
