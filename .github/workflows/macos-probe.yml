@@ -1,0 +1,57 @@
+name: macOS sign-in test controls
+on:
+  push:
+    branches: [codex/onboard-login-macos-probe-20261119]
+permissions:
+  contents: read
+jobs:
+  menu:
+    runs-on: macos-15
+    timeout-minutes: 6
+    steps:
+      - name: Inspect the test account switcher
+        shell: bash
+        run: |
+          qa_password="RmX$(openssl rand -hex 12)"
+          echo "::add-mask::$qa_password"
+          sudo sysadminctl -addUser remodexqa -fullName 'Remodex QA User' -password "$qa_password"
+          sudo defaults write /Library/Preferences/com.apple.loginwindow SHOWFULLNAME -bool YES
+          sudo defaults write /Library/Preferences/.GlobalPreferences MultipleSessionEnabled -bool YES
+          defaults -currentHost write com.apple.controlcenter UserSwitcher -int 18
+          defaults write com.apple.controlcenter 'NSStatusItem Visible UserSwitcher' -bool YES
+          killall ControlCenter || true
+          sleep 4
+          osascript <<'APPLESCRIPT'
+          tell application "System Events" to tell process "ControlCenter"
+            set button to (first menu bar item of menu bar 1 whose description is "User")
+            log (position of button)
+            log (size of button)
+            click button
+            delay 1
+            log (count of windows)
+            log (get entire contents of window 1)
+            repeat with x in entire contents of first window
+              try
+                log ("role " & (role of x as text))
+              end try
+              try
+                log ("name " & (name of x as text))
+              end try
+              try
+                log ("value " & (value of x as text))
+              end try
+              try
+                log ("description " & (description of x as text))
+              end try
+              try
+                log ("title " & (title of x as text))
+              end try
+            end repeat
+          end tell
+          APPLESCRIPT
+          /usr/sbin/screencapture -x "$RUNNER_TEMP/macos-test-screen.png"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: test-account-switcher
+          path: ${{ runner.temp }}/macos-test-screen.png
+          retention-days: 1
