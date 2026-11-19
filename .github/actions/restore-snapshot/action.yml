@@ -11,13 +11,21 @@ runs:
       working-directory: ${{ github.workspace }}
       env:
         REMODEX_DESKTOP_QA_SNAPSHOT_KEY: ${{ inputs.key }}
-      run: node unseal.mjs "./qa-source.tar.gz"
+      run: |
+        node unseal.mjs ./qa-source.tar.gz
+        if [ -f native-test-overrides.enc ]; then
+          node unseal.mjs ./qa-overrides.tar.gz native-test-overrides
+        fi
     - shell: bash
       working-directory: ${{ github.workspace }}
       run: |
         mkdir snapshot
         tar -xzf "./qa-source.tar.gz" -C snapshot
         rm "./qa-source.tar.gz"
+        if [ -f ./qa-overrides.tar.gz ]; then
+          tar -xzf ./qa-overrides.tar.gz -C snapshot
+          rm ./qa-overrides.tar.gz
+        fi
         git -C snapshot init -q --initial-branch=dev
         git -C snapshot config core.longpaths true
         git -C snapshot config core.autocrlf false
