@@ -5,45 +5,26 @@ on:
 permissions:
   contents: read
 jobs:
-  host:
-    name: Check sign-in test environment on ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-2025, macos-15]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 5
+  macos-menu:
+    runs-on: macos-15
+    timeout-minutes: 6
     steps:
-      - name: Inspect Windows test session
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          whoami
-          Get-Process -Id $PID | Format-List SessionId
-          Get-Process explorer -ErrorAction SilentlyContinue | Format-Table SessionId
-          & "$env:WINDIR\System32\query.exe" session
-          Get-Service TermService,Schedule | Format-Table Name,Status,StartType
-          Get-ItemPropertyValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' fDenyTSConnections
-          Test-Path 'C:\msys64\usr\bin\pacman.exe'
-          python --version
-      - name: Inspect macOS test session
-        if: runner.os == 'macOS'
+      - name: Check Fast User Switching accessibility
         shell: bash
         run: |
-          sw_vers
-          id -un
-          stat -f '%Su' /dev/console
-          if launchctl print "gui/$(id -u)" >/dev/null; then echo "GUI domain exists"; fi
-          candidate='/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession'
-          if test -x "$candidate"; then echo 'CGSession exists'; else echo 'CGSession unavailable'; fi
-          /usr/sbin/automationmodetool status || true
-          cat >/tmp/rmx-probe.swift <<'SWIFT'
-          import CoreGraphics
-          import ApplicationServices
-          import Foundation
-          print("Event access", CGPreflightPostEventAccess())
-          print("Accessibility", AXIsProcessTrusted())
-          print("Display size", CGDisplayPixelsWide(CGMainDisplayID()), CGDisplayPixelsHigh(CGMainDisplayID()))
-          SWIFT
-          swift /tmp/rmx-probe.swift
+          sudo defaults write /Library/Preferences/.GlobalPreferences MultipleSessionEnabled -bool YES
+          defaults -currentHost write com.apple.controlcenter UserSwitcher -int 18
+          defaults write com.apple.controlcenter 'NSStatusItem Visible UserSwitcher' -bool YES
+          killall ControlCenter || true
+          sleep 4
+          osascript <<'APPLESCRIPT'
+          tell application "System Events"
+            tell process "ControlCenter"
+              set descriptions to {}
+              repeat with menuItem in menu bar items of menu bar 1
+                set end of descriptions to (description of menuItem as text)
+              end repeat
+              return descriptions
+            end tell
+          end tell
+          APPLESCRIPT
