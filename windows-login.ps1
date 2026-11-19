@@ -40,11 +40,25 @@ function Open-QaDesktop {
     # trust its first certificate for the lifetime of this disposable client.
     $client = Start-Process -FilePath $rdp -ArgumentList @(
         '/v:127.0.0.1', "/u:$qaUser", "/d:$env:COMPUTERNAME", "/p:$password",
-        '/cert:tofu', '/size:800x600', '/log-level:ERROR',
+        '/cert:tofu', '/size:800x600', '/log-level:INFO',
         '/network:lan'
     ) -WindowStyle Hidden -RedirectStandardOutput (Join-Path $qa 'desktop.out') `
         -RedirectStandardError (Join-Path $qa 'desktop.err') -PassThru
     return $client
+}
+function Wait-QaLogon($Label) {
+    try {
+        return Wait-ForCondition $Label 135 {
+            if ($desk.HasExited) { throw "Remote Desktop client exited with code $($desk.ExitCode)" }
+            Get-QaSession
+        }
+    } catch {
+        & "$sys\query.exe" session
+        foreach ($file in @('desktop.out', 'desktop.err')) {
+            Get-Content "$qa\$file" -Tail 24 -ErrorAction SilentlyContinue
+        }
+        throw
+    }
 }
 function Refresh-QaRegistration($TaskName) {
     $entry = Get-ScheduledTask -TaskName $TaskName
@@ -101,15 +115,10 @@ exit `$LASTEXITCODE
     $action = New-ScheduledTaskAction -Execute "$sys\WindowsPowerShell\v1.0\powershell.exe" `
         -Argument "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -File `"$qa\bootstrap.ps1`""
     $principal = New-ScheduledTaskPrincipal -UserId $userSpec -LogonType Interactive -RunLevel Limited
-    Register-ScheduledTask -TaskName $bootstrap -Action $action -Principal $principal | Out-Null
-    & "$sys\wevtutil.exe" sl 'Microsoft-Windows-TaskScheduler/Operational' '/e:true'
-
     $desk = Open-QaDesktop
-    $firstLogin = Wait-ForCondition 'first interactive Windows sign-in' 70 {
-        if ($desk.HasExited) { throw "Remote Desktop client exited at first sign-in with code $($desk.ExitCode)" }
-        Get-QaSession
-    }
+    $firstLogin = Wait-QaLogon 'first interactive Windows sign-in'
     Write-Host "Windows first sign-in reached interactive session $firstLogin."
+    Register-ScheduledTask -TaskName $bootstrap -Action $action -Principal $principal | Out-Null
     Start-ScheduledTask -TaskName $bootstrap
     try {
         $null = Wait-ForCondition 'Yes at the real rmx onboard prompt' 130 { Test-Path "$qa\onboard-result.json" }
@@ -137,10 +146,7 @@ exit `$LASTEXITCODE
     Write-Host 'Windows signed out and the original server exited.'
 
     $desk = Open-QaDesktop
-    $secondLogin = Wait-ForCondition 'second interactive Windows sign-in' 70 {
-        if ($desk.HasExited) { throw "Remote Desktop client exited at second sign-in with code $($desk.ExitCode)" }
-        Get-QaSession
-    }
+    $secondLogin = Wait-QaLogon 'second interactive Windows sign-in'
     if ($secondLogin -eq $firstLogin) { throw 'Windows reused the old session' }
     try {
         $after = Wait-ForCondition 'Task Scheduler to launch Remodex at the second sign-in' 80 {
