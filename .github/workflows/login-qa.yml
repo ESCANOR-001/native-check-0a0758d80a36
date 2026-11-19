@@ -5,30 +5,43 @@ on:
 permissions:
   contents: read
 jobs:
-  macos-menu:
-    runs-on: macos-15
-    timeout-minutes: 6
+  windows:
+    name: Windows actual sign-out and sign-in
+    runs-on: windows-2025
+    environment: onboard-login-check-20261119
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_INCREMENTAL: 0
     steps:
-      - name: Check Fast User Switching accessibility
-        shell: bash
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Unpack isolated source snapshot
+        shell: pwsh
+        env:
+          REMODEX_ONBOARD_QA_SNAPSHOT_KEY: ${{ secrets.REMODEX_ONBOARD_QA_SNAPSHOT_KEY }}
         run: |
-          qa_password="qa$(openssl rand -hex 12)"
-          echo "::add-mask::$qa_password"
-          sudo sysadminctl -addUser remodexqa -fullName 'Remodex QA User' -password "$qa_password"
-          sudo defaults write /Library/Preferences/com.apple.loginwindow SHOWFULLNAME -bool YES
-          sudo defaults write /Library/Preferences/.GlobalPreferences MultipleSessionEnabled -bool YES
-          defaults -currentHost write com.apple.controlcenter UserSwitcher -int 18
-          defaults write com.apple.controlcenter 'NSStatusItem Visible UserSwitcher' -bool YES
-          killall ControlCenter || true
-          sleep 4
-          osascript <<'APPLESCRIPT'
-          tell application "System Events" to tell process "ControlCenter"
-            click (first menu bar item of menu bar 1 whose description is "User")
-            delay 1
-            repeat with x in entire contents of first window
-              try
-                log (role of x & "|" & ((name of x) as text) & "|" & ((description of x) as text) & "|" & ((value of x) as text))
-              end try
-            end repeat
-          end tell
-          APPLESCRIPT
+          node unseal.mjs "$env:RUNNER_TEMP/native-source.tar.gz"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Path native-source | Out-Null
+          tar.exe -xf "$env:RUNNER_TEMP/native-source.tar.gz" -C native-source
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item "$env:RUNNER_TEMP/native-source.tar.gz"
+      - name: Build Remodex and the windowless startup helper
+        shell: pwsh
+        working-directory: native-source/opencodex-runtime/experiments/rust-connect
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.98.0 build --locked --bin remodex-connect-native --bin remodex-startup
+      - name: Install loopback Remote Desktop client
+        shell: pwsh
+        run: |
+          & 'C:\msys64\usr\bin\bash.exe' -lc 'pacman -Sy --needed --noconfirm mingw-w64-ucrt-x86_64-freerdp'
+      - name: Choose Yes and verify relaunch at sign-in
+        shell: pwsh
+        run: |
+          $target = Resolve-Path native-source/opencodex-runtime/experiments/rust-connect/target/debug
+          ./windows-login.ps1 -Binary "$target/remodex-connect-native.exe" -StartupHelper "$target/remodex-startup.exe"
