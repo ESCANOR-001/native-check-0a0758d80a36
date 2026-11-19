@@ -1,15 +1,15 @@
-name: Remodex Rust npm distribution install and upgrade
+name: Remodex native desktop host retest
 on:
   push:
     branches: [codex/desktop-platform-qa-20261119]
 permissions:
   contents: read
 jobs:
-  distribution:
-    name: Rust npm install and upgrade ${{ matrix.os }}
+  desktop-host:
+    name: Native desktop host ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     environment: desktop-platform-check-20261119
-    timeout-minutes: 25
+    timeout-minutes: 22
     strategy:
       fail-fast: false
       matrix:
@@ -17,9 +17,11 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 4
       CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     defaults:
       run:
-        working-directory: snapshot/opencodex-runtime/experiments/rust-connect
+        working-directory: snapshot/opencodex-runtime
         shell: bash
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
@@ -28,16 +30,18 @@ jobs:
       - uses: ./.github/actions/restore-snapshot
         with:
           key: ${{ secrets.REMODEX_DESKTOP_QA_SNAPSHOT_KEY }}
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          node-version: 24.20.0
+          bun-version: 1.4.4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: 1.98.0
-      - name: Build Rust release binaries
-        run: cargo build --locked --release --bin remodex-connect-native --bin remodex-startup
-      - name: Install and upgrade the Rust npm distribution, retaining the existing pairing
+      - name: Stage release dashboard and bundled runtime
         run: |
-          suffix=''
-          if [ "$RUNNER_OS" = Windows ]; then suffix='.exe'; fi
-          node npm/installation-smoke.mjs "target/release/remodex-connect-native$suffix"
+          bun install --frozen-lockfile
+          (cd gui && bun install --frozen-lockfile)
+          bun run build:gui
+          (cd desktop && bun run stage)
+      - name: Test the native desktop host
+        working-directory: snapshot/opencodex-runtime/desktop/src-tauri
+        run: cargo test --locked --no-fail-fast -- --test-threads=1
