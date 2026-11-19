@@ -258,6 +258,24 @@ jobs:
         run: |
           version=$(node -p "require('./desktop/package.json').version")
           bun scripts/collect-desktop-artifacts.ts --target-key "$TARGET_KEY" --version "$version" --bundle-dir desktop/src-tauri/target/release/bundle --out-dir "$RUNNER_TEMP/qa-installers"
+      - name: Install and remove the unsigned Windows app
+        shell: pwsh
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && runner.os == 'Windows' }}
+        run: '& "$env:GITHUB_WORKSPACE/desktop-install.ps1" -BundleDir "desktop/src-tauri/target/release/bundle"'
+      - name: Verify a copied macOS app from the mounted disk image
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && runner.os == 'macOS' }}
+        run: |
+          mount_path="$(mktemp -d "$RUNNER_TEMP/remodex-mount.XXXXXX")"
+          install_path="$(mktemp -d "$RUNNER_TEMP/remodex-app.XXXXXX")"
+          shopt -s nullglob
+          images=(desktop/src-tauri/target/release/bundle/dmg/Remodex_*.dmg)
+          test "${#images[@]}" = 1
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_path" "${images[0]}"
+          trap 'hdiutil detach "$mount_path"' EXIT
+          ditto "$mount_path/Remodex.app" "$install_path/Remodex.app"
+          plutil -lint "$install_path/Remodex.app/Contents/Info.plist"
+          test -x "$install_path/Remodex.app/Contents/MacOS/remodex"
+          file "$install_path/Remodex.app/Contents/MacOS/remodex"
       - name: Test the native desktop host
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: snapshot/opencodex-runtime/desktop/src-tauri
