@@ -12,19 +12,23 @@ jobs:
       - name: Check Fast User Switching accessibility
         shell: bash
         run: |
+          qa_password="qa$(openssl rand -hex 12)"
+          echo "::add-mask::$qa_password"
+          sudo sysadminctl -addUser remodexqa -fullName 'Remodex QA User' -password "$qa_password"
+          sudo defaults write /Library/Preferences/com.apple.loginwindow SHOWFULLNAME -bool YES
           sudo defaults write /Library/Preferences/.GlobalPreferences MultipleSessionEnabled -bool YES
           defaults -currentHost write com.apple.controlcenter UserSwitcher -int 18
           defaults write com.apple.controlcenter 'NSStatusItem Visible UserSwitcher' -bool YES
           killall ControlCenter || true
           sleep 4
           osascript <<'APPLESCRIPT'
-          tell application "System Events"
-            tell process "ControlCenter"
-              set descriptions to {}
-              repeat with menuItem in menu bar items of menu bar 1
-                set end of descriptions to (description of menuItem as text)
-              end repeat
-              return descriptions
-            end tell
+          tell application "System Events" to tell process "ControlCenter"
+            click (first menu bar item of menu bar 1 whose description is "User")
+            delay 1
+            repeat with x in entire contents of first window
+              try
+                log (role of x & "|" & ((name of x) as text) & "|" & ((description of x) as text) & "|" & ((value of x) as text))
+              end try
+            end repeat
           end tell
           APPLESCRIPT
