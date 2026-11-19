@@ -5,13 +5,13 @@ on:
 permissions:
   contents: read
 jobs:
-  windows:
-    name: Windows actual sign-out and sign-in
-    runs-on: windows-2025
+  macos:
+    name: macOS actual sign-out and sign-in
+    runs-on: macos-15
     environment: onboard-login-check-20261119
-    timeout-minutes: 25
+    timeout-minutes: 24
     env:
-      CARGO_BUILD_JOBS: 2
+      CARGO_BUILD_JOBS: 3
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
@@ -19,29 +19,17 @@ jobs:
         with:
           persist-credentials: false
       - name: Unpack isolated source snapshot
-        shell: pwsh
         env:
           REMODEX_ONBOARD_QA_SNAPSHOT_KEY: ${{ secrets.REMODEX_ONBOARD_QA_SNAPSHOT_KEY }}
         run: |
-          node unseal.mjs "$env:RUNNER_TEMP/native-source.tar.gz"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          New-Item -ItemType Directory -Path native-source | Out-Null
-          tar.exe -xf "$env:RUNNER_TEMP/native-source.tar.gz" -C native-source
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Remove-Item "$env:RUNNER_TEMP/native-source.tar.gz"
-      - name: Build Remodex and the windowless startup helper
-        shell: pwsh
+          node unseal.mjs "$RUNNER_TEMP/native-source.tar.gz"
+          mkdir native-source
+          tar -xf "$RUNNER_TEMP/native-source.tar.gz" -C native-source
+          rm "$RUNNER_TEMP/native-source.tar.gz"
+      - name: Build Remodex
         working-directory: native-source/opencodex-runtime/experiments/rust-connect
         run: |
           rustup toolchain install 1.98.0 --profile minimal
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo +1.98.0 build --locked --bin remodex-connect-native --bin remodex-startup
-      - name: Install loopback Remote Desktop client
-        shell: pwsh
-        run: |
-          & 'C:\msys64\usr\bin\bash.exe' -lc 'pacman -Sy --needed --noconfirm mingw-w64-ucrt-x86_64-freerdp'
+          cargo +1.98.0 build --locked --bin remodex-connect-native
       - name: Choose Yes and verify relaunch at sign-in
-        shell: pwsh
-        run: |
-          $target = Resolve-Path native-source/opencodex-runtime/experiments/rust-connect/target/debug
-          ./windows-login.ps1 -Binary "$target/remodex-connect-native.exe" -StartupHelper "$target/remodex-startup.exe"
+        run: bash macos-login.sh "$PWD/native-source/opencodex-runtime/experiments/rust-connect/target/debug/remodex-connect-native"
