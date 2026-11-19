@@ -1,4 +1,4 @@
-name: Verify Rust npm installation and bin links
+name: Rust bridge formatting and strict Clippy
 on:
   push:
     branches: [codex/desktop-platform-qa-20261119]
@@ -6,7 +6,7 @@ permissions:
   contents: read
 jobs:
   distribution:
-    name: Rust npm install and upgrade ${{ matrix.os }}
+    name: Rust checks ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     environment: desktop-platform-check-20261119
     timeout-minutes: 25
@@ -28,16 +28,11 @@ jobs:
       - uses: ./.github/actions/restore-snapshot
         with:
           key: ${{ secrets.REMODEX_DESKTOP_QA_SNAPSHOT_KEY }}
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
-        with:
-          node-version: 24.20.0
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: 1.98.0
-      - name: Build Rust release binaries
-        run: cargo build --locked --release --bin remodex-connect-native --bin remodex-startup
-      - name: Install and upgrade the Rust npm distribution, retaining the existing pairing
-        run: |
-          suffix=''
-          if [ "$RUNNER_OS" = Windows ]; then suffix='.exe'; fi
-          node npm/installation-smoke.mjs "target/release/remodex-connect-native$suffix"
+          components: rustfmt,clippy
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Run strict Clippy for all targets
+        run: cargo clippy --locked --all-targets -- -D warnings
