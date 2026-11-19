@@ -1,0 +1,21 @@
+name: Windows sign-in test controls
+on:
+  push:
+    branches: [codex/onboard-login-windows-probe-20261119]
+permissions:
+  contents: read
+jobs:
+  sign-in:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - name: Install loopback Remote Desktop client
+        shell: pwsh
+        run: |
+          & 'C:\msys64\usr\bin\bash.exe' -lc 'pacman -Sy --needed --noconfirm mingw-w64-ucrt-x86_64-freerdp'
+      - name: Test two actual interactive Windows user sessions
+        shell: pwsh
+        run: ./probe.ps1
