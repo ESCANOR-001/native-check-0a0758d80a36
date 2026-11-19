@@ -140,8 +140,22 @@ label="$(sudo /usr/libexec/PlistBuddy -c 'Print :Label' "$plist")"
 echo 'Interactive Yes registered one macOS LaunchAgent with RunAtLoad.'
 health
 
+# The terminal-launched bridge is deliberately detached. Bring that
+# original process down while its owner can still close it cleanly so the
+# second sign-in proves launchd started the server from an offline state.
+as_qa env OPENCODEX_HOME="$qa_root/state" REMODEX_GUI_DIR="$qa_root/gui" "$qa_root/rmx" stop
+if health; then
+    echo 'The onboarding server remained healthy after stop' >&2
+    exit 1
+fi
 sign_out
-wait_for 'the macOS GUI domain and initial server to exit' 50 app_gone
+wait_for 'the macOS GUI domain and initial server to exit' 50 app_gone || {
+    echo "Console user: $(console_user)"
+    has_gui && echo 'Test GUI domain is still active'
+    health && echo 'The original server still responds'
+    ps -p "$original_pid" -o pid=,stat=,comm= || true
+    exit 1
+}
 echo "macOS signed out and the original server exited. Console user $(console_user)."
 
 sign_in
@@ -163,7 +177,7 @@ assert initial["answeredYes"]
 assert current["running"] and current["pid"] != initial["initialPid"]
 assert record["environment"] == initial["environmentId"]
 print(json.dumps(dict(platform="macOS", answeredYes=True, signedOutAndServerStopped=True,
-    enteredNewGuiDomain=True, startup="launchd at GUI sign-in", sameInstallation=True,
+    enteredNewGuiDomain=True, initialServerStoppedBeforeLogout=True, startup="launchd at GUI sign-in", sameInstallation=True,
     newServerPid=True, healthy=True)))
 ' "$control_dir/onboard-result.json" "$control_dir/status.json"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
