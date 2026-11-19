@@ -13,7 +13,7 @@ $productTask = $null
 $createdUser = $false
 $rdp = 'C:\msys64\ucrt64\bin\wfreerdp.exe'
 $sys = "$env:WINDIR\System32"
-$python = (Get-Command python -CommandType Application).Source
+$python = (Get-Command python -CommandType Application | Select-Object -First 1).Source
 
 function Wait-ForCondition($Label, [int]$Seconds, [scriptblock]$Check) {
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
@@ -186,3 +186,5 @@ exit `$LASTEXITCODE
         Remove-LocalUser -Name $qaUser -ErrorAction SilentlyContinue
     }
 }
+
+exit 0
